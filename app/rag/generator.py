@@ -1,12 +1,13 @@
 """Groq LLM client for clinical SOAP drafting and patient triage."""
+
 from functools import lru_cache
-from typing import Iterable, Optional
+import json
+from typing import Iterable
 
 from groq import Groq, NotFoundError
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
-from app.rag.retriever import SearchResult
 
 logger = get_logger(__name__)
 
@@ -45,6 +46,19 @@ cho bác sĩ lâm sàng. Dựa trên thông tin phác đồ được cung cấp:
 2. Nếu thiếu thông tin cho một mục SOAP, ghi rõ 'Chưa có thông tin'.
 3. Trình bày theo 4 mục S / O / A / P bằng tiếng Việt y khoa."""
 
+BHYT_PARSER_SYSTEM_PROMPT = """Bạn là trợ lý y tế chuyên bóc tách dữ liệu từ văn bản thô của thẻ Bảo hiểm Y tế (BHYT) Việt Nam.
+Nhiệm vụ: Trích xuất các trường dữ liệu và trả về DUY NHẤT một JSON object (không kèm markdown, không giải thích).
+Các trường cần có:
+- fullName: Họ và tên bệnh nhân (viết in hoa, có dấu tiếng Việt, ví dụ: "NGUYỄN VĂN AN")
+- insuranceCode: Mã số thẻ BHYT gồm 15 ký tự chữ và số viết liền không dấu cách (ví dụ: "DN4797912345678")
+- dateOfBirth: Ngày sinh định dạng YYYY-MM-DD (hoặc YYYY nếu thẻ chỉ ghi năm sinh)
+- gender: "Nam" hoặc "Nữ"
+- initialHospitalCode: Mã nơi ĐKKCB ban đầu (ví dụ: "79-014")
+- validFrom: Ngày bắt đầu giá trị sử dụng (YYYY-MM-DD)
+- validUntil: Ngày kết thúc hoặc thời điểm 5 năm liên tục (YYYY-MM-DD)
+- isExpired: true nếu thẻ đã hết hạn tính đến năm 2026, ngược lại false
+"""
+
 
 class GroqClient:
     def __init__(self, settings: Settings | None = None) -> None:
@@ -75,30 +89,46 @@ class GroqClient:
             if candidate in available:
                 return candidate
         if available:
-            logger.warning(
-                "No preferred fallback model available; using '%s'.",
-                next(iter(available)),
-            )
-            return next(iter(available))
+            fallback = next(iter(available))
+            logger.warning("No preferred fallback model available; using '%s'.", fallback)
+            return fallback
         raise RuntimeError("No fallback LLM model is available on this account.")
 
-    def _create_completion(self, model: str, system_prompt: str, user_prompt: str,
-                           temperature: float, stream: bool):
-        return self.client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            stream=stream,
-            messages=[
+    def _create_completion(
+        self,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        stream: bool,
+        response_format: dict | None = None,
+    ):
+        kwargs = {
+            "model": model,
+            "temperature": temperature,
+            "stream": stream,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-        )
+        }
+        if response_format:
+            kwargs["response_format"] = response_format
+        return self.client.chat.completions.create(**kwargs)
 
-    def _create_with_fallback(self, system_prompt: str, user_prompt: str,
-                              temperature: float, stream: bool):
+    def _create_with_fallback(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        stream: bool,
+        response_format: dict | None = None,
+    ):
         model = self.settings.LLM_MODEL_ID
         try:
-            return self._create_completion(model, system_prompt, user_prompt, temperature, stream)
+            return self._create_completion(
+                model, system_prompt, user_prompt, temperature, stream, response_format
+            )
         except NotFoundError:
             logger.warning(
                 "LLM model '%s' is not accessible (404); switching to a whitelisted fallback.",
@@ -106,7 +136,9 @@ class GroqClient:
             )
             fallback_model = self._pick_fallback_model()
             logger.info("Falling back to LLM model '%s'.", fallback_model)
-            return self._create_completion(fallback_model, system_prompt, user_prompt, temperature, stream)
+            return self._create_completion(
+                fallback_model, system_prompt, user_prompt, temperature, stream, response_format
+            )
 
     # ---------- building blocks ----------
 
@@ -122,23 +154,27 @@ class GroqClient:
     @staticmethod
     def context_from_results(results) -> str:
         contents = getattr(results, "search_results", results)
-        if hasattr(results, "search_results"):
-            contents = results.search_results
         if not contents:
             return "(Không có ngữ cảnh)"
         return "\n\n---\n\n".join(r.content for r in contents)
 
     # ---------- chat completions ----------
 
-    def complete(self, system_prompt: str, user_prompt: str,
-                 temperature: float = 0.1) -> str:
+    def complete(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        response_format: dict | None = None,
+    ) -> str:
         completion = self._create_with_fallback(
-            system_prompt, user_prompt, temperature, stream=False
+            system_prompt, user_prompt, temperature, stream=False, response_format=response_format
         )
         return completion.choices[0].message.content  # type: ignore[return-value]
 
-    def stream(self, system_prompt: str, user_prompt: str,
-               temperature: float = 0.1) -> Iterable[str]:
+    def stream(
+        self, system_prompt: str, user_prompt: str, temperature: float = 0.1
+    ) -> Iterable[str]:
         completion = self._create_with_fallback(
             system_prompt, user_prompt, temperature, stream=True
         )
@@ -163,10 +199,26 @@ class GroqClient:
         user_prompt = f"Bệnh nhân mô tả: {patient_description}"
         return self.complete(TRIAGE_SYSTEM_PROMPT, user_prompt, temperature=0.2)
 
+    def extract_bhyt_info(self, raw_ocr_text: str) -> dict:
+        user_prompt = f"Văn bản OCR thô từ ảnh thẻ BHYT:\n---\n{raw_ocr_text}\n---"
+        response_text = self.complete(
+            BHYT_PARSER_SYSTEM_PROMPT,
+            user_prompt,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        try:
+            clean_json = response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            return json.loads(clean_json)
+        except Exception as err:
+            logger.error("Failed to parse BHYT JSON from LLM: %s", err)
+            return {"rawText": raw_ocr_text, "error": "JSON_PARSE_FAILED"}
+
 
 @lru_cache(maxsize=1)
-def get_groq_client(settings: Settings | None = None) -> GroqClient:
-    return GroqClient(settings)
+def get_groq_client() -> GroqClient:
+    """Trả về singleton GroqClient dựa trên settings mặc định."""
+    return GroqClient()
 
 
 def run_chat(settings: Settings | None = None) -> None:
@@ -174,7 +226,7 @@ def run_chat(settings: Settings | None = None) -> None:
     from app.rag.retriever import retrieve_context
 
     settings = settings or get_settings()
-    client = get_groq_client(settings)
+    client = GroqClient(settings)
     print("\n" + "=" * 65)
     print(" 🩺 KHUNG CHAT HỖ TRỢ BÁC SĨ (CLINIC RAG)")
     print(f" 🤖 LLM Engine: {settings.LLM_MODEL_ID}")
