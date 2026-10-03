@@ -1,4 +1,12 @@
 """Streamlit web chat interface (migrated from web_chat.py)."""
+import sys
+from pathlib import Path
+
+# Đưa thư mục gốc dự án (clinic_rag_backend) vào sys.path để nhận diện package 'app'
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import streamlit as st
 
 from app.core.config import Settings, get_settings

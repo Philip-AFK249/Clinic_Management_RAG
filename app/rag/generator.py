@@ -2,13 +2,22 @@
 from functools import lru_cache
 from typing import Iterable, Optional
 
-from groq import Groq
+from groq import Groq, NotFoundError
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.rag.retriever import SearchResult
 
 logger = get_logger(__name__)
+
+FALLBACK_MODEL_PREFERENCES = (
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "groq/compound",
+    "groq/compound-mini",
+    "allam-2-7b",
+)
 
 DOCTOR_SYSTEM_PROMPT = """Bạn là trợ lý y khoa AI hỗ trợ bác sĩ lâm sàng tra cứu phác đồ điều trị của Bộ Y tế.
 Nguyên tắc trả lời:
@@ -43,6 +52,61 @@ class GroqClient:
         if not self.settings.GROQ_API_KEY:
             raise ValueError("Missing GROQ_API_KEY in .env")
         self.client = Groq(api_key=self.settings.GROQ_API_KEY)
+        self._available_models: set[str] | None = None
+
+    # ---------- model availability / fallback ----------
+
+    def _available_model_ids(self) -> set[str]:
+        """Query the account whitelist once and cache the model IDs."""
+        if self._available_models is None:
+            try:
+                response = self.client.models.list()
+                models = getattr(response, "data", response)
+                self._available_models = {m.id for m in models}
+                logger.debug("Available Groq models: %s", sorted(self._available_models))
+            except Exception:
+                logger.warning("Failed to list Groq models; disabling fallback.", exc_info=True)
+                self._available_models = set()
+        return self._available_models
+
+    def _pick_fallback_model(self) -> str:
+        available = self._available_model_ids()
+        for candidate in FALLBACK_MODEL_PREFERENCES:
+            if candidate in available:
+                return candidate
+        if available:
+            logger.warning(
+                "No preferred fallback model available; using '%s'.",
+                next(iter(available)),
+            )
+            return next(iter(available))
+        raise RuntimeError("No fallback LLM model is available on this account.")
+
+    def _create_completion(self, model: str, system_prompt: str, user_prompt: str,
+                           temperature: float, stream: bool):
+        return self.client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            stream=stream,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+    def _create_with_fallback(self, system_prompt: str, user_prompt: str,
+                              temperature: float, stream: bool):
+        model = self.settings.LLM_MODEL_ID
+        try:
+            return self._create_completion(model, system_prompt, user_prompt, temperature, stream)
+        except NotFoundError:
+            logger.warning(
+                "LLM model '%s' is not accessible (404); switching to a whitelisted fallback.",
+                model,
+            )
+            fallback_model = self._pick_fallback_model()
+            logger.info("Falling back to LLM model '%s'.", fallback_model)
+            return self._create_completion(fallback_model, system_prompt, user_prompt, temperature, stream)
 
     # ---------- building blocks ----------
 
@@ -68,26 +132,15 @@ class GroqClient:
 
     def complete(self, system_prompt: str, user_prompt: str,
                  temperature: float = 0.1) -> str:
-        completion = self.client.chat.completions.create(
-            model=self.settings.LLM_MODEL_ID,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        completion = self._create_with_fallback(
+            system_prompt, user_prompt, temperature, stream=False
         )
         return completion.choices[0].message.content  # type: ignore[return-value]
 
     def stream(self, system_prompt: str, user_prompt: str,
                temperature: float = 0.1) -> Iterable[str]:
-        completion = self.client.chat.completions.create(
-            model=self.settings.LLM_MODEL_ID,
-            temperature=temperature,
-            stream=True,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        completion = self._create_with_fallback(
+            system_prompt, user_prompt, temperature, stream=True
         )
         for chunk in completion:
             yield chunk.choices[0].delta.content or ""

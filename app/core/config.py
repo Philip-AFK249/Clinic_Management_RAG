@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 150
 
     # LLM
-    LLM_MODEL_ID: str = "llama-3.3-70b-versatile"
+    LLM_MODEL_ID: str = "openai/gpt-oss-120b"
     LLM_STT_MODEL_ID: str = "whisper-large-v3"
 
     # Retrieval
