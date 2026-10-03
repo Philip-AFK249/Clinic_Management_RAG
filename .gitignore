@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 data/raw_docs/*.pdf
+
+# Patient identity documents captured by the BHYT upload/verification flow
+data/bhyt_records/

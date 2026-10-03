@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Quét thẻ BHYT bằng AI - Hệ thống Tiếp đón Bệnh nhân</title>
+<style>
+  :root {
+    --brand: #0d6efd;
+    --brand-dark: #0a58ca;
+    --ok: #15803d;
+    --ok-bg: #dcfce7;
+    --warn: #b45309;
+    --warn-bg: #fef3c7;
+    --err: #b91c1c;
+    --err-bg: #fee2e2;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --surface: #ffffff;
+    --bg: #f1f5f9;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0 1rem 4rem;
+    font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.5;
+  }
+
+  header.page {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 1.5rem 0 1rem;
+    text-align: center;
+  }
+  header.page h1 { margin: 0 0 .25rem; font-size: 1.6rem; color: #0f172a; }
+  header.page p { margin: 0; color: var(--muted); font-size: .95rem; }
+
+  .shell { max-width: 1180px; margin: 0 auto; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .06);
+    padding: 1.25rem;
+  }
+  .card + .card { margin-top: 1.25rem; }
+
+  h2.step-title {
+    margin: 0 0 1rem;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    gap: .55rem;
+  }
+  .step-num {
+    width: 1.75rem; height: 1.75rem;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    background: var(--brand); color: #fff;
+    font-size: .9rem; font-weight: 700;
+    flex: 0 0 auto;
+  }
+
+  /* ---------- Step 1: upload ---------- */
+  .dropzone {
+    border: 2px dashed #c7d2fe;
+    border-radius: 12px;
+    background: #f8faff;
+    padding: 2.25rem 1rem;
+    text-align: center;
+    transition: border-color .15s, background .15s;
+    cursor: pointer;
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--brand);
+    background: #eef4ff;
+  }
+  .dropzone .big { font-size: 1.15rem; font-weight: 600; margin: .4rem 0; }
+  .dropzone .hint { color: var(--muted); font-size: .88rem; }
+
+  .upload-actions {
+    display: flex; flex-wrap: wrap; gap: .75rem;
+    justify-content: center; margin-top: 1rem;
+  }
+  .hidden-input { display: none; }
+
+  button {
+    font: inherit;
+    cursor: pointer;
+    border: none;
+    border-radius: 9px;
+    padding: .7rem 1.25rem;
+    font-weight: 600;
+    transition: filter .15s, background .15s;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  button.primary { background: var(--brand); color: #fff; }
+  button.primary:not(:disabled):hover { background: var(--brand-dark); }
+  button.ghost { background: #e2e8f0; color: #1e293b; }
+  button.ghost:not(:disabled):hover { background: #cbd5e1; }
+  button.zoom { padding: .35rem .7rem; background: #1e293b; color: #fff; font-size: .85rem; }
+
+  /* ---------- Loading ---------- */
+  .scanner { display: none; text-align: center; padding: 1.5rem 0; }
+  .scanner.active { display: block; }
+  .scanner p { font-weight: 600; color: var(--brand-dark); margin: .9rem 0 .3rem; }
+  .latency { font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .bar {
+    height: 7px; max-width: 420px; margin: 0 auto;
+    background: #e0e7ff; border-radius: 99px; overflow: hidden;
+  }
+  .bar > i {
+    display: block; height: 100%; width: 35%;
+    background: linear-gradient(90deg, var(--brand), #7c3aed);
+    animation: sweep 1.15s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(330%); }
+  }
+
+  .alert {
+    display: none;
+    margin-top: 1rem;
+    padding: .8rem 1rem;
+    border-radius: 9px;
+    font-size: .9rem;
+  }
+  .alert.show { display: block; }
+  .alert.error { background: var(--err-bg); color: var(--err); border: 1px solid #fca5a5; }
+  .alert.info  { background: var(--warn-bg); color: var(--warn); border: 1px solid #fcd34d; }
+
+  /* ---------- Step 2: review layout ---------- */
+  .review { display: none; }
+  .review.active { display: block; }
+  .review-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 1.25rem;
+  }
+  @media (max-width: 900px) { .review-grid { grid-template-columns: 1fr; } }
+
+  .preview-box {
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: #0f172a;
+    overflow: hidden;
+    position: sticky;
+    top: 1rem;
+    align-self: start;
+  }
+  .preview-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: .5rem; flex-wrap: wrap;
+    padding: .55rem .7rem;
+    background: #1e293b; color: #e2e8f0;
+    font-size: .82rem;
+  }
+  .zoom-controls { display: flex; gap: .3rem; }
+
+  /* Scroll + zoom viewport: gives the patient a cropped/zoomed reference view */
+  .zoom-viewport {
+    height: 460px;
+    overflow: auto;
+    display: grid;
+    place-items: center;
+    background: #020617;
+    cursor: grab;
+  }
+  .zoom-viewport.dragging { cursor: grabbing; }
+  .zoom-viewport img {
+    max-width: none;
+    transform-origin: center center;
+    display: block;
+    transition: transform .12s ease-out;
+  }
+  .preview-meta {
+    padding: .55rem .7rem;
+    background: #1e293b;
+    color: #94a3b8;
+    font-size: .78rem;
+    display: flex;
+    justify-content: space-between;
+    gap: .5rem; flex-wrap: wrap;
+  }
+
+  /* ---------- Verification table ---------- */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  thead th {
+    background: #f8fafc;
+    text-align: left;
+    font-size: .78rem;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+    padding: .6rem .7rem;
+    border-bottom: 2px solid var(--line);
+    white-space: nowrap;
+  }
+  tbody td { padding: .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.field-name { font-weight: 600; color: #0f172a; width: 27%; }
+  td.field-name small { display: block; font-weight: 400; color: var(--muted); font-size: .78rem; }
+
+  input[type="text"], select {
+    width: 100%;
+    font: inherit;
+    padding: .55rem .65rem;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #fff;
+    color: var(--ink);
+  }
+  input[type="text"]:focus, select:focus {
+    outline: 2px solid #bfdbfe;
+    border-color: var(--brand);
+  }
+  input.invalid, select.invalid { border-color: var(--err); background: #fff7f7; }
+
+  .date-range { display: flex; align-items: center; gap: .4rem; }
+  .date-range span { color: var(--muted); flex: 0 0 auto; }
+
+  .badge {
+    display: inline-block;
+    padding: .2rem .55rem;
+    border-radius: 99px;
+    font-size: .76rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .badge.ok   { background: var(--ok-bg);  color: var(--ok); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.err  { background: var(--err-bg);  color: var(--err); }
+
+  .char-count { font-size: .75rem; color: var(--muted); margin-top: .25rem; font-variant-numeric: tabular-nums; }
+
+  /* ---------- Actions + toast ---------- */
+  .actions {
+    display: flex; flex-wrap: wrap; gap: .75rem;
+    justify-content: flex-end;
+    margin-top: 1.25rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--line);
+  }
+  .spinner {
+    width: 1rem; height: 1rem;
+    border: 2px solid rgba(255,255,255,.45);
+    border-top-color: #fff;
+    border-radius: 50%;
+    display: inline-block;
+    vertical-align: -2px;
+    margin-right: .45rem;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .toast {
+    position: fixed; top: 1.25rem; right: 1.25rem;
+    max-width: 380px;
+    padding: .9rem 1.1rem;
+    border-radius: 11px;
+    color: #fff;
+    font-weight: 600;
+    box-shadow: 0 8px 24px rgba(15,23,42,.22);
+    transform: translateY(-150%);
+    opacity: 0;
+    transition: transform .3s ease, opacity .3s ease;
+    z-index: 50;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.success { background: var(--ok); }
+  .toast.error   { background: var(--err); }
+</style>
+</head>
+<body>
+
+<header class="page">
+  <h1>Tiếp đón Bệnh nhân bằng thẻ BHYT</h1>
+  <p>Chụp hoặc tải lên thẻ Bảo hiểm Y tế &mdash; AI sẽ bóc tách dữ liệu, bạn kiểm tra lại trước khi lưu.</p>
+</header>
+
+<div class="shell">
+
+  <!-- ============ STEP 1: UPLOAD ============ -->
+  <section class="card" id="upload-card">
+    <h2 class="step-title"><span class="step-num">1</span> Tải lên ảnh thẻ BHYT</h2>
+
+    <div class="dropzone" id="dropzone" tabindex="0" role="button"
+         aria-label="Chọn hoặc kéo thả ảnh thẻ BHYT">
+      <div style="font-size:2.2rem">🪪</div>
+      <div class="big">Kéo thả ảnh vào đây</div>
+      <div class="hint">hoặc nhấn để chọn tệp &middot; Hỗ trợ JPG, PNG, HEIC, WEBP &middot; Tối đa 15 MB</div>
+    </div>
+
+    <input type="file" id="file-input" class="hidden-input"
+           accept="image/*" capture="environment" />
+
+    <div class="upload-actions">
+      <button class="primary" id="btn-camera" type="button">📷 Chụp ảnh thẻ</button>
+      <button class="ghost" id="btn-browse" type="button">📁 Chọn tệp từ máy</button>
+    </div>
+
+    <div class="scanner" id="scanner">
+      <div class="bar"><i></i></div>
+      <p>Đang quét và bóc tách dữ liệu qua Groq AI...</p>
+      <div class="latency">Đã chờ <span id="elapsed">0.0</span> giây</div>
+    </div>
+
+    <div class="alert" id="upload-alert"></div>
+  </section>
+
+  <!-- ============ STEP 2: VERIFY & CONFIRM ============ -->
+  <section class="card review" id="review-card">
+    <h2 class="step-title"><span class="step-num">2</span> Kiểm tra thông tin đã trích xuất</h2>
+
+    <div class="review-grid">
+      <!-- Left: zoomable reference image -->
+      <div class="preview-box">
+        <div class="preview-head">
+          <span>Ảnh gốc &mdash; dùng để đối chiếu</span>
+          <span class="zoom-controls">
+            <button class="zoom" type="button" data-zoom="0.5" aria-label="Thu nhỏ">&minus;</button>
+            <button class="zoom" type="button" data-zoom="0" aria-label="Về kích thước gốc">100%</button>
+            <button class="zoom" type="button" data-zoom="2" aria-label="Phóng to">+</button>
+          </span>
+        </div>
+        <div class="zoom-viewport" id="zoom-viewport">
+          <img id="card-image" alt="Ảnh thẻ BHYT đã tải lên" />
+        </div>
+        <div class="preview-meta">
+          <span id="preview-size">&mdash;</span>
+          <span id="preview-model">&mdash;</span>
+        </div>
+      </div>
+
+      <!-- Right: editable verification table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Trường thông tin</th>
+              <th>Dữ liệu trích xuất (Có thể chỉnh sửa)</th>
+              <th>Trạng thái</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="field-name">Họ và tên<small>in hoa, có dấu</small></td>
+              <td><input type="text" id="ho_ten" autocomplete="name" /></td>
+              <td><span class="badge ok" id="st-ho_ten">Hợp lệ</span></td>
+            </tr>
+            <tr>
+              <td class="field-name">Mã số BHYT<small>15 ký tự chữ và số</small></td>
+              <td>
+                <input type="text" id="ma_so_bhyt" maxlength="15"
+                       inputmode="latin" autocapitalize="characters" spellcheck="false" />
+                <div class="char-count"><span id="code-len">0</span>/15 ký tự</div>
+              </td>
+              <td><span class="badge ok" id="st-ma_so_bhyt">Đủ 15 ký tự</span></td>
+            </tr>
+            <tr>
+              <td class="field-name">Ngày sinh<small>định dạng DD/MM/YYYY</small></td>
+              <td><input type="text" id="ngay_sinh" placeholder="DD/MM/YYYY" inputmode="numeric" /></td>
+              <td><span class="badge ok" id="st-ngay_sinh">Hợp lệ</span></td>
+            </tr>
+            <tr>
+              <td class="field-name">Giới tính</td>
+              <td>
+                <select id="gioi_tinh">
+                  <option value="">-- Chọn --</option>
+                  <option value="Nam">Nam</option>
+                  <option value="Nữ">Nữ</option>
+                </select>
+              </td>
+              <td><span class="badge ok" id="st-gioi_tinh">Hợp lệ</span></td>
+            </tr>
+            <tr>
+              <td class="field-name">Nơi ĐKKCB ban đầu<small>cơ sở khám chữa bệnh đầu tiên</small></td>
+              <td><input type="text" id="noi_kham" /></td>
+              <td><span class="badge ok" id="st-noi_kham">Hợp lệ</span></td>
+            </tr>
+            <tr>
+              <td class="field-name">Hạn sử dụng<small>từ &ndash; đến</small></td>
+              <td>
+                <div class="date-range">
+                  <input type="text" id="han_tu" placeholder="DD/MM/YYYY" inputmode="numeric" />
+                  <span>&ndash;</span>
+                  <input type="text" id="han_den" placeholder="DD/MM/YYYY" inputmode="numeric" />
+                </div>
+              </td>
+              <td><span class="badge ok" id="st-han">Còn hạn</span></td>
+            </tr>
+            <tr>
+              <td class="field-name">Ghi chú<small>tuỳ chọn</small></td>
+              <td><input type="text" id="ghi_chu" /></td>
+              <td><span class="badge ok" id="st-ghi_chu">&mdash;</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="alert info" id="review-alert"></div>
+
+    <div class="actions">
+      <button class="ghost" id="btn-reset" type="button">📸 Chụp lại ảnh khác</button>
+      <button class="primary" id="btn-save" type="button">✅ Xác nhận &amp; Lưu thông tin</button>
+    </div>
+  </section>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+
+  const dropzone   = $("dropzone");
+  const fileInput  = $("file-input");
+  const scanner    = $("scanner");
+  const elapsedEl  = $("elapsed");
+  const uploadAlert = $("upload-alert");
+  const reviewCard = $("review-card");
+  const reviewAlert = $("review-alert");
+  const cardImage  = $("card-image");
+  const zoomView   = $("zoom-viewport");
+  const saveBtn    = $("btn-save");
+
+  // Map the API schema onto the DOM ids used in the verification table.
+  const FIELDS = {
+    ho_ten:                        "ho_ten",
+    ma_so_bhyt:                    "ma_so_bhyt",
+    ngay_sinh:                     "ngay_sinh",
+    gioi_tinh:                     "gioi_tinh",
+    noi_kham_chua_benh_ban_dau:    "noi_kham",
+    gia_tri_su_dung_tu:            "han_tu",
+    gia_tri_su_dung_den:           "han_den",
+    ghi_chu:                       "ghi_chu"
+  };
+
+  let timerId = null;
+  let zoom = 1;
+  let currentFileSizeMB = null;
+
+  /* ---------------- helpers ---------------- */
+
+  function setAlert(el, message, type) {
+    if (!message) { el.className = "alert"; el.textContent = ""; return; }
+    el.className = "alert show " + (type || "error");
+    el.textContent = message;
+  }
+
+  function toast(message, type) {
+    const el = $("toast");
+    el.textContent = message;
+    el.className = "toast show " + (type || "success");
+    window.clearTimeout(el._hide);
+    el._hide = window.setTimeout(() => { el.className = "toast"; }, 4200);
+  }
+
+  function startLatencyCounter() {
+    const t0 = performance.now();
+    scanner.classList.add("active");
+    window.clearInterval(timerId);
+    timerId = window.setInterval(() => {
+      elapsedEl.textContent = ((performance.now() - t0) / 1000).toFixed(1);
+    }, 100);
+  }
+
+  function stopLatencyCounter() {
+    window.clearInterval(timerId);
+    timerId = null;
+    scanner.classList.remove("active");
+  }
+
+  function isBlank(value) {
+    return !value || !String(value).trim();
+  }
+
+  // Strict DD/MM/YYYY check that also confirms the date really exists.
+  function isValidDate(text) {
+    if (!/^\d{2}\/\d{2}\/\d{4}$/.test(text || "")) return false;
+    const [d, m, y] = text.split("/").map(Number);
+    const dt = new Date(y, m - 1, d);
+    return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+  }
+
+  function setBadge(el, text, state) {
+    el.textContent = text;
+    el.className = "badge " + state;
+  }
+
+  /* ---------------- field validation ---------------- */
+
+  function validateCode() {
+    const input = $("ma_so_bhyt");
+    const value = (input.value || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    input.value = value;
+    $("code-len").textContent = value.length;
+
+    const badge = $("st-ma_so_bhyt");
+    input.classList.remove("invalid");
+    if (value.length === 0) {
+      setBadge(badge, "Thiếu mã số", "err");
+      input.classList.add("invalid");
+    } else if (value.length !== 15) {
+      setBadge(badge, "Cần kiểm tra (" + value.length + "/15)", "warn");
+      input.classList.add("invalid");
+    } else {
+      setBadge(badge, "Đủ 15 ký tự", "ok");
+    }
+    return value.length;
+  }
+
+  function validateText(id, badgeId, label) {
+    const input = $(id);
+    const badge = $(badgeId);
+    input.classList.remove("invalid");
+    if (isBlank(input.value)) {
+      setBadge(badge, "Thiếu " + label, "err");
+      input.classList.add("invalid");
+      return false;
+    }
+    setBadge(badge, "Hợp lệ", "ok");
+    return true;
+  }
+
+  function validateDates() {
+    const from = $("han_tu");
+    const to = $("han_den");
+    const badge = $("st-han");
+    from.classList.remove("invalid");
+    to.classList.remove("invalid");
+
+    if (!isBlank(from.value) && !isValidDate(from.value)) {
+      setBadge(badge, "Ngày bắt đầu sai định dạng", "warn");
+      from.classList.add("invalid");
+      return false;
+    }
+    if (isBlank(to.value)) {
+      setBadge(badge, "Chưa rõ hạn", "warn");
+      return false;
+    }
+    if (!isValidDate(to.value)) {
+      setBadge(badge, "Ngày hết hạn sai định dạng", "warn");
+      to.classList.add("invalid");
+      return false;
+    }
+
+    const [d, m, y] = to.value.split("/").map(Number);
+    const expiry = new Date(y, m - 1, d);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+
+    if (expiry < today) {
+      setBadge(badge, "Hết hạn", "err");
+      to.classList.add("invalid");
+      return false;
+    }
+    setBadge(badge, "Còn hạn", "ok");
+    return true;
+  }
+
+  function revalidate() {
+    const codeLen = validateCode();
+    validateText("ho_ten", "st-ho_ten", "họ tên");
+    validateText("noi_kham", "st-noi_kham", "nơi ĐKKCB");
+
+    const dob = $("ngay_sinh");
+    dob.classList.remove("invalid");
+    if (isBlank(dob.value)) {
+      setBadge($("st-ngay_sinh"), "Thiếu ngày sinh", "err");
+      dob.classList.add("invalid");
+    } else if (!isValidDate(dob.value)) {
+      setBadge($("st-ngay_sinh"), "Cần kiểm tra (DD/MM/YYYY)", "warn");
+      dob.classList.add("invalid");
+    } else {
+      setBadge($("st-ngay_sinh"), "Hợp lệ", "ok");
+    }
+
+    const gender = $("gioi_tinh");
+    gender.classList.remove("invalid");
+    if (!gender.value) {
+      setBadge($("st-gioi_tinh"), "Thiếu giới tính", "err");
+      gender.classList.add("invalid");
+    } else {
+      setBadge($("st-gioi_tinh"), "Hợp lệ", "ok");
+    }
+
+    validateDates();
+
+    const note = $("ghi_chu");
+    setBadge($("st-ghi_chu"), isBlank(note.value) ? "—" : "Đã ghi chú",
+             isBlank(note.value) ? "ok" : "warn");
+
+    return codeLen === 15;
+  }
+
+  /* ---------------- zoom controls ---------------- */
+
+  function applyZoom(next) {
+    zoom = Math.min(5, Math.max(0.4, next));
+    cardImage.style.transform = "scale(" + zoom + ")";
+  }
+
+  // Fit the card to the viewport width on first load.
+  function fitImage() {
+    zoom = 1;
+    cardImage.style.transform = "none";
+    cardImage.style.width = "100%";
+    cardImage.style.height = "auto";
+  }
+
+  document.querySelectorAll("[data-zoom]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const factor = Number(btn.dataset.zoom);
+      if (factor === 0) { fitImage(); return; }
+      cardImage.style.width = "100%";
+      applyZoom(zoom * factor);
+    });
+  });
+
+  zoomView.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    applyZoom(zoom * (e.deltaY < 0 ? 1.12 : 0.89));
+  }, { passive: false });
+
+  /* ---------------- upload flow ---------------- */
+
+  dropzone.addEventListener("click", () => fileInput.click());
+  dropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+  });
+  $("btn-camera").addEventListener("click", () => fileInput.click());
+  $("btn-browse").addEventListener("click", () => fileInput.click());
+
+  ["dragenter", "dragover"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.add("dragover");
+    })
+  );
+  ["dragleave", "drop"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("dragover");
+    })
+  );
+
+  dropzone.addEventListener("drop", (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) uploadFile(file);
+  });
+
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files && fileInput.files[0]) uploadFile(fileInput.files[0]);
+  });
+
+  async function uploadFile(file) {
+    if (!file.type || !file.type.startsWith("image/")) {
+      setAlert(uploadAlert, "Tệp đã chọn không phải ảnh. Vui lòng chọn tệp JPG hoặc PNG.", "error");
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      setAlert(uploadAlert, "Ảnh vượt quá 15 MB. Vui lòng chụp lại hoặc giảm kích thước ảnh.", "error");
+      return;
+    }
+
+    setAlert(uploadAlert, "");
+    setAlert(reviewAlert, "");
+    currentFileSizeMB = (file.size / 1024 / 1024).toFixed(1);
+    $("btn-camera").disabled = true;
+    $("btn-browse").disabled = true;
+    startLatencyCounter();
+
+    const body = new FormData();
+    body.append("file", file);
+
+    try {
+      const response = await fetch("/api/v1/ocr/bhyt", { method: "POST", body });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(payload.detail || "Không thể bóc tách dữ liệu từ ảnh này.");
+      }
+
+      renderResult(payload);
+    } catch (error) {
+      setAlert(uploadAlert, error.message || "Lỗi mạng khi gửi ảnh lên máy chủ.", "error");
+    } finally {
+      stopLatencyCounter();
+      $("btn-camera").disabled = false;
+      $("btn-browse").disabled = false;
+      fileInput.value = "";
+    }
+  }
+
+  function renderResult(payload) {
+    const data = payload.data || {};
+
+    Object.entries(FIELDS).forEach(([key, id]) => {
+      const el = $(id);
+      if (el) el.value = data[key] == null ? "" : data[key];
+    });
+
+    // Show the exact optimized frame the model analysed.
+    cardImage.src = payload.image_preview;
+    cardImage.onload = fitImage;
+
+    $("preview-size").textContent =
+      "Ảnh gốc: " + (currentFileSizeMB || "?") + " MB → nén còn " + payload.image_size_kb + " KB";
+    $("preview-model").textContent = payload.model + " • " + payload.latency_ms + " ms";
+
+    revalidate();
+
+    if (payload.warnings && payload.warnings.length) {
+      setAlert(reviewAlert, "⚠ " + payload.warnings.join(" | "), "info");
+    } else {
+      setAlert(reviewAlert, "");
+    }
+
+    reviewCard.classList.add("active");
+    reviewCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function fileSizeMB() {
+    return currentFileSizeMB;
+  }
+
+  /* ---------------- save flow ---------------- */
+
+  Object.values(FIELDS).forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("input", revalidate);
+    el.addEventListener("change", revalidate);
+  });
+
+  saveBtn.addEventListener("click", async () => {
+    const codeOk = revalidate();
+    if (!codeOk) {
+      setAlert(reviewAlert,
+        "Mã số BHYT phải đủ 15 ký tự trước khi lưu. Vui lòng đối chiếu với thẻ rồi sửa lại.",
+        "error");
+      $("ma_so_bhyt").focus();
+      return;
+    }
+
+    const payload = {
+      ho_ten: $("ho_ten").value.trim(),
+      ma_so_bhyt: $("ma_so_bhyt").value.trim(),
+      ngay_sinh: $("ngay_sinh").value.trim() || null,
+      gioi_tinh: $("gioi_tinh").value || null,
+      noi_kham_chua_benh_ban_dau: $("noi_kham").value.trim() || null,
+      gia_tri_su_dung_tu: $("han_tu").value.trim() || null,
+      gia_tri_su_dung_den: $("han_den").value.trim() || null,
+      ghi_chu: $("ghi_chu").value.trim() || null
+    };
+
+    const original = saveBtn.innerHTML;
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="spinner"></span>Đang lưu...';
+
+    try {
+      const response = await fetch("/api/v1/bhyt/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(result.detail || "Không thể lưu thông tin.");
+      }
+
+      toast("✔ " + result.message, "success");
+
+      // Surface anything the patient should still double-check before the record is used.
+      const followUps = (result.warnings || []).filter((w) => w !== "");
+      setAlert(
+        reviewAlert,
+        "Mã hồ sơ: " + result.record.id +
+          (followUps.length ? " — " + followUps.join(" | ") : ""),
+        followUps.length ? "info" : "error"
+      );
+    } catch (error) {
+      toast("✖ " + (error.message || "Lỗi khi lưu."), "error");
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.innerHTML = original;
+    }
+  });
+
+  $("btn-reset").addEventListener("click", () => {
+    stopLatencyCounter();
+    reviewCard.classList.remove("active");
+    setAlert(uploadAlert, "");
+    setAlert(reviewAlert, "");
+    cardImage.removeAttribute("src");
+    Object.values(FIELDS).forEach((id) => { const el = $(id); if (el) el.value = ""; });
+    fileInput.value = "";
+    $("upload-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    fileInput.click();
+  });
+})();
+</script>
+</body>
+</html>

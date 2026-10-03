@@ -35,7 +35,7 @@ st.set_page_config(
 @st.cache_resource
 def init_resources():
     embedder = get_embedder(settings)
-    groq_client = get_groq_client(settings)
+    groq_client = get_groq_client()
     return embedder, groq_client
 
 

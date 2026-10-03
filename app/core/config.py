@@ -43,35 +43,31 @@ class Settings(BaseSettings):
     CHUNK_MAX_CHARS: int = 1200
     CHUNK_OVERLAP: int = 150
 
-    # LLM
+    # LLM & VLM Models
     LLM_MODEL_ID: str = "openai/gpt-oss-120b"
     LLM_STT_MODEL_ID: str = "whisper-large-v3"
+    VLM_MODEL_ID: str = "qwen/qwen3.8-27b"
 
     # Retrieval
     RETRIEVER_TOP_K: int = 3
 
     @property
     def db_dsn(self) -> str:
-        """Build the psycopg connection URI."""
         return (
             f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
         )
 
     def validate_api_keys(self) -> None:
-        """Fail fast if required API keys are missing."""
         missing = []
         if not self.GROQ_API_KEY:
             missing.append("GROQ_API_KEY")
-        if not self.LLAMA_CLOUD_API_KEY:
-            missing.append("LLAMA_CLOUD_API_KEY")
         if missing:
             logger.warning("Missing environment variables: %s", ", ".join(missing))
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return a cached Settings singleton."""
     settings = Settings()
     settings.validate_api_keys()
     return settings

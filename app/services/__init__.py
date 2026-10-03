@@ -1,0 +1,1 @@
+"""Persistence for patient-confirmed BHYT records."""

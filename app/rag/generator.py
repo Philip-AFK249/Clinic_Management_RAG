@@ -1,7 +1,6 @@
 """Groq LLM client for clinical SOAP drafting and patient triage."""
 
 from functools import lru_cache
-import json
 from typing import Iterable
 
 from groq import Groq, NotFoundError
@@ -46,18 +45,8 @@ cho bác sĩ lâm sàng. Dựa trên thông tin phác đồ được cung cấp:
 2. Nếu thiếu thông tin cho một mục SOAP, ghi rõ 'Chưa có thông tin'.
 3. Trình bày theo 4 mục S / O / A / P bằng tiếng Việt y khoa."""
 
-BHYT_PARSER_SYSTEM_PROMPT = """Bạn là trợ lý y tế chuyên bóc tách dữ liệu từ văn bản thô của thẻ Bảo hiểm Y tế (BHYT) Việt Nam.
-Nhiệm vụ: Trích xuất các trường dữ liệu và trả về DUY NHẤT một JSON object (không kèm markdown, không giải thích).
-Các trường cần có:
-- fullName: Họ và tên bệnh nhân (viết in hoa, có dấu tiếng Việt, ví dụ: "NGUYỄN VĂN AN")
-- insuranceCode: Mã số thẻ BHYT gồm 15 ký tự chữ và số viết liền không dấu cách (ví dụ: "DN4797912345678")
-- dateOfBirth: Ngày sinh định dạng YYYY-MM-DD (hoặc YYYY nếu thẻ chỉ ghi năm sinh)
-- gender: "Nam" hoặc "Nữ"
-- initialHospitalCode: Mã nơi ĐKKCB ban đầu (ví dụ: "79-014")
-- validFrom: Ngày bắt đầu giá trị sử dụng (YYYY-MM-DD)
-- validUntil: Ngày kết thúc hoặc thời điểm 5 năm liên tục (YYYY-MM-DD)
-- isExpired: true nếu thẻ đã hết hạn tính đến năm 2026, ngược lại false
-"""
+BHYT_VLM_GUIDE = """Thẻ Bảo hiểm Y tế được bóc tách bởi VLM Groq (xem app/parsers/bhyt_vlm.py),
+nên không còn bước chuyển văn bản OCR thô sang JSON ở tầng LLM này."""
 
 
 class GroqClient:
@@ -199,20 +188,8 @@ class GroqClient:
         user_prompt = f"Bệnh nhân mô tả: {patient_description}"
         return self.complete(TRIAGE_SYSTEM_PROMPT, user_prompt, temperature=0.2)
 
-    def extract_bhyt_info(self, raw_ocr_text: str) -> dict:
-        user_prompt = f"Văn bản OCR thô từ ảnh thẻ BHYT:\n---\n{raw_ocr_text}\n---"
-        response_text = self.complete(
-            BHYT_PARSER_SYSTEM_PROMPT,
-            user_prompt,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        try:
-            clean_json = response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            return json.loads(clean_json)
-        except Exception as err:
-            logger.error("Failed to parse BHYT JSON from LLM: %s", err)
-            return {"rawText": raw_ocr_text, "error": "JSON_PARSE_FAILED"}
+    # NOTE: the OCR-text -> JSON hop (extract_bhyt_info) was removed together with
+    # PaddleOCR. BHYT cards are now read end-to-end by the VLM in app/parsers/bhyt_vlm.py.
 
 
 @lru_cache(maxsize=1)
