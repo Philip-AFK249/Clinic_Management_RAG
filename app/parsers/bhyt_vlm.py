@@ -13,6 +13,7 @@ import json
 import re
 import unicodedata
 from datetime import date, datetime
+from typing import Mapping
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
@@ -44,14 +45,17 @@ QUY TẮC BẮT BUỘC:
 4. TUYỆT ĐỐI KHÔNG bọc trong markdown ```json``` và không giải thích thêm.
 5. Ngày tháng luôn trả về định dạng DD/MM/YYYY.
 6. ma_so_bhyt ghi liền, không dấu cách, viết HOA (ví dụ: "HC4915361000392" hoặc "DN4797912345678").
+7. ma_noi_dkkcb_ban_dau là mã nơi khám chữa bệnh ban đầu in trên thẻ, giữ nguyên dấu gạch nối (ví dụ: "79-014"). Nơi này KHÁC ma_so_bhyt.
+8. noi_kham_chua_benh_ban_dau là TÊN nơi khám chữa bệnh ban đầu (ví dụ: "BV Đa Khoa Sài Gòn"), không kèm mã số.
 
 SCHEMA JSON BẮT BUỘC:
 {
   "ho_ten": "HỌ VÀ TÊN IN HOA",
-  "ma_so_bhyt": "15 ký tự chữ và số",
+  "ma_so_bhyt": "15 ký tự chữ và số viết liền, ví dụ: DN4797912345678",
   "ngay_sinh": "DD/MM/YYYY",
   "gioi_tinh": "Nam hoặc Nữ",
-  "noi_kham_chua_benh_ban_dau": "string",
+  "ma_noi_dkkcb_ban_dau": "Mã nơi KCB, ví dụ: 79-014 hoặc null",
+  "noi_kham_chua_benh_ban_dau": "Tên nơi KCB, ví dụ: BV Đa Khoa Sài Gòn hoặc null",
   "gia_tri_su_dung_tu": "DD/MM/YYYY",
   "gia_tri_su_dung_den": "DD/MM/YYYY hoặc null",
   "con_han": true,
@@ -60,17 +64,40 @@ SCHEMA JSON BẮT BUỘC:
 
 
 class BhytData(BaseModel):
-    """Structured payload extracted from a BHYT card."""
+    """Structured payload extracted from a BHYT card.
 
+    Carries parallel representations of the same card so that the Vietnamese
+    verification table, the React booking form at :5173 and the Spring Boot
+    services can consume it without a mapping layer. The snake_case fields stay
+    canonical; every derived display/ISO field is computed in
+    `normalise_bhyt_payload` so all entry points stay consistent.
+    """
+
+    # --- Vietnamese fields (verification table display) ---
     ho_ten: str | None = None
-    ma_so_bhyt: str | None = None
-    ngay_sinh: str | None = None
+    ma_so_bhyt: str | None = None  # raw 15 alnum code (e.g. DN4797912345678)
+    ma_so_bhyt_formatted: str | None = None  # display code with spaces (DN 4 79 79 12345678)
+    ngay_sinh: str | None = None  # card printed format: DD/MM/YYYY
+    ngay_sinh_iso: str | None = None  # form input format: YYYY-MM-DD
     gioi_tinh: str | None = None
-    noi_kham_chua_benh_ban_dau: str | None = None
-    gia_tri_su_dung_tu: str | None = None
-    gia_tri_su_dung_den: str | None = None
+    ma_noi_dkkcb_ban_dau: str | None = None  # e.g. 79-014
+    noi_kham_chua_benh_ban_dau: str | None = None  # e.g. BV Đa Khoa Sài Gòn
+    noi_kcb_ban_dau_full: str | None = None  # combined: 79-014 (BV Đa Khoa Sài Gòn)
+    gia_tri_su_dung_tu: str | None = None  # DD/MM/YYYY
+    gia_tri_su_dung_den: str | None = None  # DD/MM/YYYY
     con_han: bool | None = None
     ghi_chu: str | None = None
+
+    # --- camelCase fields (React frontend & Spring Boot API compatibility) ---
+    fullName: str | None = None
+    insuranceCode: str | None = None
+    dateOfBirth: str | None = None  # YYYY-MM-DD
+    gender: str | None = None  # "Nam" or "Nữ"
+    initialHospitalCode: str | None = None
+    validFrom: str | None = None  # YYYY-MM-DD
+    validUntil: str | None = None  # YYYY-MM-DD
+    isExpired: bool = False
+    isOcrVerified: bool = True
 
 
 def _strip_accents(text: str) -> str:
@@ -168,12 +195,63 @@ def _normalise_date(value: object) -> str | None:
     return _parse_vn_long_date(text) or text
 
 
+def to_iso_date(date_str: str | None) -> str | None:
+    """DD/MM/YYYY -> YYYY-MM-DD for `<input type="date">` and Java LocalDate.
+
+    Returns None for anything unparseable rather than passing the raw string
+    through: Spring's LocalDate binding throws on a malformed date, so a null
+    is the only safe fallback for an OCR field we could not read.
+    """
+    if not date_str:
+        return None
+    text = str(date_str).strip()
+    if not text:
+        return None
+
+    # Already ISO, or a near miss such as "1980-1-8".
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    # Vietnamese long form, e.g. "Ngày 10 tháng 12 năm 2020".
+    long_form = _parse_vn_long_date(text)
+    if long_form:
+        try:
+            return datetime.strptime(long_form, "%d/%m/%Y").date().isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+# Backwards-compatible private alias for the pre-rename call sites.
+_to_iso_date = to_iso_date
+
+
 def normalise_insurance_code(value: object) -> str | None:
     """Cards are printed with spaces/dashes; the canonical form is 15 alnum chars."""
     if value is None:
         return None
     code = re.sub(r"[^A-Za-z0-9]", "", str(value)).upper()
     return code or None
+
+
+def format_insurance_code(code: str | None) -> str | None:
+    """Group a 15-character BHYT code the way the card prints it.
+
+    `DN4797912345678` -> `DN 4 79 79 12345678` (2 / 1 / 2 / 2 / 8 groups).
+    Short or malformed codes are returned uppercased but ungrouped, so a
+    misread code stays visibly wrong instead of being silently reshaped.
+    """
+    if not code:
+        return None
+    c = re.sub(r"[^A-Za-z0-9]", "", str(code)).upper()
+    if not c:
+        return None
+    if len(c) == INSURANCE_CODE_LENGTH:
+        return f"{c[0:2]} {c[2]} {c[3:5]} {c[5:7]} {c[7:]}"
+    return c
 
 
 def _normalise_gender(value: object) -> str | None:
@@ -226,18 +304,68 @@ def _text_or_none(value: object) -> str | None:
     return text or None
 
 
-def normalise_bhyt_payload(raw: dict) -> BhytData:
+# camelCase -> snake_case aliases, so callers may send either convention.
+_CAMEL_TO_SNAKE = {
+    "fullName": "ho_ten",
+    "insuranceCode": "ma_so_bhyt",
+    "dateOfBirth": "ngay_sinh",
+    "gender": "gioi_tinh",
+    "initialHospitalCode": "noi_kham_chua_benh_ban_dau",
+    "initialHospitalName": "noi_kham_chua_benh_ban_dau",
+    "initialHospitalCodeNumber": "ma_noi_dkkcb_ban_dau",
+    "maNoiDkkcbBanDau": "ma_noi_dkkcb_ban_dau",
+    "validFrom": "gia_tri_su_dung_tu",
+    "validUntil": "gia_tri_su_dung_den",
+}
+
+
+def alias_camel_keys(raw: Mapping[str, object]) -> dict:
+    """Fold camelCase keys onto their snake_case equivalents.
+
+    snake_case wins when both are supplied. `isExpired` is the inverse of
+    `con_han`, and `isOcrVerified` is a derived output rather than an input, so
+    both are handled explicitly.
+    """
+    data = dict(raw)
+    for camel, snake in _CAMEL_TO_SNAKE.items():
+        if data.get(snake) is None and data.get(camel) is not None:
+            data[snake] = data[camel]
+    if data.get("con_han") is None and data.get("isExpired") is not None:
+        data["con_han"] = not bool(data["isExpired"])
+    return data
+
+
+def normalise_bhyt_payload(raw: Mapping[str, object]) -> BhytData:
     """Map any raw mapping onto the canonical schema and normalise every value.
 
     Shared by the VLM response path and the patient-confirmed save path so both
-    produce identical, fully-populated records.
+    produce identical, fully-populated records. Accepts snake_case or camelCase
+    input and always emits both.
     """
+    raw = alias_camel_keys(raw)
+
+    raw_code = normalise_insurance_code(raw.get("ma_so_bhyt"))
+    ngay_sinh_raw = _normalise_date(raw.get("ngay_sinh"))
+    ma_kcb = _text_or_none(raw.get("ma_noi_dkkcb_ban_dau"))
+    ten_kcb = _text_or_none(raw.get("noi_kham_chua_benh_ban_dau"))
+
+    # The booking form shows one line: "79-014 (BV Đa Khoa Sài Gòn)". Fall back
+    # to whichever half was actually legible on the card.
+    if ma_kcb and ten_kcb:
+        kcb_full = f"{ma_kcb} ({ten_kcb})"
+    else:
+        kcb_full = ten_kcb or ma_kcb
+
     data = BhytData(
         ho_ten=_text_or_none(raw.get("ho_ten")),
-        ma_so_bhyt=normalise_insurance_code(raw.get("ma_so_bhyt")),
-        ngay_sinh=_normalise_date(raw.get("ngay_sinh")),
+        ma_so_bhyt=raw_code,
+        ma_so_bhyt_formatted=format_insurance_code(raw_code),
+        ngay_sinh=ngay_sinh_raw,
+        ngay_sinh_iso=to_iso_date(ngay_sinh_raw),
         gioi_tinh=_normalise_gender(raw.get("gioi_tinh")),
-        noi_kham_chua_benh_ban_dau=_text_or_none(raw.get("noi_kham_chua_benh_ban_dau")),
+        ma_noi_dkkcb_ban_dau=ma_kcb,
+        noi_kham_chua_benh_ban_dau=ten_kcb,
+        noi_kcb_ban_dau_full=kcb_full,
         gia_tri_su_dung_tu=_normalise_date(raw.get("gia_tri_su_dung_tu")),
         gia_tri_su_dung_den=_normalise_date(raw.get("gia_tri_su_dung_den")),
         ghi_chu=_text_or_none(raw.get("ghi_chu")),
@@ -249,6 +377,20 @@ def normalise_bhyt_payload(raw: dict) -> BhytData:
         data.con_han = expiry >= date.today()
     elif raw.get("con_han") is not None:
         data.con_han = bool(raw["con_han"])
+
+    # camelCase mirror for the React frontend / Spring Boot services.
+    data.fullName = data.ho_ten
+    data.insuranceCode = data.ma_so_bhyt
+    data.dateOfBirth = to_iso_date(data.ngay_sinh)
+    data.gender = data.gioi_tinh
+    data.initialHospitalCode = data.noi_kham_chua_benh_ban_dau
+    data.validFrom = to_iso_date(data.gia_tri_su_dung_tu)
+    data.validUntil = to_iso_date(data.gia_tri_su_dung_den)
+    # An unknown expiry is not evidence of expiry; only con_han=False implies it.
+    data.isExpired = not (data.con_han if data.con_han is not None else True)
+    data.isOcrVerified = bool(
+        data.ma_so_bhyt and len(data.ma_so_bhyt) == INSURANCE_CODE_LENGTH
+    )
 
     return data
 

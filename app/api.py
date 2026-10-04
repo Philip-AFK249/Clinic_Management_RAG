@@ -10,12 +10,13 @@ from typing import Optional
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.config import PROJECT_ROOT, get_settings
 from app.core.logging import get_logger
 from app.parsers.bhyt_vlm import (
     BhytData,
+    alias_camel_keys,
     extract_bhyt_from_bytes,
     normalise_bhyt_payload,
     normalise_insurance_code,
@@ -32,7 +33,12 @@ app = FastAPI(title="Smart Clinic - AI Gateway API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,17 +57,30 @@ class BhytOcrResponse(BaseModel):
 
 
 class BhytSaveRequest(BaseModel):
-    """Patient-confirmed payload coming back from the verification table."""
+    """Patient-confirmed payload coming back from the verification table.
+
+    Accepts either the Vietnamese snake_case keys or the camelCase keys used by
+    the React frontend / Spring Boot services; both are folded onto snake_case
+    before validation so a mixed payload from either client works unchanged.
+    """
 
     ho_ten: str = Field(min_length=1, description="Họ tên bệnh nhân đã xác nhận")
     ma_so_bhyt: str = Field(min_length=1, description="Mã số thẻ BHYT đã xác nhận")
     ngay_sinh: Optional[str] = None
     gioi_tinh: Optional[str] = None
+    ma_noi_dkkcb_ban_dau: Optional[str] = None
     noi_kham_chua_benh_ban_dau: Optional[str] = None
     gia_tri_su_dung_tu: Optional[str] = None
     gia_tri_su_dung_den: Optional[str] = None
     con_han: Optional[bool] = None
     ghi_chu: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_camel_case(cls, value):
+        if isinstance(value, dict):
+            return alias_camel_keys(value)
+        return value
 
     @field_validator("ma_so_bhyt")
     @classmethod
