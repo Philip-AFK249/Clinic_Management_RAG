@@ -56,6 +56,25 @@ class IngestResult:
     target_audience: str = DEFAULT_AUDIENCE
 
 
+def purge_document(
+    doc_id: str,
+    settings: Optional[Settings] = None,
+    table: str = "clinic_knowledge_nodes",
+) -> int:
+    """Delete every existing chunk row for ``doc_id``; return how many were removed.
+
+    Used by the pipeline console's "clean replace" option so re-ingesting a file
+    cannot leave the previous version's vectors behind.
+    """
+    with get_connection(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {table} WHERE doc_id = %s;", (doc_id,))
+            deleted = cur.rowcount
+        conn.commit()
+    logger.info("Purged %d existing chunk(s) for doc_id=%s", deleted, doc_id)
+    return max(deleted, 0)
+
+
 def ingest_markdown_file(
     markdown_path: Path,
     doc_id: str,

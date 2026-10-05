@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Smart Clinic - RAG Pipeline Controller</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased">
+
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+  <!-- ===== Header ===== -->
+  <header class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-8">
+    <div>
+      <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
+        Smart Clinic &mdash; RAG Pipeline Controller
+      </h1>
+      <p class="mt-1 text-sm text-slate-500">
+        Chọn một tài liệu trong <code class="px-1 py-0.5 rounded bg-slate-200 text-slate-700">data/raw_docs/</code>
+        để phân tích &rarr; chia đoạn &rarr; tạo vector &rarr; nạp vào pgvector.
+      </p>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+      <span id="dbPill" class="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-white border border-slate-200 shadow-sm text-sm">
+        <span id="dbDot" class="w-2.5 h-2.5 rounded-full bg-slate-300"></span>
+        <span class="font-medium text-slate-700">PostgreSQL</span>
+        <span id="dbText" class="text-slate-400">đang kiểm tra…</span>
+      </span>
+      <span class="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-white border border-slate-200 shadow-sm text-sm">
+        <span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+        <span class="font-medium text-slate-700">Embedding</span>
+        <span id="modelText" class="font-mono text-xs text-slate-500">BAAI/bge-m3</span>
+      </span>
+    </div>
+  </header>
+
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+    <!-- ===== File selection ===== -->
+    <section class="lg:col-span-5 bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+        <h2 class="font-semibold text-slate-900">1 &middot; Chọn tài liệu</h2>
+        <button id="reloadBtn" class="text-xs font-medium text-indigo-600 hover:text-indigo-800 hover:underline">
+          Tải lại
+        </button>
+      </div>
+      <div id="fileList" class="max-h-[28rem] overflow-y-auto divide-y divide-slate-100"></div>
+      <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex items-center justify-between">
+        <span id="rawCount">0 tài liệu</span>
+        <span id="parsedCount">0 file .md</span>
+      </div>
+    </section>
+
+    <!-- ===== Config + Action ===== -->
+    <section class="lg:col-span-7 flex flex-col gap-6">
+      <div class="bg-white rounded-xl border border-slate-200 shadow-sm">
+        <div class="px-5 py-4 border-b border-slate-200">
+          <h2 class="font-semibold text-slate-900">2 &middot; Cấu hình chạy</h2>
+        </div>
+        <div class="p-5 space-y-6">
+
+          <!-- selected file summary -->
+          <div id="selectedBox" class="rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-sm">
+            <span class="text-slate-500">Chưa chọn tài liệu nào.</span>
+          </div>
+
+          <!-- parser -->
+          <fieldset>
+            <legend class="text-sm font-medium text-slate-700 mb-2">Bộ phân tích (Parser)</legend>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label class="cursor-pointer">
+                <input type="radio" name="parser" value="docling" class="peer sr-only" checked />
+                <div class="rounded-lg border border-slate-200 p-4 peer-checked:border-indigo-500 peer-checked:bg-indigo-50 peer-checked:ring-1 peer-checked:ring-indigo-500 transition">
+                  <div class="font-medium text-slate-900">Docling <span class="text-xs font-normal text-slate-500">(Fast Local CPU)</span></div>
+                  <div class="mt-1 text-xs text-slate-500">Cấu trúc xác định, ổn định, chạy ngoại tuyến. Khuyến nghị cho file .docx.</div>
+                </div>
+              </label>
+              <label class="cursor-pointer">
+                <input type="radio" name="parser" value="llama" class="peer sr-only" />
+                <div class="rounded-lg border border-slate-200 p-4 peer-checked:border-indigo-500 peer-checked:bg-indigo-50 peer-checked:ring-1 peer-checked:ring-indigo-500 transition">
+                  <div class="font-medium text-slate-900">LlamaParse <span class="text-xs font-normal text-slate-500">(Cloud Vision)</span></div>
+                  <div class="mt-1 text-xs text-slate-500">Đọc layout &amp; bảng bằng mô hình đa phương thức. Chậm hơn, cần kết nối mạng.</div>
+                </div>
+              </label>
+            </div>
+            <p id="parserHint" class="mt-2 hidden text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2"></p>
+          </fieldset>
+
+          <!-- audience -->
+          <div>
+            <label for="audience" class="block text-sm font-medium text-slate-700 mb-2">Đối tượng sử dụng (Target audience)</label>
+            <select id="audience" class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+              <option value="auto">Tự động nhận diện (Auto-detect)</option>
+              <option value="tiep_don">Tiếp đón / Triage</option>
+              <option value="bac_si">Bác sĩ (Protocols)</option>
+            </select>
+            <p class="mt-1 text-xs text-slate-500" id="audienceHint">Khoa chuyên khoa được tự suy ra từ tên tài liệu.</p>
+          </div>
+
+          <!-- checkboxes -->
+          <div class="space-y-3">
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input id="cleanBox" type="checkbox" checked class="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+              <span>
+                <span class="block text-sm font-medium text-slate-800">Xóa vector cũ của file này trước khi nạp mới (Clean replace)</span>
+                <span class="block text-xs text-slate-500">Xóa các chunk cũ có cùng <code>doc_id</code> để tránh trùng vector.</span>
+              </span>
+            </label>
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input id="reparseBox" type="checkbox" class="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+              <span>
+                <span class="block text-sm font-medium text-slate-800">Phân tích lại file gốc (Force reparse)</span>
+                <span class="block text-xs text-slate-500">Bỏ qua file <code>.md</code> đã có và chạy lại bộ phân tích.</span>
+              </span>
+            </label>
+          </div>
+
+          <button id="runBtn" disabled class="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-5 py-3 text-base font-semibold text-white shadow-sm transition hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:bg-slate-300 disabled:cursor-not-allowed disabled:shadow-none">
+            <span id="runIcon">&#9654;</span>
+            <span id="runLabel">Chạy Pipeline cho file này</span>
+          </button>
+          <p id="runWarning" class="hidden text-xs text-center text-slate-400">
+            Quá trình phân tích PDF và tạo embedding có thể mất vài phút. Vui lòng không đóng trang.
+          </p>
+        </div>
+      </div>
+
+      <!-- summary chips -->
+      <div id="summary" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-3"></div>
+    </section>
+  </div>
+
+  <!-- ===== Terminal ===== -->
+  <section class="mt-6 bg-slate-900 rounded-xl border border-slate-800 shadow-sm overflow-hidden">
+    <div class="px-4 py-3 flex items-center justify-between border-b border-slate-800">
+      <div class="flex items-center gap-2">
+        <span class="w-3 h-3 rounded-full bg-red-500/80"></span>
+        <span class="w-3 h-3 rounded-full bg-yellow-500/80"></span>
+        <span class="w-3 h-3 rounded-full bg-green-500/80"></span>
+        <span class="ml-3 text-sm font-medium text-slate-300">Pipeline output</span>
+      </div>
+      <button id="clearBtn" class="text-xs text-slate-400 hover:text-slate-200">Xóa log</button>
+    </div>
+    <div id="terminal" class="h-96 overflow-y-auto p-4 font-mono text-xs leading-relaxed text-slate-300 space-y-0.5">
+      <div class="text-slate-500">$ sẵn sàng. Chọn một tài liệu để bắt đầu.</div>
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    dbDot: $("dbDot"), dbText: $("dbText"), modelText: $("modelText"),
+    fileList: $("fileList"), rawCount: $("rawCount"), parsedCount: $("parsedCount"),
+    reloadBtn: $("reloadBtn"), selectedBox: $("selectedBox"),
+    audience: $("audience"), audienceHint: $("audienceHint"), parserHint: $("parserHint"),
+    cleanBox: $("cleanBox"), reparseBox: $("reparseBox"),
+    runBtn: $("runBtn"), runIcon: $("runIcon"), runLabel: $("runLabel"), runWarning: $("runWarning"),
+    terminal: $("terminal"), clearBtn: $("clearBtn"), summary: $("summary"),
+  };
+
+  let files = [];
+  let selected = null;
+  let running = false;
+  let timer = null;
+
+  // ---------- terminal ----------
+  function log(text, cls) {
+    const line = document.createElement("div");
+    line.className = cls || "text-slate-300";
+    line.textContent = text;
+    el.terminal.appendChild(line);
+    el.terminal.scrollTop = el.terminal.scrollHeight;
+  }
+  function logRich(timestamp, level, message) {
+    log(timestamp + "  " + level.padEnd(8) + " | " + message,
+        level === "ERROR" ? "text-red-400" : level === "WARNING" ? "text-amber-300" : "text-slate-300");
+  }
+  function clearLog() { el.terminal.innerHTML = ""; }
+
+  // ---------- file list ----------
+  function badge(text, cls) {
+    const b = document.createElement("span");
+    b.className = "px-2 py-0.5 rounded text-[11px] font-semibold uppercase tracking-wide " + cls;
+    b.textContent = text;
+    return b;
+  }
+
+  function renderFiles() {
+    el.fileList.innerHTML = "";
+    if (!files.length) {
+      const empty = document.createElement("div");
+      empty.className = "px-5 py-10 text-center text-sm text-slate-400";
+      empty.textContent = "Không tìm thấy tài liệu .pdf / .docx trong data/raw_docs/.";
+      el.fileList.appendChild(empty);
+      return;
+    }
+    files.forEach((f) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "w-full text-left px-5 py-3 hover:bg-slate-50 transition flex items-center justify-between gap-3";
+      row.dataset.name = f.filename;
+      row.classList.toggle("bg-indigo-50", selected && selected.filename === f.filename);
+
+      const left = document.createElement("div");
+      left.className = "min-w-0";
+      const name = document.createElement("div");
+      name.className = "truncate text-sm font-medium text-slate-800";
+      name.textContent = f.filename;                       // textContent: filenames are untrusted
+      const meta = document.createElement("div");
+      meta.className = "mt-1 flex items-center gap-2";
+      meta.appendChild(badge(f.ext === ".pdf" ? "PDF" : "DOCX",
+                             f.ext === ".pdf" ? "bg-rose-100 text-rose-700" : "bg-sky-100 text-sky-700"));
+      const size = document.createElement("span");
+      size.className = "text-xs text-slate-400";
+      size.textContent = f.size_kb + " KB";
+      meta.appendChild(size);
+      if (f.has_parsed_md) {
+        meta.appendChild(badge("đã có .md", "bg-emerald-100 text-emerald-700"));
+      }
+      left.appendChild(name); left.appendChild(meta);
+
+      const dot = document.createElement("span");
+      dot.className = "text-indigo-600 text-xs";
+      dot.textContent = selected && selected.filename === f.filename ? "●" : "";
+      row.appendChild(left); row.appendChild(dot);
+
+      row.addEventListener("click", () => selectFile(f));
+      el.fileList.appendChild(row);
+    });
+  }
+
+  function selectFile(f) {
+    selected = f;
+    renderFiles();
+
+    el.selectedBox.innerHTML = "";
+    const title = document.createElement("div");
+    title.className = "font-medium text-slate-900 break-all";
+    title.textContent = f.filename;
+    const sub = document.createElement("div");
+    sub.className = "mt-1 text-xs text-slate-500 flex items-center gap-2";
+    sub.appendChild(badge(f.ext === ".pdf" ? "PDF" : "DOCX",
+                          f.ext === ".pdf" ? "bg-rose-100 text-rose-700" : "bg-sky-100 text-sky-700"));
+    const t = document.createElement("span");
+    t.textContent = f.size_kb + " KB · doc_id: " + f.filename.replace(/\.[^.]+$/, "");
+    sub.appendChild(t);
+    if (f.has_parsed_md) sub.appendChild(badge("đã có markdown", "bg-emerald-100 text-emerald-700"));
+    el.selectedBox.appendChild(title); el.selectedBox.appendChild(sub);
+
+    // Evidence: LlamaParse reconstructs .docx and can invent content; Docling extracts.
+    if (f.ext === ".docx" && document.querySelector('input[name="parser"][value="llama"]').checked) {
+      setParserHint("File .docx đang dùng LlamaParse. Cơ chế Cloud có thể tái dựng nội dung " +
+                    "(ảnh chụp cấu trúc, không chỉ trích xuất) — Docling an toàn hơn cho .docx.");
+    } else if (f.ext === ".docx") {
+      setParserHint("Docling được chọn sẵn cho .docx: trích xuất cấu trúc xác định, bảng giữ nguyên.");
+    } else {
+      setParserHint("");
+    }
+    el.runBtn.disabled = false;
+  }
+
+  function setParserHint(text) {
+    el.parserHint.textContent = text || "";
+    el.parserHint.classList.toggle("hidden", !text);
+  }
+
+  function setParser(value) {
+    const input = document.querySelector('input[name="parser"][value="' + value + '"]');
+    if (input) input.checked = true;
+    if (selected) selectFile(selected);
+  }
+
+  // ---------- data ----------
+  async function loadFiles() {
+    el.reloadBtn.disabled = true;
+    try {
+      const res = await fetch("/api/v1/pipeline/files");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      files = data.raw_files || [];
+      el.modelText.textContent = data.embedding_model || "BAAI/bge-m3";
+      el.rawCount.textContent = files.length + " tài liệu trong raw_docs";
+      el.parsedCount.textContent = (data.parsed_files || []).length + " file .md đã phân tích";
+      if (selected) {
+        selected = files.find((f) => f.filename === selected.filename) || null;
+      }
+      renderFiles();
+      el.runBtn.disabled = !selected;
+    } catch (err) {
+      log("Không tải được danh sách tài liệu: " + err.message, "text-red-400");
+    } finally {
+      el.reloadBtn.disabled = false;
+    }
+    await refreshDbStatus();
+  }
+
+  async function refreshDbStatus() {
+    try {
+      const res = await fetch("/api/v1/pipeline/files");
+      const data = await res.json();
+      const db = data.database || { ok: false, detail: "không xác định" };
+      el.dbDot.className = "w-2.5 h-2.5 rounded-full " + (db.ok ? "bg-emerald-500" : "bg-red-500");
+      el.dbText.textContent = db.ok ? "đã kết nối" : "không kết nối";
+      el.dbText.className = db.ok ? "text-emerald-600" : "text-red-500";
+      el.dbText.title = db.detail || "";
+    } catch (err) {
+      el.dbDot.className = "w-2.5 h-2.5 rounded-full bg-red-500";
+      el.dbText.textContent = "không kết nối";
+      el.dbText.title = String(err);
+    }
+  }
+
+  // ---------- summary chips ----------
+  function showSummary(r) {
+    el.summary.innerHTML = "";
+    el.summary.classList.remove("hidden");
+    const items = [
+      ["Chunks nạp", String(r.chunks_created), "bg-indigo-50 text-indigo-700 border-indigo-200"],
+      ["Thực thể", String(r.entities_found), "bg-emerald-50 text-emerald-700 border-emerald-200"],
+      ["Khoa / Đối tượng", (r.specialty || "?") + " · " + (r.target_audience || "?"), "bg-sky-50 text-sky-700 border-sky-200"],
+      ["Chunk cũ đã xóa", String(r.rows_deleted), "bg-slate-50 text-slate-700 border-slate-200"],
+    ];
+    items.forEach(([label, value, cls]) => {
+      const card = document.createElement("div");
+      card.className = "rounded-lg border px-4 py-3 " + cls;
+      const l = document.createElement("div");
+      l.className = "text-xs opacity-80";
+      l.textContent = label;
+      const v = document.createElement("div");
+      v.className = "mt-1 font-semibold break-words";
+      v.textContent = value;
+      card.appendChild(l); card.appendChild(v);
+      el.summary.appendChild(card);
+    });
+  }
+
+  // ---------- run ----------
+  function formatDetail(detail) {
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      return detail.map(function (d) {
+        if (typeof d === "string") return d;
+        const loc = (d.loc || []).slice(-1)[0];
+        const field = loc && loc.loc ? loc.loc.join(".") : "";
+        return field ? field + ": " + d.msg : d.msg;
+      }).join(" | ");
+    }
+    return JSON.stringify(detail);
+  }
+
+  async function run() {
+    if (!selected || running) return;
+    running = true;
+    el.runBtn.disabled = true;
+    el.runBtn.classList.add("opacity-70");
+    el.runIcon.innerHTML = '<span class="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>';
+    el.runLabel.textContent = "Đang xử lý…";
+    el.runWarning.classList.remove("hidden");
+    el.summary.classList.add("hidden");
+
+    const parser = document.querySelector('input[name="parser"]:checked').value;
+    const payload = {
+      filename: selected.filename,
+      parser_type: parser,
+      force_reparse: el.reparseBox.checked,
+      clean_doc_first: el.cleanBox.checked,
+      target_audience_override: el.audience.value,
+    };
+
+    const started = Date.now();
+    const tick = function () {
+      const s = Math.floor((Date.now() - started) / 1000);
+      el.runLabel.textContent = "Đang xử lý… " + s + "s";
+    };
+    tick(); timer = setInterval(tick, 1000);
+
+    log("$ POST /api/v1/pipeline/run-single  " + JSON.stringify(payload), "text-sky-300");
+
+    try {
+      const res = await fetch("/api/v1/pipeline/run-single", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json().catch(function () { return {}; });
+
+      if (!res.ok) {
+        (body.logs || []).forEach(function (line) { log("  " + line, "text-slate-400"); });
+        log("✗ Thất bại (HTTP " + res.status + "): " + formatDetail(body.detail || body.message || body), "text-red-400");
+        return;
+      }
+
+      (body.logs || []).forEach(function (line) {
+        const parts = line.split("|");
+        if (parts.length >= 2) {
+          logRich(new Date().toISOString().slice(11, 19), parts[0].trim(), parts.slice(1).join("|").trim());
+        } else {
+          log(line, "text-slate-300");
+        }
+      });
+
+      log("✓ " + body.message, "text-emerald-400 font-semibold");
+      showSummary(body);
+      log("   parser=" + body.parser_used + " · markdown=" + body.markdown_path +
+          " · " + (body.duration_ms / 1000).toFixed(1) + "s");
+      refreshDbStatus();
+    } catch (err) {
+      log("✗ Lỗi mạng: " + err, "text-red-400");
+    } finally {
+      clearInterval(timer); timer = null; running = false;
+      el.runBtn.classList.remove("opacity-70");
+      el.runIcon.innerHTML = "&#9654;";
+      el.runLabel.textContent = "Chạy Pipeline cho file này";
+      el.runWarning.classList.add("hidden");
+      el.runBtn.disabled = !selected;
+    }
+  }
+
+  // ---------- events ----------
+  el.reloadBtn.addEventListener("click", loadFiles);
+  el.clearBtn.addEventListener("click", clearLog);
+  el.runBtn.addEventListener("click", run);
+  document.querySelectorAll('input[name="parser"]').forEach(function (r) {
+    r.addEventListener("change", function () { if (selected) selectFile(selected); });
+  });
+  el.audience.addEventListener("change", function () {
+    el.audienceHint.textContent = el.audience.value === "auto"
+      ? "Khoa chuyên khoa và đối tượng được tự suy ra từ tên tài liệu."
+      : "Đối tượng sẽ bị ghi đè; khoa chuyên khoa vẫn tự suy ra từ tên tài liệu.";
+  });
+
+  if (files.length && !selected) setParser("docling");
+  loadFiles();
+  // Select the first document by default for convenience.
+  setTimeout(function () {
+    if (!selected && files.length) selectFile(files[0]);
+  }, 400);
+})();
+</script>
+</body>
+</html>

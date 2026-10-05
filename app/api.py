@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import time
-from typing import Optional
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Literal, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.core.config import PROJECT_ROOT, get_settings
+from app.core.config import PARSED_MARKDOWN_DIR, PROJECT_ROOT, RAW_DOCS_DIR, get_settings
 from app.core.logging import get_logger
 from app.parsers.bhyt_vlm import (
     BhytData,
@@ -28,6 +31,10 @@ from app.services import bhyt_store
 logger = get_logger(__name__)
 
 INDEX_HTML = PROJECT_ROOT / "index.html"
+PIPELINE_HTML = PROJECT_ROOT / "app" / "static" / "pipeline.html"
+
+# Document types the pipeline console is allowed to ingest.
+RAW_DOC_EXTENSIONS = (".pdf", ".docx")
 
 app = FastAPI(title="Smart Clinic - AI Gateway API", version="3.0")
 
@@ -98,6 +105,66 @@ class BhytSaveResponse(BaseModel):
     message: str
     warnings: list[str] = Field(default_factory=list)
     record: dict
+
+
+class PipelineFileInfo(BaseModel):
+    filename: str
+    size_kb: float
+    ext: str
+    has_parsed_md: bool = False
+
+
+class DatabaseStatus(BaseModel):
+    ok: bool
+    detail: str
+
+
+class PipelineFilesResponse(BaseModel):
+    raw_files: list[PipelineFileInfo] = Field(default_factory=list)
+    parsed_files: list[PipelineFileInfo] = Field(default_factory=list)
+    raw_docs_dir: str
+    parsed_markdown_dir: str
+    database: DatabaseStatus
+    embedding_model: str
+
+
+class PipelineRunRequest(BaseModel):
+    """Ask the ingestion pipeline to process exactly one file from raw_docs."""
+
+    filename: str = Field(min_length=1, description="Tên file trong data/raw_docs/")
+    parser_type: Literal["llama", "docling"] = "docling"
+    force_reparse: bool = False
+    clean_doc_first: bool = True
+    target_audience_override: Literal["auto", "tiep_don", "bac_si"] = "auto"
+    specialty_override: Optional[Literal["tim_mach", "ho_hap_di_ung", "da_lieu", "chung"]] = None
+
+    @field_validator("filename")
+    @classmethod
+    def _reject_path_traversal(cls, value: str) -> str:
+        """Only ever accept a bare filename, never a path."""
+        cleaned = value.strip()
+        if not cleaned or cleaned in {".", ".."}:
+            raise ValueError("Tên file không hợp lệ.")
+        if Path(cleaned).name != cleaned or "/" in cleaned or "\\" in cleaned:
+            raise ValueError("Chỉ được truyền tên file, không dùng đường dẫn.")
+        return cleaned
+
+
+class PipelineRunResponse(BaseModel):
+    success: bool
+    doc_id: str = ""
+    filename: str = ""
+    specialty: str = ""
+    target_audience: str = ""
+    parser_used: str = ""
+    markdown_path: str = ""
+    chunks_created: int = 0
+    entities_found: int = 0
+    rows_deleted: int = 0
+    reparsed: bool = False
+    duration_ms: float = 0.0
+    message: str = ""
+    logs: list[str] = Field(default_factory=list)
 
 
 @app.get("/", include_in_schema=False)
@@ -211,6 +278,270 @@ async def save_bhyt_record(payload: BhytSaveRequest):
         warnings=warnings,
         record=record,
     )
+
+
+class _LogCollector(logging.Handler):
+    """Buffers `app.*` log records so the UI can show the run's log afterwards."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.setFormatter(logging.Formatter("%(levelname)-8s | %(message)s"))
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not record.name.startswith("app"):
+            return
+        try:
+            self.records.append(self.format(record))
+        except Exception:  # never let logging break the request
+            pass
+
+
+@contextmanager
+def _capture_logs():
+    """Tee application logs into a list for the duration of the block."""
+    collector = _LogCollector()
+    root = logging.getLogger()
+    previous_level = root.level
+    root.addHandler(collector)
+    root.setLevel(logging.INFO)
+    try:
+        yield collector
+    finally:
+        root.removeHandler(collector)
+        root.setLevel(previous_level)
+
+
+def _file_size_kb(path: Path) -> float:
+    return round(path.stat().st_size / 1024, 1)
+
+
+def _check_database(settings) -> DatabaseStatus:
+    """Liveness probe with a hard 3s timeout so the UI cannot hang on page load.
+
+    libpq has no default connect timeout, so the probe sets one explicitly
+    instead of going through ``get_connection`` (which leaves config untouched).
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(settings.db_dsn, connect_timeout=3, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+        return DatabaseStatus(ok=True, detail="Đã kết nối")
+    except Exception as exc:
+        return DatabaseStatus(ok=False, detail=str(exc).strip().splitlines()[0][:200])
+
+
+def _resolve_raw_file(filename: str) -> Path:
+    """Map a bare filename onto data/raw_docs/, refusing anything that escapes it."""
+    candidate = (RAW_DOCS_DIR / filename).resolve()
+    try:
+        candidate.relative_to(RAW_DOCS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Đường dẫn không hợp lệ.",
+        )
+    if candidate.suffix.lower() not in RAW_DOC_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Chỉ hỗ trợ {' / '.join(RAW_DOC_EXTENSIONS)}.",
+        )
+    if not candidate.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Không tìm thấy file '{filename}' trong data/raw_docs/.",
+        )
+    return candidate
+
+
+def _parse_to_markdown(source: Path, parser_type: str) -> tuple[Path, str]:
+    """Parse ``source`` into data/parsed_markdown/; returns (md_path, parser_used)."""
+    # Heavy imports stay inside the worker thread: pulling in sentence-transformers
+    # and docling at module scope would add ~30s to API startup.
+    target_dir = PARSED_MARKDOWN_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if parser_type == "llama":
+        from app.parsers.llamaparse_parser import LlamaParseParser
+
+        try:
+            parser = LlamaParseParser(output_dir=target_dir, settings=get_settings())
+        except Exception as exc:
+            logger.warning("LlamaParse unavailable (%s) - falling back to Docling", exc)
+            return _parse_to_markdown(source, "docling")
+        parser.parse(source)
+        return target_dir / f"{source.stem}.md", "llama"
+
+    from app.parsers.docling_parser import DoclingParser
+
+    DoclingParser(output_dir=target_dir).parse(source)
+    return target_dir / f"{source.stem}.md", "docling"
+
+
+def _run_single_pipeline(payload: PipelineRunRequest) -> PipelineRunResponse:
+    """Blocking pipeline body; always executed off the event loop."""
+    from app.ingestion.pipeline import (
+        classify_document,
+        ingest_markdown_file,
+        purge_document,
+    )
+
+    started = time.perf_counter()
+    settings = get_settings()
+    source = None
+    doc_id = Path(payload.filename).stem
+    markdown_path = PARSED_MARKDOWN_DIR / f"{doc_id}.md"
+    parser_used = payload.parser_type
+
+    with _capture_logs() as collector:
+      try:
+        source = _resolve_raw_file(payload.filename)
+        doc_id = source.stem
+        markdown_path = PARSED_MARKDOWN_DIR / f"{doc_id}.md"
+        logger.info("=== Pipeline run: %s ===", source.name)
+        logger.info("Source: %s (%.1f KB)", source, _file_size_kb(source))
+
+        if markdown_path.exists() and not payload.force_reparse:
+            logger.info("Reusing existing Markdown %s (force_reparse=false)", markdown_path.name)
+        else:
+            logger.info("Parsing with %s -> data/parsed_markdown/%s.md", payload.parser_type, doc_id)
+            markdown_path, parser_used = _parse_to_markdown(source, payload.parser_type)
+            if not markdown_path.is_file():
+                raise RuntimeError(f"Bộ phân tích không tạo ra file {markdown_path.name}.")
+            logger.info("Parsed Markdown ready (%d chars)", len(markdown_path.read_text(encoding="utf-8")))
+
+        auto_specialty, auto_audience = classify_document(doc_id)
+        specialty = payload.specialty_override or auto_specialty
+        target_audience = (
+            auto_audience
+            if payload.target_audience_override == "auto"
+            else payload.target_audience_override
+        )
+        logger.info("Routing -> specialty=%s | target_audience=%s", specialty, target_audience)
+
+        rows_deleted = 0
+        if payload.clean_doc_first:
+            rows_deleted = purge_document(doc_id, settings)
+        else:
+            logger.warning("clean_doc_first=false: existing chunks of this doc are kept.")
+
+        result = ingest_markdown_file(
+            markdown_path,
+            doc_id,
+            specialty,
+            target_audience,
+            settings,
+            migrate=True,
+        )
+
+        message = (
+            f"Đã nạp {result.total_chunks} chunk cho '{doc_id}' "
+            f"[{specialty} / {target_audience}]."
+        )
+        logger.info(message)
+        return PipelineRunResponse(
+            success=True,
+            doc_id=doc_id,
+            filename=source.name,
+            specialty=specialty,
+            target_audience=target_audience,
+            parser_used=parser_used,
+            markdown_path=str(markdown_path.relative_to(PROJECT_ROOT)),
+            chunks_created=result.total_chunks,
+            entities_found=result.entities_found,
+            rows_deleted=rows_deleted,
+            reparsed=bool(payload.force_reparse),
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            message=message,
+            logs=collector.records,
+        )
+      except HTTPException:
+        raise
+      except Exception as exc:
+        # Surface a correct status code while still shipping the partial log.
+        logger.exception("Pipeline run failed for %s: %s", payload.filename, exc)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=PipelineRunResponse(
+                success=False,
+                doc_id=doc_id,
+                filename=payload.filename,
+                parser_used=parser_used,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                message=f"{type(exc).__name__}: {exc}",
+                logs=collector.records,
+            ).model_dump(),
+        )
+
+
+@app.get("/pipeline", include_in_schema=False)
+async def serve_pipeline_console():
+    """Serve the RAG pipeline controller (vanilla HTML, no Streamlit)."""
+    if not PIPELINE_HTML.exists():
+        logger.error("Không tìm thấy %s", PIPELINE_HTML)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Không tìm thấy giao diện pipeline.html.",
+        )
+    return FileResponse(PIPELINE_HTML)
+
+
+@app.get("/api/v1/pipeline/files", response_model=PipelineFilesResponse)
+async def list_pipeline_files():
+    """List ingestible documents in raw_docs plus already-parsed Markdown."""
+    settings = get_settings()
+    raw_files: list[PipelineFileInfo] = []
+    if RAW_DOCS_DIR.is_dir():
+        for path in sorted(RAW_DOCS_DIR.iterdir(), key=lambda p: p.name.lower()):
+            if not path.is_file() or path.suffix.lower() not in RAW_DOC_EXTENSIONS:
+                continue
+            raw_files.append(
+                PipelineFileInfo(
+                    filename=path.name,
+                    size_kb=_file_size_kb(path),
+                    ext=path.suffix.lower(),
+                    has_parsed_md=(PARSED_MARKDOWN_DIR / f"{path.stem}.md").is_file(),
+                )
+            )
+
+    parsed_files: list[PipelineFileInfo] = []
+    if PARSED_MARKDOWN_DIR.is_dir():
+        for path in sorted(PARSED_MARKDOWN_DIR.glob("*.md")):
+            if path.is_file():
+                parsed_files.append(
+                    PipelineFileInfo(
+                        filename=path.name,
+                        size_kb=_file_size_kb(path),
+                        ext=path.suffix.lower(),
+                    )
+                )
+
+    return PipelineFilesResponse(
+        raw_files=raw_files,
+        parsed_files=parsed_files,
+        raw_docs_dir=str(RAW_DOCS_DIR.relative_to(PROJECT_ROOT)),
+        parsed_markdown_dir=str(PARSED_MARKDOWN_DIR.relative_to(PROJECT_ROOT)),
+        database=_check_database(settings),
+        embedding_model=settings.EMBEDDING_MODEL,
+    )
+
+
+@app.post("/api/v1/pipeline/run-single", response_model=PipelineRunResponse)
+async def run_single_file(payload: PipelineRunRequest):
+    """Parse -> chunk -> embed -> insert one document from raw_docs into pgvector."""
+    try:
+        return await asyncio.to_thread(_run_single_pipeline, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Pipeline run failed for %s: %s", payload.filename, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
 if __name__ == "__main__":
