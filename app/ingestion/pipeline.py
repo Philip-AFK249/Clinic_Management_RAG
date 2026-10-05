@@ -1,6 +1,9 @@
 """Ingestion orchestrator: Parse -> Chunk -> Extract -> Embed -> Insert."""
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 from psycopg.types.json import Jsonb
 
@@ -20,6 +23,29 @@ INSERT_SQL = """
     VALUES (%s, %s, %s, %s, %s, %s::jsonb);
 """
 
+# Department routing for the three clinical departments plus the catch-all.
+DEFAULT_SPECIALTY = "chung"
+DEFAULT_AUDIENCE = "bac_si"
+
+# Order matters: the first matching department wins, so more specific keyword
+# sets are listed before broader ones.
+SPECIALTY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "tim_mach": (
+        "tim_mach", "tim mach", "noi_khoa", "cardio", "cardiology",
+        "tuan_hoan", "huyet_ap", "nhoi_mau", "dien_tam", "nong_van",
+    ),
+    "ho_hap_di_ung": (
+        "ho_hap", "di_ung", "tai_mui_hong", "tai_mui", "respiratory",
+        "ent", "hen_suyen", "phoi", "sung_mui", "vien_xoang",
+    ),
+    "da_lieu": ("da_lieu", "derma", "dermat", "dermatology", "vay_nen"),
+}
+
+# Documents aimed at reception / triage rather than at clinicians.
+AUDIENCE_TRIAGE_KEYWORDS: tuple[str, ...] = (
+    "triage", "tiep_don", "sang_loc", "trieu_chung",
+)
+
 
 @dataclass
 class IngestResult:
@@ -27,18 +53,25 @@ class IngestResult:
     specialty: str
     total_chunks: int
     entities_found: int
+    target_audience: str = DEFAULT_AUDIENCE
 
 
 def ingest_markdown_file(
     markdown_path: Path,
     doc_id: str,
     specialty: str,
-    target_audience: str = "bac_si",
-    settings: Settings | None = None,
+    target_audience: str = DEFAULT_AUDIENCE,
+    settings: Optional[Settings] = None,
+    migrate: bool = True,
 ) -> IngestResult:
-    """Chunk, embed, and insert a single Markdown file into pgvector."""
+    """Chunk, embed, and insert a single Markdown file into pgvector.
+
+    ``migrate=False`` lets a batch caller apply the DDL once instead of paying
+    for four statements per file.
+    """
     settings = settings or get_settings()
-    run_migrations(settings)
+    if migrate:
+        run_migrations(settings)
 
     markdown_path = Path(markdown_path)
     chunks = chunk_markdown(
@@ -47,6 +80,16 @@ def ingest_markdown_file(
         overlap=settings.CHUNK_OVERLAP,
     )
     total = len(chunks)
+    if total == 0:
+        logger.warning("No usable content in %s - skipping", markdown_path.name)
+        return IngestResult(
+            doc_id=doc_id,
+            specialty=specialty,
+            total_chunks=0,
+            entities_found=0,
+            target_audience=target_audience,
+        )
+
     logger.info("Embedding %d chunks from %s", total, markdown_path.name)
     embeddings = embed_texts(chunks, settings)
 
@@ -56,7 +99,13 @@ def ingest_markdown_file(
             for idx, (content, embedding) in enumerate(zip(chunks, embeddings), 1):
                 entities: ExtractedEntities = extract_entities(content)
                 entities_count += len(entities.icd10_codes) + len(entities.medications)
-                metadata = {"entities": entities.as_dict}
+                metadata = {
+                    "entities": entities.as_dict,
+                    "chunk_index": idx - 1,
+                    "specialty": specialty,
+                    "target_audience": target_audience,
+                    "source_file": markdown_path.name,
+                }
                 cur.execute(
                     INSERT_SQL,
                     (doc_id, specialty, target_audience, content, embedding, Jsonb(metadata)),
@@ -66,22 +115,28 @@ def ingest_markdown_file(
                     logger.info("  -> [%5.1f%%] Ingested %d/%d chunks", pct, idx, total)
         conn.commit()  # Persist all chunks to the database
 
-    logger.info("Pipeline complete for %s (%d chunks, %d entities)",
-                doc_id, total, entities_count)
+    logger.info("Pipeline complete for %s (%s/%s: %d chunks, %d entities)",
+                doc_id, specialty, target_audience, total, entities_count)
     return IngestResult(
         doc_id=doc_id,
         specialty=specialty,
         total_chunks=total,
         entities_found=entities_count,
+        target_audience=target_audience,
     )
 
 
 def ingest_directory(
     raw_docs_dir: Path = RAW_DOCS_DIR,
     parsed_dir: Path = PARSED_MARKDOWN_DIR,
-    settings: Settings | None = None,
+    settings: Optional[Settings] = None,
 ) -> list[IngestResult]:
-    """Ingest every Markdown file in ``parsed_dir`` using the matching PDF stem."""
+    """Ingest every Markdown file in ``parsed_dir`` using the matching PDF stem.
+
+    Specialty and target audience are inferred from the file stem so the three
+    clinical departments stay separated in the vector store and reception staff
+    only ever retrieve triage material.
+    """
     settings = settings or get_settings()
     results = []
     for md_path in sorted(parsed_dir.glob("*.md")):
@@ -89,23 +144,61 @@ def ingest_directory(
             (f for f in raw_docs_dir.glob("*.pdf") if f.stem == md_path.stem),
             None,
         )
-        specialty = _infer_specialty(md_path.stem)
+        specialty, audience = classify_document(md_path.stem)
         doc_id = md_path.stem
-        logger.info("Ingesting %s (specialty=%s)", md_path.name, specialty)
+        logger.info(
+            "Ingesting %s (specialty=%s, audience=%s, source=%s)",
+            md_path.name, specialty, audience, source.name if source else "markdown-only",
+        )
         results.append(
-            ingest_markdown_file(md_path, doc_id, specialty, settings=settings)
+            ingest_markdown_file(
+                md_path,
+                doc_id,
+                specialty,
+                target_audience=audience,
+                settings=settings,
+            )
         )
     return results
 
 
+def classify_document(stem: str) -> Tuple[str, str]:
+    """Return ``(specialty, target_audience)`` inferred from a document stem."""
+    return _infer_specialty(stem), _infer_target_audience(stem)
+
+
+def _normalise_stem(stem: str) -> str:
+    """Lowercase, strip accents and fold separators for keyword matching."""
+    decomposed = unicodedata.normalize("NFD", stem.lower())
+    flat = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "_", flat).strip("_")
+
+
+def _matches_token(haystack: str, keyword: str) -> bool:
+    """Whole-token match so ``ent`` never fires inside ``different``/``trent``."""
+    token = _normalise_stem(keyword)
+    if not token:
+        return False
+    return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", haystack) is not None
+
+
 def _infer_specialty(stem: str) -> str:
-    if "tim_mach" in stem:
-        return "tim_mach"
-    if "da_lieu" in stem:
-        return "da_lieu"
-    if "noi_khoa" in stem:
-        return "noi_khoa"
-    return "chung"
+    """Route a document to one of the three departments, else ``chung``."""
+    haystack = _normalise_stem(stem)
+    if not haystack:
+        return DEFAULT_SPECIALTY
+    for specialty, keywords in SPECIALTY_KEYWORDS.items():
+        if any(_matches_token(haystack, kw) for kw in keywords):
+            return specialty
+    return DEFAULT_SPECIALTY
+
+
+def _infer_target_audience(stem: str) -> str:
+    """``tiep_don`` for triage/voice-booking material, else ``bac_si``."""
+    haystack = _normalise_stem(stem)
+    if any(_matches_token(haystack, kw) for kw in AUDIENCE_TRIAGE_KEYWORDS):
+        return "tiep_don"
+    return DEFAULT_AUDIENCE
 
 
 if __name__ == "__main__":

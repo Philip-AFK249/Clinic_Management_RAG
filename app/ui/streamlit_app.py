@@ -116,9 +116,11 @@ def patient_interface() -> None:
                         model=settings.LLM_STT_MODEL_ID,
                         language="vi",
                         prompt=(
-                            "Khám bệnh, đau thắt ngực, khó thở, huyết áp, da liễu, "
-                            "nổi mẩn đỏ, ngứa ngáy, mụn nước, dát sẩn, vảy nến, "
-                            "bong vảy, viêm da cơ địa, zona, lở loét."
+                            "Khám bệnh, đau thắt ngực, khó thở, huyết áp, hồi hộp, "
+                            "tim mạch, sốt cao, ho khạc đờm, ho khan, đau rát họng, "
+                            "khò khè, hen suyễn, sổ mũi, viêm xoang, dị ứng, nổi mẩn đỏ, "
+                            "ngứa ngáy, mụn nước, dát sẩn, vảy nến, zona, sốc phản vệ, "
+                            "mề đay."
                         ),
                         response_format="text",
                     )

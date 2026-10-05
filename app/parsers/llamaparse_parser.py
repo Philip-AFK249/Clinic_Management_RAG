@@ -24,6 +24,8 @@ Khi chuyển đổi sang Markdown, hãy tuân thủ nghiêm ngặt các quy tắ
 3. Không bỏ sót các mã chẩn đoán ICD-10, chống chỉ định, liều dùng đặc biệt
    cho suy gan/suy thận.
 4. Giữ nguyên các danh sách gạch đầu dòng triệu chứng, tiêu chuẩn chẩn đoán.
+5. Ma trận sàng lọc (P1 đỏ, P2 vàng, P3 xanh) và bảng định tuyến tiếp đón phải
+   là bảng Markdown đầy đủ, giữ nguyên từng dòng và không gộp ô.
 """
 
 
@@ -41,13 +43,22 @@ class LlamaParseParser(BaseParser):
         settings = settings or get_settings()
         if not settings.LLAMA_CLOUD_API_KEY:
             raise ValueError("Missing LLAMA_CLOUD_API_KEY in .env")
+
+        # split_by_page=False keeps the whole guideline as one document: a
+        #   medication table split across a page boundary otherwise arrives as
+        #   two fragments and loses its header row.
+        # annotate_links=True preserves the reference URLs in the guideline
+        #   bibliography so citations stay resolvable after parsing.
+        # language="vi" keeps Vietnamese diacritics intact instead of letting
+        #   the model transliterate them.
         self._parser = LlamaParse(
             api_key=settings.LLAMA_CLOUD_API_KEY,
             result_type="markdown",
             language="vi",
             parsing_instruction=MEDICAL_PARSING_INSTRUCTION,
+            split_by_page=False,
+            annotate_links=True,
             num_workers=4,
-            page_separator="\n\n---\n\n",
             verbose=True,
         )
 
@@ -60,7 +71,7 @@ class LlamaParseParser(BaseParser):
         documents = self._parser.load_data(str(file_path))
         markdown_content = "\n\n".join(doc.text for doc in documents)
         out_path = self.save(file_path, markdown_content)
-        logger.info("Saved markdown to %s", out_path)
+        logger.info("Saved markdown to %s (%d chars)", out_path, len(markdown_content))
         return markdown_content
 
 
