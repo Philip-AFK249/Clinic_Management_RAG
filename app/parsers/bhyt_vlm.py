@@ -85,7 +85,9 @@ class BhytData(BaseModel):
     noi_kcb_ban_dau_full: str | None = None  # combined: 79-014 (BV Đa Khoa Sài Gòn)
     gia_tri_su_dung_tu: str | None = None  # DD/MM/YYYY
     gia_tri_su_dung_den: str | None = None  # DD/MM/YYYY
-    con_han: bool | None = None
+    # An unknown expiry is not evidence of expiry, so the card is assumed valid
+    # until the printed date (or the model) says otherwise.
+    con_han: bool | None = True
     ghi_chu: str | None = None
 
     # --- camelCase fields (React frontend & Spring Boot API compatibility) ---
@@ -395,6 +397,26 @@ def normalise_bhyt_payload(raw: Mapping[str, object]) -> BhytData:
     return data
 
 
+# Fields the model must actually read off the card. Derived mirrors and
+# defaulted flags (con_han, isExpired, isOcrVerified) are excluded, otherwise
+# their default values would mask an unreadable card.
+_OCR_CONTENT_FIELDS = (
+    "ho_ten",
+    "ma_so_bhyt",
+    "ngay_sinh",
+    "gioi_tinh",
+    "ma_noi_dkkcb_ban_dau",
+    "noi_kham_chua_benh_ban_dau",
+    "gia_tri_su_dung_tu",
+    "gia_tri_su_dung_den",
+)
+
+
+def _has_ocr_content(data: BhytData) -> bool:
+    """True when at least one field was actually read off the card."""
+    return any(getattr(data, field, None) for field in _OCR_CONTENT_FIELDS)
+
+
 def extract_bhyt_from_bytes(
     image_bytes: bytes, optimized: bytes | None = None
 ) -> tuple[BhytData, str, bytes]:
@@ -434,7 +456,7 @@ def extract_bhyt_from_bytes(
     logger.info("VLM (%s) trả về: %s", settings.VLM_MODEL_ID, raw_reply)
 
     data = normalise_bhyt_payload(_extract_json_payload(raw_reply))
-    if not any(data.model_dump().values()):
+    if not _has_ocr_content(data):
         data.ghi_chu = "Mô hình không nhận ra nội dung thẻ. Vui lòng chụp lại rõ nét hơn."
     return data, raw_reply, optimized
 
