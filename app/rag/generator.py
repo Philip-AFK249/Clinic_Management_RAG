@@ -11,12 +11,9 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 FALLBACK_MODEL_PREFERENCES = (
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
-    "groq/compound",
-    "groq/compound-mini",
-    "allam-2-7b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
 )
 
 DOCTOR_SYSTEM_PROMPT = """Bạn là trợ lý y khoa AI hỗ trợ bác sĩ lâm sàng tra cứu phác đồ điều trị của Bộ Y tế.
