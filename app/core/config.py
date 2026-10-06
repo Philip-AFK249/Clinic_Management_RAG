@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     DB_PASSWORD: str = "mysecretpassword"
     DB_NAME: str = "clinic_rag"
 
+    # Doctor-schedule service database (Stage 2 of voice triage).
+    # Fully decoupled from the pgvector connection above: the Spring Boot
+    # DoctorScheduleService runs on its own PostgreSQL instance (port 5432),
+    # NOT on the pgvector container (port 5433). Override every value in .env
+    # for anything other than local development.
+    SCHEDULE_DB_HOST: str = "localhost"
+    SCHEDULE_DB_PORT: int = 5432
+    SCHEDULE_DB_USER: str = "postgres"
+    SCHEDULE_DB_PASSWORD: str = "123"
+    SCHEDULE_DB_NAME: str = "clinic_management_doctorschedule_service"
+    SCHEDULE_DB_CONNECT_TIMEOUT: int = 5
+
     # External API keys
     GROQ_API_KEY: str = ""
     LLAMA_CLOUD_API_KEY: str = ""
@@ -56,6 +68,27 @@ class Settings(BaseSettings):
         return (
             f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        )
+
+    @property
+    def schedule_db_dsn(self) -> str:
+        """DSN for the doctor-schedule service database.
+
+            Built purely from the ``SCHEDULE_DB_*`` settings - deliberately *not*
+            derived from the pgvector connection, because the two databases live
+            on different servers. Credentials always come from the environment.
+        """
+        return (
+            f"postgresql://{self.SCHEDULE_DB_USER}:{self.SCHEDULE_DB_PASSWORD}"
+            f"@{self.SCHEDULE_DB_HOST}:{self.SCHEDULE_DB_PORT}/{self.SCHEDULE_DB_NAME}"
+        )
+
+    @property
+    def schedule_admin_dsn(self) -> str:
+        """Same server, maintenance database - used by scripts/setup_schedule_db.py."""
+        return (
+            f"postgresql://{self.SCHEDULE_DB_USER}:{self.SCHEDULE_DB_PASSWORD}"
+            f"@{self.SCHEDULE_DB_HOST}:{self.SCHEDULE_DB_PORT}/postgres"
         )
 
     def validate_api_keys(self) -> None:

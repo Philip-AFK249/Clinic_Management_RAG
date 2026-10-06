@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.config import PARSED_MARKDOWN_DIR, PROJECT_ROOT, RAW_DOCS_DIR, get_settings
 from app.core.logging import get_logger
+from app.database.schedule_queries import (
+    DoctorShiftInfo,
+    SessionSchedule,
+    query_department_schedule,
+    today_in_clinic_timezone,
+)
 from app.parsers.bhyt_vlm import (
     BhytData,
     alias_camel_keys,
@@ -35,6 +44,37 @@ PIPELINE_HTML = PROJECT_ROOT / "app" / "static" / "pipeline.html"
 
 # Document types the pipeline console is allowed to ingest.
 RAW_DOC_EXTENSIONS = (".pdf", ".docx")
+
+# Voice triage (Stage 1) + doctor dispatch (Stage 2).
+TRIAGE_KB_DOC_ID = "Triệu chứng chẩn đoán sớm"
+VOICE_ALLOWED_EXTENSIONS = (".wav", ".webm", ".m4a", ".mp3", ".ogg", ".flac")
+VOICE_MAX_BYTES = 25 * 1024 * 1024  # Groq's per-file STT ceiling
+VALID_DEPARTMENT_IDS = (1, 2, 3)
+VALID_PRIORITIES = ("P1", "P2", "P3")
+
+VOICE_STT_PROMPT = (
+    "Khám bệnh, đau thắt ngực, khó thở, huyết áp, hồi hộp, tim mạch, sốt cao, "
+    "ho khạc đờm, ho khan, đau rát họng, khò khè, hen suyễn, sổ mũi, viêm xoang, "
+    "dị ứng, nổi mẩn đỏ, ngứa ngáy, mụn nước, dát sẩn, vảy nến, zona, sốc phản vệ, "
+    "mề đay, tê bàn chân, tiêu chảy, nôn ói."
+)
+
+VOICE_TRIAGE_SYSTEM_PROMPT = """Bạn là trợ lý phân loại triệu chứng lâm sàng tại phòng tiếp đón.
+Nhiệm vụ: đọc lời kể của bệnh nhân và NGỮ CẢNH TRIỆU CHỨNG được cung cấp, rồi trả về đúng MỘT đối tượng JSON.
+
+Quy tắc bắt buộc:
+1. CHỈ dùng thông tin trong [NGỮ CẢNH TRIỆU CHỨNG] để suy ra bệnh và mã ICD-10. Nếu ngữ cảnh không nói, đặt icd10_code là chuỗi rỗng "" - TUYỆT ĐỐI không tự bịa mã bệnh.
+2. department_id chỉ được là 1, 2 hoặc 3:
+   - 1 = Khoa Nội Tổng quát & Tim mạch (triệu chứng tim mạch, hô hấp, nội khoa chung, tiêu hóa)
+   - 2 = Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng (triệu chứng hô hấp, dị ứng, tai mũi họng, da liễu dị ứng)
+   - 3 = Khoa Da liễu (triệu chứng da, tóc, móng)
+3. department_name phải khớp đúng tên khoa ứng với department_id.
+4. priority_level: "P1" = cấp cứu (đau ngực dữ dội, khó thở nặng, lơ mơ, sốc phản vệ, loét da diện rộng cấp), "P2" = ưu tiên khám trong ngày, "P3" = khám thường.
+5. KHÔNG BAO GIỜ suy đoán danh sách bác sĩ, ca trực, phòng khám hay số suất còn trống. Lịch làm việc sẽ được tra cứu từ cơ sở dữ liệu riêng.
+6. chief_complaint_summary: tóm tắt triệu chứng chính trong 1-2 câu tiếng Việt để bệnh nhân trình bày với bác sĩ.
+
+Định dạng JSON bắt buộc:
+{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P2", "chief_complaint_summary": "..."}"""
 
 app = FastAPI(title="Smart Clinic - AI Gateway API", version="3.0")
 
@@ -165,6 +205,409 @@ class PipelineRunResponse(BaseModel):
     duration_ms: float = 0.0
     message: str = ""
     logs: list[str] = Field(default_factory=list)
+
+
+class VoiceAudioDecodeError(ValueError):
+    """The uploaded audio could not be decoded by the speech-to-text service."""
+
+
+#: Peak amplitude below this (16-bit PCM ≈ -42 dBFS) counts as silence.
+_SILENCE_PEAK_THRESHOLD = 500
+
+
+def _wav_has_no_speech(audio: bytes) -> Optional[bool]:
+    """Cheap stdlib silence check for PCM WAV files.
+
+    Whisper *hallucinates* fluent text from silence or noise (it happily
+    returns "subscribe to my channel" for a pure tone), which would otherwise
+    feed a fabricated transcript into clinical triage. Returns True when the
+    file is decodable and silent, False when it carries signal, and None when
+    the format is outside what :mod:`wave` can read (letting Groq decide).
+    """
+    import wave
+    from array import array
+
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            if wav.getcomptype() != "NONE":
+                return None
+            width = wav.getsampwidth()
+            # 8-bit WAV is unsigned and biased around 128 - skip rather than
+            # misread it as signed samples.
+            if width not in (2, 4):
+                return None
+            frames = wav.readframes(min(wav.getnframes(), 16000 * 30))
+    except (wave.Error, EOFError, ValueError):
+        return None
+
+    if not frames:
+        return True
+
+    samples = array("h" if width == 2 else "i")
+    samples.frombytes(frames[: len(frames) - (len(frames) % samples.itemsize)])
+    if not samples:
+        return True
+    peak = max(max(samples), -min(samples))
+    return peak < _SILENCE_PEAK_THRESHOLD
+
+
+#: WHO ICD-10 morphology: letter, 2 digits, optional sub-code. 'U' is excluded
+#: because it is reserved for special-purpose codes, and the LLM is told to
+#: return "" rather than guess, so anything malformed is dropped.
+_ICD10_RE = re.compile(r"^[A-TV-Z][0-9][0-9AB](\.[0-9A-TV-Z]{1,4})?$", re.IGNORECASE)
+
+_DEPARTMENT_NAMES = {
+    1: "Khoa Nội Tổng quát & Tim mạch",
+    2: "Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng",
+    3: "Khoa Da liễu",
+}
+
+
+#: Whisper reliably hallucinates these stock phrases when fed silence, room tone
+#: or noise. Left unchecked they look like plausible Vietnamese and get fed
+#: straight into clinical triage, so they are rejected as non-clinical audio.
+#: Examples observed in this project: "Hãy subscribe cho kênh Ghiền Mì Gõ",
+#: "Hãy subscribe cho kênh La La La School", "Hẹn gặp lại các bạn".
+_WHISPER_HALLUCINATION_PATTERNS = (
+    re.compile(r"subscribe", re.IGNORECASE),
+    re.compile(r"ghi[eề]n m[iì] g[oõ]", re.IGNORECASE),
+    re.compile(r"la\s*la\s*school", re.IGNORECASE),
+    re.compile(r"h[eẹ]n g[ặa]p l[ạa]i", re.IGNORECASE),
+    re.compile(r"c[ảa]m\s*[ơo]n\s*b[ạa]n", re.IGNORECASE),
+    re.compile(r"^\W*$"),
+)
+
+#: Anything shorter than this carries no usable clinical content.
+_MIN_TRANSCRIPTION_CHARS = 5
+
+#: Terms that make a short transcript worth trusting despite its brevity.
+_CLINICAL_HINTS = (
+    "đau", "sốt", "ho", "khó thở", "khó thở", "ngứa", "nổi", "mẩn", "chảy máu",
+    "sau khi", "nhiều ngày", "buồn nôn", "nôn", "tiêu chảy", "mệt", "chóng mặt",
+)
+
+_NO_SPEECH_MESSAGE = (
+    "Không phát hiện âm thanh triệu chứng rõ ràng. "
+    "Vui lòng thử lại và nói to hơn vào micro."
+)
+
+
+def _looks_like_whisper_hallucination(text: str) -> bool:
+    """True when a transcript is a known Whisper phantom or clinically empty."""
+    stripped = text.strip()
+    for pattern in _WHISPER_HALLUCINATION_PATTERNS:
+        if pattern.search(stripped):
+            return True
+    lowered = stripped.lower()
+    if len(stripped) < _MIN_TRANSCRIPTION_CHARS and not any(
+        hint in lowered for hint in _CLINICAL_HINTS
+    ):
+        return True
+    return False
+
+
+def _transcribe_voice(audio: bytes, filename: str, settings) -> str:
+    """Stage 1a: Groq Whisper STT, Vietnamese, with the clinic vocabulary prompt."""
+    from groq import BadRequestError
+    from groq import Groq
+
+    if not settings.GROQ_API_KEY:
+        raise VoiceAudioDecodeError("Thiếu GROQ_API_KEY trong .env.")
+
+    client = Groq(api_key=settings.GROQ_API_KEY)
+    try:
+        completion = client.audio.transcriptions.create(
+            file=(filename, audio),
+            model=settings.LLM_STT_MODEL_ID,
+            language="vi",
+            prompt=VOICE_STT_PROMPT,
+            response_format="text",
+        )
+    except BadRequestError as exc:
+        raise VoiceAudioDecodeError(
+            f"Không giải mã được tệp audio ({filename}): {exc}"
+        ) from exc
+
+    text = (completion or "").strip()
+    if not text or _looks_like_whisper_hallucination(text):
+        logger.warning(
+            "Rejected transcription as hallucination/noise: %r", (text or "")[:120]
+        )
+        raise VoiceAudioDecodeError(_NO_SPEECH_MESSAGE)
+    return text
+
+
+def _retrieve_triage_context(transcription: str, settings) -> tuple[str, list[str], list[str]]:
+    """Stage 1b: semantic search over the triage knowledge base."""
+    from app.rag.retriever import retrieve_context
+
+    warnings: list[str] = []
+    sources: list[str] = []
+    try:
+        results = retrieve_context(
+            transcription, top_k=2, target_audience="tiep_don", settings=settings
+        )
+    except Exception as exc:  # RAG must not block the clinical stage
+        logger.warning("RAG retrieval failed: %s", exc)
+        warnings.append(f"Không tra cứu được tri thức (RAG): {exc}")
+        return ("(Không có ngữ cảnh)", sources, warnings)
+
+    # Keep results from the dedicated triage document; fall back to whatever the
+    # vector search returned so a metadata gap cannot silence the LLM stage.
+    from_kb = [r for r in results if r.doc_id == TRIAGE_KB_DOC_ID]
+    chosen = from_kb or results
+    if results and not from_kb:
+        warnings.append(
+            f"Không tìm thấy đoạn nào từ '{TRIAGE_KB_DOC_ID}'; dùng ngữ cảnh gần nhất."
+        )
+
+    if not chosen:
+        return ("(Không có ngữ cảnh)", sources, warnings)
+
+    sources = sorted({f"{r.doc_id} (cosine {r.score:.3f})" for r in chosen})
+    context = "\n\n---\n\n".join(r.content for r in chosen)
+    return (context, sources, warnings)
+
+
+def _sanitise_triage_payload(payload: dict) -> tuple[dict, list[str]]:
+    """Validate the LLM's JSON against the clinical contract before using it.
+
+    The LLM is untrusted: an out-of-range department, an unknown priority or a
+    malformed ICD-10 code is corrected (and reported) rather than passed on.
+    """
+    warnings: list[str] = []
+
+    def _text(key: str, limit: int = 500) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str):
+            value = "" if value is None else str(value)
+        return " ".join(value.split())[:limit].strip()
+
+    try:
+        department_id = int(payload.get("department_id", 0))
+    except (TypeError, ValueError):
+        department_id = 0
+    if department_id not in VALID_DEPARTMENT_IDS:
+        warnings.append(
+            f"department_id không hợp lệ ({payload.get('department_id')!r}); mặc định về khoa 1."
+        )
+        department_id = 1
+
+    priority = _text("priority_level", 8).upper().replace(" ", "")
+    if priority not in VALID_PRIORITIES:
+        # Bias towards urgency rather than down-triage an unparseable answer.
+        warnings.append(
+            f"priority_level không hợp lệ ({payload.get('priority_level')!r}); mặc định P2."
+        )
+        priority = "P2"
+
+    icd10 = _text("icd10_code", 16).upper().replace(" ", "")
+    if icd10 and not _ICD10_RE.match(icd10):
+        warnings.append(f"Mã ICD-10 không đúng định dạng ({icd10!r}); đã bỏ qua.")
+        icd10 = ""
+
+    # The departments table is authoritative; the LLM only proposes a name.
+    department_name = _DEPARTMENT_NAMES[department_id]
+
+    return (
+        {
+            "disease_guess": _text("disease_guess", 300) or "Chưa xác định",
+            "icd10_code": icd10,
+            "department_id": department_id,
+            "department_name": department_name,
+            "priority_level": priority,
+            "chief_complaint_summary": _text("chief_complaint_summary", 400),
+        },
+        warnings,
+    )
+
+
+def _extract_triage_facts(transcription: str, context: str, settings) -> tuple[dict, list[str]]:
+    """Stage 1c: force the LLM into a single JSON object and validate it."""
+    from app.rag.generator import get_groq_client
+
+    user_prompt = (
+        f"[NGỮ CẠNH TRIỆU CHỨNG]\n{context}\n\n"
+        f"[LỜI KỂ BỆNH NHÂN]\n{transcription}"
+    )
+    raw = get_groq_client().complete(
+        VOICE_TRIAGE_SYSTEM_PROMPT,
+        user_prompt,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
+
+    text = (raw or "").strip()
+    if text.startswith("```"):  # strip an accidental markdown fence
+        text = text.split("```")[1]
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("LLM returned non-JSON triage output: %s", text[:200])
+        warnings = [f"Không đọc được JSON từ mô hình ({exc.msg}); dùng giá trị mặc định."]
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return _sanitise_triage_payload(payload)
+
+
+def _build_advice(
+    priority: str,
+    recommended_shift: str,
+    schedule: dict[str, Any],
+    department_name: str,
+    connected: bool = True,
+) -> str:
+    """Deterministic advice - never generated by the LLM, never invents a roster."""
+    if not connected:
+        # Stage 2 is down: tell the patient what we could and could not do.
+        return (
+            "Hệ thống đã nhận diện triệu chứng và đề xuất chuyên khoa thành công. "
+            "Lịch trực bác sĩ đang được cập nhật, vui lòng chọn ca khám bên dưới "
+            "hoặc liên hệ quầy tiếp đón."
+        )
+
+    shift_labels = {
+        "MORNING": "ca sáng (07:30 - 11:30)",
+        "AFTERNOON": "ca chiều (13:00 - 17:00)",
+        "NEXT_DAY": "ngày hôm sau",
+        "NO_DUTY": "chưa có lịch khám",
+        "MANUAL_PICK": "thủ công",
+    }
+    slot = shift_labels.get(recommended_shift, recommended_shift)
+
+    if priority == "P1":
+        return (
+            f"Triệu chứng thuộc nhóm CẤP CỨU (P1). Đề nghị gọi cấp cứu 115 hoặc đưa người bệnh "
+            f"vào khoa cấp cứu ngay, không chờ khám định kỳ. Nhánh tiếp đón sẽ ưu tiên "
+            f"hỗ trợ tại {department_name}. Lịch khám chỉ có ý nghĩa sau khi bệnh nhân "
+            f"đã được đánh giá đủ an toàn để khám ngoại trú."
+        )
+
+    if recommended_shift == "NO_DUTY":
+        return (
+            f"{department_name} không có lịch khám ngoại trú vào ngày cần xếp. "
+            "Đề nghị liên hệ phòng tiếp đôn hoặc chọn ngày làm việc kế tiếp. "
+            "Mức độ ưu tiên: " + priority + "."
+        )
+
+    if recommended_shift == "NEXT_DAY":
+        return (
+            f"Cả ca sáng và ca chiều tại {department_name} đã đủ bệnh trong ngày cần xếp. "
+            "Đề nghị đặt lịch vào ngày làm việc kế tiếp. Mức độ ưu tiên: " + priority + "."
+        )
+
+    morning_open = not schedule["MORNING"]["is_full"]
+    if priority == "P2":
+        return (
+            f"Nên khám trong ngày tại {department_name}. Đề nghị ưu tiên {slot} "
+            f"(còn trống). Nếu triệu chứng nặng lên như khó thở dữ dội, đau ngực "
+            "dữ dội hoặc lơ mơ thì chuyển sang cấp cứu ngay."
+        )
+    return (
+        f"Có thể khám theo lịch thường tại {department_name}, ưu tiên {slot}"
+        + (" nếu bệnh nhân thuận lợi hơn." if morning_open else ".")
+        + " Đề nghị tái khám nếu triệu chứng không cải thiện sau 3-5 ngày hoặc nặng thêm."
+    )
+
+
+def _run_voice_triage(
+    audio: bytes, filename: str, target_date: Optional[str]
+) -> VoiceScheduleTriageResponse:
+    """Blocking two-stage body, executed off the event loop."""
+    started = time.perf_counter()
+    settings = get_settings()
+
+    transcription = _transcribe_voice(audio, filename, settings)
+    logger.info("STT (%d chars): %s", len(transcription), transcription[:120])
+
+    context, sources, warnings = _retrieve_triage_context(transcription, settings)
+    facts, fact_warnings = _extract_triage_facts(transcription, context, settings)
+    warnings.extend(fact_warnings)
+
+    # Stage 2: deterministic. The inferred department id is the only input.
+    # query_department_schedule degrades instead of raising, so this call always
+    # returns and the client always gets HTTP 200.
+    schedule_payload = query_department_schedule(
+        facts["department_id"], target_date or today_in_clinic_timezone().isoformat(), settings
+    )
+    connected = bool(schedule_payload.get("is_available"))
+    recommended_shift = schedule_payload["recommended_shift"]
+    schedule: dict[str, Optional[SessionSchedule]] = {}
+    if connected:
+        for label in ("morning", "afternoon"):
+            data = schedule_payload.get(label)
+            if data:
+                schedule[label] = SessionSchedule(**data)
+    else:
+        schedule["morning"] = None
+        schedule["afternoon"] = None
+        warnings.append(schedule_payload.get("error_message") or "")
+        if schedule_payload.get("detail"):
+            warnings.append(f"Chi tiết lỗi lịch trực: {schedule_payload['detail']}")
+
+    advice = _build_advice(
+        facts["priority_level"],
+        recommended_shift,
+        schedule_payload,
+        schedule_payload["department_name"],
+        connected=connected,
+    )
+    facts["department_name"] = schedule_payload["department_name"]
+
+    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    logger.info(
+        "Voice triage: dept=%s priority=%s icd=%s shift=%s schedule_connected=%s (%.0f ms)",
+        facts["department_id"],
+        facts["priority_level"],
+        facts["icd10_code"] or "-",
+        recommended_shift,
+        connected,
+        latency_ms,
+    )
+    return VoiceScheduleTriageResponse(
+        success=True,
+        transcription=transcription,
+        recommended_shift=recommended_shift,
+        advice=advice,
+        schedule=schedule,
+        schedule_connected=connected,
+        schedule_error=schedule_payload.get("error_message", "") if not connected else "",
+        target_date=schedule_payload["target_date"],
+        rag_sources=sources,
+        warnings=warnings,
+        latency_ms=latency_ms,
+        **facts,
+    )
+
+
+class VoiceScheduleTriageResponse(BaseModel):
+
+    success: bool = True
+    transcription: str
+    disease_guess: str
+    icd10_code: str
+    department_id: int
+    department_name: str
+    priority_level: str
+    chief_complaint_summary: str
+    recommended_shift: str
+    advice: str
+    schedule: dict[str, Optional[SessionSchedule]] = Field(
+        default_factory=dict,
+        description="morning/afternoon are null when the schedule service is unreachable",
+    )
+    schedule_connected: bool = Field(
+        default=True,
+        description="False = Stage 2 degraded; clinical triage is still valid",
+    )
+    schedule_error: str = ""
+    target_date: str = ""
+    rag_sources: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    latency_ms: float = 0.0
 
 
 @app.get("/", include_in_schema=False)
@@ -541,6 +984,53 @@ async def run_single_file(payload: PipelineRunRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@app.post("/api/v1/triage/voice-schedule", response_model=VoiceScheduleTriageResponse)
+async def voice_schedule_triage(
+    file: UploadFile = File(..., description="Ghi âm: .wav, .webm, .m4a, .mp3"),
+    target_date: Optional[str] = Form(
+        None, description="Ngày cần xếp khám (YYYY-MM-DD). Mặc định: hôm nay Asia/Ho_Chi_Minh."
+    ),
+):
+    """Two-stage voice triage: Whisper + RAG + LLM, then a real roster query."""
+    filename = (file.filename or "").strip()
+    extension = Path(filename).suffix.lower()
+    if extension not in VOICE_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Định dạng audio không hỗ trợ: {extension or '(không có)'}. "
+            f"Chấp nhận: {', '.join(VOICE_ALLOWED_EXTENSIONS)}",
+        )
+
+    audio = await file.read()
+    await file.close()
+    if not audio:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp audio rỗng."
+        )
+    if len(audio) > VOICE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File audio vượt quá {VOICE_MAX_BYTES // (1024 * 1024)} MB.",
+        )
+    if _wav_has_no_speech(audio) is True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Không phát hiện giọng nói trong tệp WAV (âm thanh im lặng hoặc chỉ có nhiễu). "
+            "Vui lòng ghi âm lại gần micro hơn.",
+        )
+
+    try:
+        return await asyncio.to_thread(
+            _run_voice_triage, audio, filename, target_date
+        )
+    except ValueError as exc:
+        # Only Stage 1 failures (bad audio, unrecognisable speech) reach here;
+        # Stage 2 problems degrade inside _run_voice_triage.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
 
 
