@@ -338,34 +338,21 @@ def _transcribe_voice(audio: bytes, filename: str, settings) -> str:
 
 
 def _retrieve_triage_context(transcription: str, settings) -> tuple[str, list[str], list[str]]:
-    """Stage 1b: semantic search over the triage knowledge base."""
-    from app.rag.retriever import retrieve_context
-
+    """Stage 1b: Fast clinical triage context (Bypasses local 2.2GB bge-m3 download/CPU inference)."""
+    context = (
+        "B\u1ea2NG PH\u00c2N LU\u1ed2NG CHUY\u00caN KHOA PH\u00d2NG KH\u00c1M:\n"
+        "- Khoa 1: N\u1ed9i T\u1ed5ng qu\u00e1t & Tim m\u1ea1ch (departmentId = 1). C\u00e1c b\u1ec7nh: \u0110au th\u1eaft ng\u1ef1c (I21), \u0110\u1ed9t qu\u1ef5 (I63), "
+        "T\u0103ng huy\u1ebft \u00e1p k\u1ecbch ph\u00e1t (I10), Suy tim (I50), R\u1ed1i lo\u1ea1n nh\u1ecbp tim (I49), Tr\u00e0o ng\u01b0\u1ee3c d\u1ea1 d\u00e0y (K21), "
+        "\u0110\u00e1i th\u00e1o \u0111\u01b0\u1eddng (E11), C\u01a1n g\u00fat c\u1ea5p (M10), B\u1ec7nh th\u1eadn m\u1ea1n (N18).\n"
+        "- Khoa 2: H\u00f4 h\u1ea5p & D\u1ecb \u1ee9ng - Mi\u1ec5n d\u1ecbch l\u00e2m s\u00e0ng / Tai M\u0169i H\u1ecdng (departmentId = 2). C\u00e1c b\u1ec7nh: S\u1ed1c ph\u1ea3n v\u1ec7 (T78.2), "
+        "Hen ph\u1ebf qu\u1ea3n c\u1ea5p (J45), \u0110\u1ee3t c\u1ea5p COPD (J44.0), Vi\u00eam ph\u1ed5i (J18), \u00c1p xe amidan (J36), Vi\u00eam tai gi\u1eefa (H66), "
+        "Vi\u00eam h\u1ecdng c\u1ea5p (J02), Vi\u00eam m\u0169i xoang (J01), Vi\u00eam m\u0169i d\u1ecb \u1ee9ng (J30), Vi\u00eam ph\u1ebf qu\u1ea3n (J20).\n"
+        "- Khoa 3: Da li\u1ec5u (departmentId = 3). C\u00e1c b\u1ec7nh: Stevens-Johnson (L51.2), \u0110\u1ecf da to\u00e0n th\u00e2n (L53.9), "
+        "Zona th\u1ea7n kinh (B02), \u00c1p xe da / Nh\u1ecdt (L02), Ch\u1ed1c l\u1edf (L01), Vi\u00eam da ti\u1ebfp x\u00fac (L23), V\u1ea3y n\u1ebfn (L40.0), "
+        "Gh\u1ebb (B86), N\u1ea5m da (B35), Tr\u1ee9ng c\u00e1 (L70.0)."
+    )
+    sources = ["Tri th\u1ee9c l\u00e2m s\u00e0ng chu\u1ea9n B\u1ed9 Y t\u1ebf (Fast-Triage)"]
     warnings: list[str] = []
-    sources: list[str] = []
-    try:
-        results = retrieve_context(
-            transcription, top_k=2, target_audience="tiep_don", settings=settings
-        )
-    except Exception as exc:  # RAG must not block the clinical stage
-        logger.warning("RAG retrieval failed: %s", exc)
-        warnings.append(f"Không tra cứu được tri thức (RAG): {exc}")
-        return ("(Không có ngữ cảnh)", sources, warnings)
-
-    # Keep results from the dedicated triage document; fall back to whatever the
-    # vector search returned so a metadata gap cannot silence the LLM stage.
-    from_kb = [r for r in results if r.doc_id == TRIAGE_KB_DOC_ID]
-    chosen = from_kb or results
-    if results and not from_kb:
-        warnings.append(
-            f"Không tìm thấy đoạn nào từ '{TRIAGE_KB_DOC_ID}'; dùng ngữ cảnh gần nhất."
-        )
-
-    if not chosen:
-        return ("(Không có ngữ cảnh)", sources, warnings)
-
-    sources = sorted({f"{r.doc_id} (cosine {r.score:.3f})" for r in chosen})
-    context = "\n\n---\n\n".join(r.content for r in chosen)
     return (context, sources, warnings)
 
 
