@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import re
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,11 +16,12 @@ from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.config import PARSED_MARKDOWN_DIR, PROJECT_ROOT, RAW_DOCS_DIR, get_settings
 from app.core.logging import get_logger
+from app.database.connection import get_connection
 from app.database.schedule_queries import (
     DoctorShiftInfo,
     SessionSchedule,
@@ -75,6 +77,62 @@ Quy tắc bắt buộc:
 
 Định dạng JSON bắt buộc:
 {"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P2", "chief_complaint_summary": "..."}"""
+
+# ---------------------------------------------------------------------------
+# Runtime model configuration (admin dashboard - hot swappable, no restart)
+# ---------------------------------------------------------------------------
+
+#: Whitelists exposed to the admin dashboard. Anything outside these lists is
+#: rejected by POST /api/v1/admin/models so a typo cannot poison the gateway.
+AVAILABLE_MODELS: dict[str, list[str]] = {
+    "llm_models": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768",
+    ],
+    "stt_models": [
+        "whisper-large-v3",
+        "whisper-large-v3-turbo",
+    ],
+    "vlm_models": [
+        "qwen/qwen3.8-27b",
+    ],
+}
+
+_DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
+_DEFAULT_STT_MODEL = "whisper-large-v3"
+_DEFAULT_VLM_MODEL = "qwen/qwen3.8-27b"
+
+_runtime_lock = threading.Lock()
+
+
+def _default_runtime_models() -> dict[str, str]:
+    """Seed the runtime holder from .env/settings, falling back to the defaults."""
+    settings = get_settings()
+    return {
+        "llm_model": settings.LLM_MODEL_ID or _DEFAULT_LLM_MODEL,
+        "stt_model": settings.LLM_STT_MODEL_ID or _DEFAULT_STT_MODEL,
+        "vlm_model": settings.VLM_MODEL_ID or _DEFAULT_VLM_MODEL,
+    }
+
+
+#: Live model selection shared by every Groq invocation (LLM / STT / VLM).
+_RUNTIME_MODELS: dict[str, str] = _default_runtime_models()
+
+
+def _runtime_model(key: str, fallback: str) -> str:
+    """Thread-safe read of the active model for ``key``."""
+    with _runtime_lock:
+        return _RUNTIME_MODELS.get(key) or fallback
+
+
+class ModelConfigPayload(BaseModel):
+    """Requested LLM / STT / VLM selection from the admin dashboard."""
+
+    llm_model: str = Field(min_length=1)
+    stt_model: str = Field(min_length=1)
+    vlm_model: str = Field(min_length=1)
+
 
 app = FastAPI(title="Smart Clinic - AI Gateway API", version="3.0")
 
@@ -317,10 +375,12 @@ def _transcribe_voice(audio: bytes, filename: str, settings) -> str:
         raise VoiceAudioDecodeError("Thiếu GROQ_API_KEY trong .env.")
 
     client = Groq(api_key=settings.GROQ_API_KEY)
+    stt_model = _runtime_model("stt_model", settings.LLM_STT_MODEL_ID)
+    logger.info("STT request using model '%s'", stt_model)
     try:
         completion = client.audio.transcriptions.create(
             file=(filename, audio),
-            model=settings.LLM_STT_MODEL_ID,
+            model=stt_model,
             language="vi",
             prompt=VOICE_STT_PROMPT,
             response_format="text",
@@ -419,12 +479,15 @@ def _extract_triage_facts(transcription: str, context: str, settings) -> tuple[d
         f"[NGỮ CẠNH TRIỆU CHỨNG]\n{context}\n\n"
         f"[LỜI KỂ BỆNH NHÂN]\n{transcription}"
     )
+    llm_model = _runtime_model("llm_model", settings.LLM_MODEL_ID)
     raw = get_groq_client().complete(
         VOICE_TRIAGE_SYSTEM_PROMPT,
         user_prompt,
         temperature=0.1,
         response_format={"type": "json_object"},
+        model=llm_model,
     )
+    logger.info("Triage LLM request using model '%s'", llm_model)
 
     text = (raw or "").strip()
     if text.startswith("```"):  # strip an accidental markdown fence
@@ -621,7 +684,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "Smart Clinic AI Gateway",
-        "vlm_model": settings.VLM_MODEL_ID,
+        "vlm_model": _runtime_model("vlm_model", settings.VLM_MODEL_ID),
         "confirmed_records": bhyt_store.count_records(),
     }
 
@@ -640,12 +703,14 @@ async def _run_ocr(file: UploadFile) -> BhytOcrResponse:
         )
 
     start = time.perf_counter()
+    settings = get_settings()
+    vlm_model = _runtime_model("vlm_model", settings.VLM_MODEL_ID)
     try:
         # Optimize once so the preview the patient checks against is exactly the
         # pixels the VLM saw; then run the (blocking) Groq call off the event loop.
         optimized = await asyncio.to_thread(optimize_image, image_bytes)
         data, raw_text, _ = await asyncio.to_thread(
-            extract_bhyt_from_bytes, image_bytes, optimized
+            extract_bhyt_from_bytes, image_bytes, optimized, vlm_model
         )
     except ValueError as exc:
         raise HTTPException(
@@ -664,7 +729,7 @@ async def _run_ocr(file: UploadFile) -> BhytOcrResponse:
     return BhytOcrResponse(
         data=data,
         warnings=validate_bhyt(data),
-        model=get_settings().VLM_MODEL_ID,
+        model=vlm_model,
         latency_ms=elapsed_ms,
         image_preview="data:image/jpeg;base64,"
         + base64.b64encode(optimized).decode("utf-8"),
@@ -1099,6 +1164,306 @@ async def voice_schedule_triage(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Admin: AI Gateway & RAG Knowledge management
+# ---------------------------------------------------------------------------
+
+
+class ModelConfigResponse(BaseModel):
+    """Active models + whitelists + infrastructure health for the dashboard."""
+
+    llm_model: str
+    stt_model: str
+    vlm_model: str
+    embedding_model: str
+    active: dict[str, str] = Field(default_factory=dict)
+    available: dict[str, list[str]] = Field(default_factory=dict)
+    infrastructure: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class ModelConfigUpdateResponse(ModelConfigResponse):
+    success: bool = True
+    message: str = ""
+
+
+class KnowledgeDocItem(BaseModel):
+    id: str
+    title: str
+    specialty: str
+    target_audience: str = ""
+    chunkCount: int = 0
+    embeddingModel: str = ""
+    createdAt: str = ""
+    status: str = "INDEXED"
+
+
+class KnowledgeDocsResponse(BaseModel):
+    documents: list[KnowledgeDocItem] = Field(default_factory=list)
+    total_docs: int = 0
+
+
+class KnowledgeDocDeleteResponse(BaseModel):
+    success: bool = True
+    message: str
+
+
+class OcrLogItem(BaseModel):
+    id: str
+    documentType: str = "BHYT_CARD"
+    patientName: str = ""
+    extractedId: str = ""
+    confidenceScore: int = 0
+    timestamp: str = ""
+    status: str = "SUCCESS"
+
+
+class OcrLogsResponse(BaseModel):
+    logs: list[OcrLogItem] = Field(default_factory=list)
+    total: int = 0
+
+
+KNOWLEDGE_DOCS_SQL = """
+SELECT doc_id, specialty, target_audience, COUNT(*) AS chunk_count, MIN(created_at) AS created_at
+FROM clinic_knowledge_nodes
+GROUP BY doc_id, specialty, target_audience
+ORDER BY MIN(created_at) DESC;
+"""
+
+#: OCR audit rows kept for the dashboard (newest first).
+OCR_LOG_LIMIT = 50
+
+
+def _infrastructure_health(settings) -> dict[str, dict[str, Any]]:
+    """Probe ai_gateway / pgvector / embedding_engine without ever raising."""
+    health: dict[str, dict[str, Any]] = {}
+
+    gateway_ok = bool(settings.GROQ_API_KEY)
+    health["ai_gateway"] = {
+        "status": "healthy" if gateway_ok else "degraded",
+        "detail": (
+            "Groq API key đã cấu hình" if gateway_ok else "Thiếu GROQ_API_KEY trong .env"
+        ),
+    }
+
+    database = _check_database(settings)
+    health["pgvector"] = {
+        "status": "healthy" if database.ok else "down",
+        "detail": (
+            f"PostgreSQL {settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME} - "
+            f"{database.detail}"
+        ),
+    }
+
+    if not settings.EMBEDDING_MODEL:
+        embedding_status, embedding_detail = "degraded", "Chưa cấu hình EMBEDDING_MODEL."
+    elif not database.ok:
+        embedding_status = "degraded"
+        embedding_detail = f"Không xác minh được index pgvector ({database.detail})"
+    else:
+        embedding_status = "healthy"
+        embedding_detail = f"{settings.EMBEDDING_MODEL} (dim={settings.EMBEDDING_DIM})"
+
+    health["embedding_engine"] = {"status": embedding_status, "detail": embedding_detail}
+    return health
+
+
+def _models_payload(settings) -> dict[str, Any]:
+    """Shape shared by GET/POST /api/v1/admin/models."""
+    active = {
+        "llm_model": _runtime_model("llm_model", settings.LLM_MODEL_ID),
+        "stt_model": _runtime_model("stt_model", settings.LLM_STT_MODEL_ID),
+        "vlm_model": _runtime_model("vlm_model", settings.VLM_MODEL_ID),
+        "embedding_model": settings.EMBEDDING_MODEL,
+    }
+    return {
+        **active,
+        "active": dict(active),
+        "available": {key: list(value) for key, value in AVAILABLE_MODELS.items()},
+        "infrastructure": _infrastructure_health(settings),
+    }
+
+
+def _db_error_detail(exc: Exception, settings) -> str:
+    """Human-readable DB error that never leaks the password back to a client."""
+    message = f"{type(exc).__name__}: {exc}".strip()
+    if settings.DB_PASSWORD:
+        message = message.replace(settings.DB_PASSWORD, "***")
+    return message[:300]
+
+
+@app.get("/api/v1/admin/models", response_model=ModelConfigResponse)
+async def get_admin_models():
+    """Active LLM/STT/VLM selection, whitelists and infrastructure health."""
+    # The pgvector probe inside _infrastructure_health blocks for up to 3s.
+    return await asyncio.to_thread(_models_payload, get_settings())
+
+
+@app.post("/api/v1/admin/models", response_model=ModelConfigUpdateResponse)
+async def set_admin_models(payload: ModelConfigPayload):
+    """Hot-swap the LLM / STT / VLM models without restarting Uvicorn."""
+    settings = get_settings()
+
+    allowed = {
+        "llm_model": AVAILABLE_MODELS["llm_models"],
+        "stt_model": AVAILABLE_MODELS["stt_models"],
+        "vlm_model": AVAILABLE_MODELS["vlm_models"],
+    }
+    rejected = {
+        field: getattr(payload, field)
+        for field, options in allowed.items()
+        if getattr(payload, field) not in options
+    }
+    if rejected:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Mô hình không hợp lệ: {rejected}. "
+                f"Các giá trị cho phép: {allowed}"
+            ),
+        )
+
+    with _runtime_lock:
+        for field in allowed:
+            _RUNTIME_MODELS[field] = getattr(payload, field)
+        updated = dict(_RUNTIME_MODELS)
+
+    message = (
+        f"Đã chuyển model: LLM={updated['llm_model']}, "
+        f"STT={updated['stt_model']}, VLM={updated['vlm_model']}."
+    )
+    logger.info(message)
+
+    body = await asyncio.to_thread(_models_payload, settings)
+    return ModelConfigUpdateResponse(success=True, message=message, **body)
+
+
+@app.get("/api/v1/admin/knowledge-docs", response_model=KnowledgeDocsResponse)
+async def list_knowledge_docs():
+    """Grouped view of every document indexed in clinic_knowledge_nodes."""
+    settings = get_settings()
+
+    def _fetch() -> list[tuple]:
+        with get_connection(settings) as conn:
+            with conn.cursor() as cur:
+                cur.execute(KNOWLEDGE_DOCS_SQL)
+                rows = cur.fetchall()
+            conn.commit()
+        return rows
+
+    try:
+        rows = await asyncio.to_thread(_fetch)
+    except Exception as exc:
+        logger.exception("Không truy vấn được clinic_knowledge_nodes: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Không đọc được kho tri thức từ pgvector: {_db_error_detail(exc, settings)}",
+        ) from exc
+
+    documents: list[KnowledgeDocItem] = []
+    for doc_id, specialty, target_audience, chunk_count, created_at in rows:
+        created = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+        documents.append(
+            KnowledgeDocItem(
+                id=str(doc_id),
+                title=str(doc_id),
+                specialty=str(specialty or ""),
+                target_audience=str(target_audience or ""),
+                chunkCount=int(chunk_count or 0),
+                embeddingModel=settings.EMBEDDING_MODEL,
+                createdAt=created,
+                status="INDEXED",
+            )
+        )
+
+    logger.info("Danh sách tri thức: %d tài liệu", len(documents))
+    return KnowledgeDocsResponse(documents=documents, total_docs=len(documents))
+
+
+def _purge_knowledge_doc(doc_id: str, settings) -> int:
+    """Heavy import kept inside the worker thread so the event loop never blocks."""
+    from app.ingestion.pipeline import purge_document
+
+    return purge_document(doc_id, settings)
+
+
+@app.delete(
+    "/api/v1/admin/knowledge-docs/{doc_id}",
+    response_model=KnowledgeDocDeleteResponse,
+)
+async def delete_knowledge_doc(doc_id: str):
+    """Remove every pgvector chunk belonging to ``doc_id``."""
+    settings = get_settings()
+    try:
+        deleted = await asyncio.to_thread(_purge_knowledge_doc, doc_id, settings)
+    except Exception as exc:
+        logger.exception("Không xoá được tài liệu '%s': %s", doc_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Không xoá được tài liệu: {_db_error_detail(exc, settings)}",
+        ) from exc
+
+    message = f"Purged {deleted} chunks for document '{doc_id}'"
+    logger.info(message)
+    return KnowledgeDocDeleteResponse(success=True, message=message)
+
+
+def _to_ocr_log(record: dict, index: int) -> dict[str, Any]:
+    """Map one confirmed_bhyt.jsonl record onto the dashboard audit row."""
+    verified = bool(record.get("isOcrVerified"))
+    in_validity = bool(record.get("con_han"))
+    return {
+        "id": str(record.get("id") or f"record-{index}"),
+        "documentType": "BHYT_CARD",
+        "patientName": str(record.get("ho_ten") or ""),
+        "extractedId": str(
+            record.get("ma_so_bhyt_formatted") or record.get("ma_so_bhyt") or ""
+        ),
+        "confidenceScore": 99 if verified else 80,
+        "timestamp": str(record.get("created_at") or ""),
+        "status": "SUCCESS" if in_validity else "FLAGGED_FOR_REVIEW",
+    }
+
+
+def _read_ocr_logs(path: Path) -> list[dict[str, Any]]:
+    """Parse confirmed_bhyt.jsonl newest-first, capped at OCR_LOG_LIMIT rows."""
+    parsed: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed JSON line in %s:%d", path.name, line_no)
+                continue
+            if isinstance(record, dict):
+                parsed.append(record)
+
+    parsed.reverse()
+    return [_to_ocr_log(record, index) for index, record in enumerate(parsed[:OCR_LOG_LIMIT])]
+
+
+@app.get("/api/v1/admin/ocr-logs", response_model=OcrLogsResponse)
+async def list_ocr_logs():
+    """Real OCR audit telemetry read from data/bhyt_records/confirmed_bhyt.jsonl."""
+    path = bhyt_store.records_path()
+    if not path.exists():
+        logger.info("Chưa có file audit OCR tại %s", path)
+        return OcrLogsResponse(logs=[], total=0)
+
+    try:
+        logs = await asyncio.to_thread(_read_ocr_logs, path)
+    except OSError as exc:
+        logger.exception("Không đọc được file audit OCR: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Không đọc được confirmed_bhyt.jsonl: {exc}",
+        ) from exc
+
+    return OcrLogsResponse(logs=logs, total=len(logs))
 
 
 if __name__ == "__main__":

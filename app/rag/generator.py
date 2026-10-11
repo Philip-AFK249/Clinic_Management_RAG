@@ -109,8 +109,11 @@ class GroqClient:
         temperature: float,
         stream: bool,
         response_format: dict | None = None,
+        model: str | None = None,
     ):
-        model = self.settings.LLM_MODEL_ID
+        # ``model`` lets the admin dashboard swap LLMs at runtime; when it is
+        # not supplied the configured default (settings.LLM_MODEL_ID) applies.
+        model = model or self.settings.LLM_MODEL_ID
         try:
             return self._create_completion(
                 model, system_prompt, user_prompt, temperature, stream, response_format
@@ -152,17 +155,27 @@ class GroqClient:
         user_prompt: str,
         temperature: float = 0.1,
         response_format: dict | None = None,
+        model: str | None = None,
     ) -> str:
         completion = self._create_with_fallback(
-            system_prompt, user_prompt, temperature, stream=False, response_format=response_format
+            system_prompt,
+            user_prompt,
+            temperature,
+            stream=False,
+            response_format=response_format,
+            model=model,
         )
         return completion.choices[0].message.content  # type: ignore[return-value]
 
     def stream(
-        self, system_prompt: str, user_prompt: str, temperature: float = 0.1
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        model: str | None = None,
     ) -> Iterable[str]:
         completion = self._create_with_fallback(
-            system_prompt, user_prompt, temperature, stream=True
+            system_prompt, user_prompt, temperature, stream=True, model=model
         )
         for chunk in completion:
             yield chunk.choices[0].delta.content or ""

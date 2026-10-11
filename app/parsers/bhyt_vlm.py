@@ -418,20 +418,25 @@ def _has_ocr_content(data: BhytData) -> bool:
 
 
 def extract_bhyt_from_bytes(
-    image_bytes: bytes, optimized: bytes | None = None
+    image_bytes: bytes,
+    optimized: bytes | None = None,
+    model: str | None = None,
 ) -> tuple[BhytData, str, bytes]:
     """Run the optimized image through the Groq VLM and return parsed data.
 
     Pass `optimized` to reuse an encode already produced by the caller.
+    `model` overrides the configured VLM (runtime switching from the admin
+    dashboard); it defaults to ``settings.VLM_MODEL_ID``.
     The Groq client is sync/blocking, so call this from a worker thread.
     """
     settings = get_settings()
+    vlm_model = model or settings.VLM_MODEL_ID
     if optimized is None:
         optimized = optimize_image(image_bytes)
     data_uri = "data:image/jpeg;base64," + base64.b64encode(optimized).decode("utf-8")
 
     response = get_groq_client().client.chat.completions.create(
-        model=settings.VLM_MODEL_ID,
+        model=vlm_model,
         messages=[
             {"role": "system", "content": BHYT_SYSTEM_PROMPT},
             {
@@ -453,7 +458,7 @@ def extract_bhyt_from_bytes(
     )
 
     raw_reply = response.choices[0].message.content or "{}"
-    logger.info("VLM (%s) trả về: %s", settings.VLM_MODEL_ID, raw_reply)
+    logger.info("VLM (%s) trả về: %s", vlm_model, raw_reply)
 
     data = normalise_bhyt_payload(_extract_json_payload(raw_reply))
     if not _has_ocr_content(data):
