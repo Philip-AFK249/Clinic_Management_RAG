@@ -13,13 +13,21 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.core.config import PARSED_MARKDOWN_DIR, PROJECT_ROOT, RAW_DOCS_DIR, get_settings
+from app.core.config import (
+    EXTRACTED_IMAGES_DIR,
+    PARSED_MARKDOWN_DIR,
+    PROJECT_ROOT,
+    RAW_DOCS_DIR,
+    get_settings,
+)
 from app.core.logging import get_logger
 from app.database.connection import get_connection
 from app.database.schedule_queries import (
@@ -46,6 +54,12 @@ PIPELINE_HTML = PROJECT_ROOT / "app" / "static" / "pipeline.html"
 
 # Document types the pipeline console is allowed to ingest.
 RAW_DOC_EXTENSIONS = (".pdf", ".docx")
+
+# Hard ceiling for a single document uploaded through the pipeline console.
+PIPELINE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+
+# Figure/diagram formats LlamaParse may drop into data/extracted_images/.
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 
 # Voice triage (Stage 1) + doctor dispatch (Stage 2).
 TRIAGE_KB_DOC_ID = "Triệu chứng chẩn đoán sớm"
@@ -149,6 +163,15 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Serve the figures LlamaParse pulled out of the ingested documents so the
+# admin console can render them next to their chunks.
+EXTRACTED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/static/images",
+    StaticFiles(directory=str(EXTRACTED_IMAGES_DIR)),
+    name="extracted_images",
 )
 
 
@@ -1030,6 +1053,71 @@ async def list_pipeline_files():
     )
 
 
+def _sanitise_upload_filename(filename: str) -> str:
+    """Reduce an uploaded name to a safe basename that cannot escape raw_docs."""
+    cleaned = Path((filename or "").strip().replace("\\", "/")).name.strip()
+    # Drop control characters plus characters that are illegal on Windows.
+    cleaned = re.sub(r'[\x00-\x1f<>:"|?*]', "", cleaned).strip()
+    return cleaned
+
+
+@app.post("/api/v1/pipeline/upload")
+async def upload_pipeline_file(file: UploadFile = File(...)):
+    """Store an uploaded .pdf/.docx into data/raw_docs/ for the ingestion pipeline."""
+    filename = _sanitise_upload_filename(file.filename or "")
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tên file không hợp lệ.",
+        )
+    if Path(filename).suffix.lower() not in RAW_DOC_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Chỉ hỗ trợ {' / '.join(RAW_DOC_EXTENSIONS)}.",
+        )
+
+    destination = RAW_DOCS_DIR / filename
+    try:
+        destination.resolve().relative_to(RAW_DOCS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Đường dẫn không hợp lệ.",
+        )
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File rỗng."
+        )
+    if len(content) > PIPELINE_UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File vượt quá {PIPELINE_UPLOAD_MAX_BYTES // (1024 * 1024)} MB.",
+        )
+
+    try:
+        RAW_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(destination.write_bytes, content)
+    except OSError as exc:
+        logger.exception("Không lưu được file upload '%s': %s", filename, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Không lưu được file: {exc}",
+        ) from exc
+    finally:
+        await file.close()
+
+    size_kb = round(len(content) / 1024, 1)
+    logger.info("Đã tải lên %s (%.1f KB) -> %s", filename, size_kb, destination)
+    return {
+        "success": True,
+        "filename": filename,
+        "size_kb": size_kb,
+        "message": "File uploaded successfully to data/raw_docs/.",
+    }
+
+
 @app.post("/api/v1/pipeline/run-single", response_model=PipelineRunResponse)
 async def run_single_file(payload: PipelineRunRequest):
     """Parse -> chunk -> embed -> insert one document from raw_docs into pgvector."""
@@ -1172,15 +1260,22 @@ async def voice_schedule_triage(
 
 
 class ModelConfigResponse(BaseModel):
-    """Active models + whitelists + infrastructure health for the dashboard."""
+    """Active models + whitelists + infrastructure health for the dashboard.
+
+    The dashboard reads both key conventions: ``active`` / ``active_models``
+    and ``available`` / ``available_options`` (id+name option lists).
+    """
 
     llm_model: str
     stt_model: str
     vlm_model: str
     embedding_model: str
     active: dict[str, str] = Field(default_factory=dict)
+    active_models: dict[str, str] = Field(default_factory=dict)
     available: dict[str, list[str]] = Field(default_factory=dict)
+    available_options: dict[str, list[dict[str, str]]] = Field(default_factory=dict)
     infrastructure: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    infrastructure_status: dict[str, str] = Field(default_factory=dict)
 
 
 class ModelConfigUpdateResponse(ModelConfigResponse):
@@ -1202,6 +1297,24 @@ class KnowledgeDocItem(BaseModel):
 class KnowledgeDocsResponse(BaseModel):
     documents: list[KnowledgeDocItem] = Field(default_factory=list)
     total_docs: int = 0
+
+
+class KnowledgeChunk(BaseModel):
+    # Serialised as text: the deployed clinic_knowledge_nodes uses UUID ids
+    # while the local DDL declares SERIAL, so str() covers both.
+    id: str
+    content: str
+    specialty: str = ""
+    target_audience: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+
+
+class KnowledgeChunksResponse(BaseModel):
+    doc_id: str
+    total_chunks: int = 0
+    chunks: list[KnowledgeChunk] = Field(default_factory=list)
+    extracted_images: list[str] = Field(default_factory=list)
 
 
 class KnowledgeDocDeleteResponse(BaseModel):
@@ -1229,6 +1342,13 @@ SELECT doc_id, specialty, target_audience, COUNT(*) AS chunk_count, MIN(created_
 FROM clinic_knowledge_nodes
 GROUP BY doc_id, specialty, target_audience
 ORDER BY MIN(created_at) DESC;
+"""
+
+CHUNKS_SQL = """
+SELECT id, content, specialty, target_audience, metadata, created_at
+FROM clinic_knowledge_nodes
+WHERE doc_id = %s
+ORDER BY id ASC;
 """
 
 #: OCR audit rows kept for the dashboard (newest first).
@@ -1270,18 +1390,36 @@ def _infrastructure_health(settings) -> dict[str, dict[str, Any]]:
 
 
 def _models_payload(settings) -> dict[str, Any]:
-    """Shape shared by GET/POST /api/v1/admin/models."""
+    """Shape shared by GET/POST /api/v1/admin/models.
+
+    Exposes every key the admin dashboard may read (``llm_model`` flat keys,
+    ``active`` / ``active_models`` dicts, ``available`` lists,
+    ``available_options`` id+name lists, ``infrastructure`` and the flattened
+    ``infrastructure_status``) so the frontend never sees ``undefined``.
+    """
     active = {
         "llm_model": _runtime_model("llm_model", settings.LLM_MODEL_ID),
         "stt_model": _runtime_model("stt_model", settings.LLM_STT_MODEL_ID),
         "vlm_model": _runtime_model("vlm_model", settings.VLM_MODEL_ID),
         "embedding_model": settings.EMBEDDING_MODEL,
     }
+    infra = _infrastructure_health(settings)
     return {
         **active,
         "active": dict(active),
+        "active_models": dict(active),
         "available": {key: list(value) for key, value in AVAILABLE_MODELS.items()},
-        "infrastructure": _infrastructure_health(settings),
+        "available_options": {
+            "llm_models": [{"id": m, "name": m} for m in AVAILABLE_MODELS["llm_models"]],
+            "stt_models": [{"id": m, "name": m} for m in AVAILABLE_MODELS["stt_models"]],
+            "vlm_models": [{"id": m, "name": m} for m in AVAILABLE_MODELS["vlm_models"]],
+        },
+        "infrastructure": infra,
+        "infrastructure_status": {
+            "ai_gateway": infra.get("ai_gateway", {}).get("status", "healthy"),
+            "pgvector": infra.get("pgvector", {}).get("status", "healthy"),
+            "embedding_device": infra.get("embedding_engine", {}).get("detail", "CPU/CUDA"),
+        },
     }
 
 
@@ -1379,6 +1517,91 @@ async def list_knowledge_docs():
 
     logger.info("Danh sách tri thức: %d tài liệu", len(documents))
     return KnowledgeDocsResponse(documents=documents, total_docs=len(documents))
+
+
+def _extracted_image_urls(doc_id: str) -> list[str]:
+    """Static URLs for the figures LlamaParse extracted into ``data/extracted_images/{doc_id}``."""
+    safe_doc_id = Path((doc_id or "").strip().replace("\\", "/")).name.strip()
+    if not safe_doc_id or safe_doc_id in {".", ".."}:
+        return []
+    doc_dir = (EXTRACTED_IMAGES_DIR / safe_doc_id).resolve()
+    try:
+        doc_dir.relative_to(EXTRACTED_IMAGES_DIR.resolve())
+    except ValueError:
+        return []
+    if not doc_dir.is_dir():
+        return []
+    image_files = sorted(
+        (
+            path
+            for path in doc_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=lambda path: path.name.lower(),
+    )
+    return [
+        f"/static/images/{quote(safe_doc_id)}/{quote(path.name)}"
+        for path in image_files
+    ]
+
+
+@app.get(
+    "/api/v1/admin/knowledge-docs/{doc_id}/chunks",
+    response_model=KnowledgeChunksResponse,
+)
+async def get_knowledge_doc_chunks(doc_id: str):
+    """Inspect every ingested chunk (plus extracted images) of one document."""
+    settings = get_settings()
+
+    def _fetch() -> list[tuple]:
+        with get_connection(settings) as conn:
+            with conn.cursor() as cur:
+                cur.execute(CHUNKS_SQL, (doc_id,))
+                rows = cur.fetchall()
+            conn.commit()
+        return rows
+
+    try:
+        rows = await asyncio.to_thread(_fetch)
+    except Exception as exc:
+        logger.exception("Không truy vấn được chunk của '%s': %s", doc_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Không đọc được chunk từ pgvector: {_db_error_detail(exc, settings)}",
+        ) from exc
+
+    chunks: list[KnowledgeChunk] = []
+    for row_id, content, specialty, target_audience, metadata, created_at in rows:
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        chunks.append(
+            KnowledgeChunk(
+                id=str(row_id),
+                content=str(content or ""),
+                specialty=str(specialty or ""),
+                target_audience=str(target_audience or ""),
+                metadata=metadata if isinstance(metadata, dict) else {},
+                created_at=(
+                    created_at.isoformat()
+                    if hasattr(created_at, "isoformat")
+                    else str(created_at or "")
+                ),
+            )
+        )
+
+    images = _extracted_image_urls(doc_id)
+    logger.info(
+        "Soát phê chunk '%s': %d chunk(s), %d image(s)", doc_id, len(chunks), len(images)
+    )
+    return KnowledgeChunksResponse(
+        doc_id=doc_id,
+        total_chunks=len(chunks),
+        chunks=chunks,
+        extracted_images=images,
+    )
 
 
 def _purge_knowledge_doc(doc_id: str, settings) -> int:

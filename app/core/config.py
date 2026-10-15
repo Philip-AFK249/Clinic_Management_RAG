@@ -12,6 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DOCS_DIR = DATA_DIR / "raw_docs"
 PARSED_MARKDOWN_DIR = DATA_DIR / "parsed_markdown"
+# Images/diagrams LlamaParse pulls out of a document, one folder per file stem.
+EXTRACTED_IMAGES_DIR = DATA_DIR / "extracted_images"
 
 
 class Settings(BaseSettings):

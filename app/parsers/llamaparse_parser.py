@@ -8,7 +8,7 @@ from typing import Optional
 
 from llama_parse import LlamaParse
 
-from app.core.config import PARSED_MARKDOWN_DIR, Settings, get_settings
+from app.core.config import EXTRACTED_IMAGES_DIR, PARSED_MARKDOWN_DIR, Settings, get_settings
 from app.core.logging import get_logger
 from app.parsers.base import BaseParser
 
@@ -51,6 +51,9 @@ class LlamaParseParser(BaseParser):
         #   bibliography so citations stay resolvable after parsing.
         # language="vi" keeps Vietnamese diacritics intact instead of letting
         #   the model transliterate them.
+        # disable_image_extraction=False + extract_charts=True + save_images=True
+        #   keep every figure, diagram and chart table available for download
+        #   through get_images() alongside the Markdown.
         self._parser = LlamaParse(
             api_key=settings.LLAMA_CLOUD_API_KEY,
             result_type="markdown",
@@ -60,6 +63,9 @@ class LlamaParseParser(BaseParser):
             annotate_links=True,
             num_workers=4,
             verbose=True,
+            disable_image_extraction=False,
+            extract_charts=True,
+            save_images=True,
         )
 
     def parse(self, file_path: Path) -> str:
@@ -67,11 +73,39 @@ class LlamaParseParser(BaseParser):
         if not file_path.exists():
             raise FileNotFoundError(f"Missing source file: {file_path}")
 
+        doc_img_dir = EXTRACTED_IMAGES_DIR / file_path.stem
+        doc_img_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("Sending %s to LlamaParse (medical layout mode)", file_path)
         documents = self._parser.load_data(str(file_path))
         markdown_content = "\n\n".join(doc.text for doc in documents)
         out_path = self.save(file_path, markdown_content)
         logger.info("Saved markdown to %s (%d chars)", out_path, len(markdown_content))
+
+        # Image extraction is best effort: a diagram that fails to download must
+        # never discard the Markdown that was already produced.
+        images: list = []
+        try:
+            images = self._parser.get_images(str(file_path), download_path=str(doc_img_dir))
+        except TypeError as exc:
+            # llama-parse >= 0.6 wants the parsed JSON job result, not a path.
+            logger.warning("get_images(path) rejected (%s) - retrying with JSON result", exc)
+            try:
+                json_result = self._parser.get_json_result(str(file_path))
+                images = self._parser.get_images(json_result, download_path=str(doc_img_dir))
+            except Exception as fallback_exc:
+                logger.warning("Image extraction failed for %s: %s", file_path.name, fallback_exc)
+                images = []
+        except Exception as exc:
+            logger.warning("Image extraction failed for %s: %s", file_path.name, exc)
+            images = []
+
+        logger.info(
+            "Extracted %d image(s) from %s into %s",
+            len(images) if isinstance(images, list) else 0,
+            file_path.name,
+            doc_img_dir,
+        )
         return markdown_content
 
 
