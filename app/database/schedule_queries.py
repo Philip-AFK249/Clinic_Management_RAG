@@ -20,7 +20,7 @@ as a query parameter - no SQL string is ever built by concatenation.
 from __future__ import annotations
 
 from datetime import date as date_cls
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -33,6 +33,10 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 CLINIC_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+#: Outpatient reception ends strictly at 17:00; after that the day's roster is
+#: considered finished and any unspecified/today request rolls to tomorrow.
+CLINIC_CLOSING_TIME = time(17, 0)
 
 #: Session label -> human readable window. Fixed by clinic policy.
 SESSION_WINDOWS: Dict[str, str] = {
@@ -169,16 +173,35 @@ def today_in_clinic_timezone() -> date_cls:
     return datetime.now(CLINIC_TIMEZONE).date()
 
 
-def normalise_target_date(target_date: Optional[str]) -> date_cls:
-    """Accept ``YYYY-MM-DD`` or None; default to today in Asia/Ho_Chi_Minh."""
-    if not target_date:
-        return today_in_clinic_timezone()
+def _parse_target_date(target_date: str) -> date_cls:
+    """Parse a strict ``YYYY-MM-DD`` string; raise ValueError when malformed."""
     try:
         return datetime.strptime(target_date.strip(), "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError(
             f"target_date phải có định dạng YYYY-MM-DD, nhận được: {target_date!r}"
         ) from exc
+
+
+def normalise_target_date(target_date: Optional[str]) -> date_cls:
+    """Accept ``YYYY-MM-DD`` or None; default to today in Asia/Ho_Chi_Minh.
+
+    After the clinic closes (``CLINIC_CLOSING_TIME`` = 17:00) an unspecified
+    date *or* today's date automatically rolls over to tomorrow, so patients
+    are never steered at an already-expired roster.
+    """
+    now_in_clinic = datetime.now(CLINIC_TIMEZONE)
+    after_closing = now_in_clinic.time() >= CLINIC_CLOSING_TIME
+
+    if not target_date:
+        if after_closing:
+            return now_in_clinic.date() + timedelta(days=1)
+        return now_in_clinic.date()
+
+    parsed = _parse_target_date(target_date)
+    if parsed == now_in_clinic.date() and after_closing:
+        return parsed + timedelta(days=1)
+    return parsed
 
 
 def _connect(settings: Settings) -> psycopg.Connection:
@@ -213,32 +236,55 @@ def query_department_schedule(
     """Return real-time outpatient duty shifts and capacity for one department.
 
         ``department_id`` must be one of the three clinical departments (1, 2, 3).
-        ``target_date`` defaults to today in Asia/Ho_Chi_Minh.
+        ``target_date`` defaults to today in Asia/Ho_Chi_Minh - or to tomorrow
+        when the request arrives after the 17:00 clinic closing time, see
+        :func:`normalise_target_date`.
 
         This function never raises for infrastructure problems. If the schedule
         database is unreachable, missing, or its tables are absent, it returns
-        :func:`unavailable_schedule` with ``is_available=False`` so the caller can
-        still answer HTTP 200 with the Stage 1 clinical result.
+        :func:`unavailable_schedule` with ``is_available=False`` (still carrying
+        the normalized target date) so the caller can still answer HTTP 200 with
+        the Stage 1 clinical result.
     """
     settings = settings or get_settings()
+    now_in_clinic = datetime.now(CLINIC_TIMEZONE)
+
     try:
         department_id = int(department_id)
     except (TypeError, ValueError):
         # A malformed id cannot be routed anywhere; degrade rather than 500.
         return unavailable_schedule(
-            1, today_in_clinic_timezone(), reason=f"department_id không hợp lệ: {department_id!r}"
+            1,
+            normalise_target_date(None),
+            reason=f"department_id không hợp lệ: {department_id!r}",
         )
     if department_id not in FALLBACK_DEPARTMENTS:
         return unavailable_schedule(
             1,
-            today_in_clinic_timezone(),
+            normalise_target_date(None),
             reason=f"department_id phải là 1, 2 hoặc 3; nhận được: {department_id}",
         )
 
-    try:
-        day = normalise_target_date(target_date)
-    except ValueError as exc:
-        return unavailable_schedule(department_id, today_in_clinic_timezone(), reason=str(exc))
+    # The un-rolled request (today, or the explicitly requested day); comparing
+    # it with the normalized result reveals whether the 17:00 rollover fired.
+    requested: Optional[date_cls]
+    if target_date:
+        try:
+            requested = _parse_target_date(target_date)
+        except ValueError as exc:
+            return unavailable_schedule(
+                department_id, normalise_target_date(None), reason=str(exc)
+            )
+    else:
+        requested = now_in_clinic.date()
+
+    day = normalise_target_date(target_date)
+    if day != requested:
+        logger.info(
+            "Current time %s >= 17:00. Target date rolled over to tomorrow: %s",
+            now_in_clinic.strftime("%H:%M"),
+            day.isoformat(),
+        )
 
     try:
         return _load_schedule(department_id, day, settings)
