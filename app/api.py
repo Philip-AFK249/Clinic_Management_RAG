@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.formparsers import MultiPartParser
 
 from app.core.config import (
     EXTRACTED_IMAGES_DIR,
@@ -47,7 +48,15 @@ from app.parsers.bhyt_vlm import (
     optimize_image,
     validate_bhyt,
 )
-from app.services import bhyt_store
+from app.services import ambient, bhyt_store
+from app.services.ambient import (
+    ClinicalDraft,
+    DiarizedTurn,
+    IcdDiagnosis,
+    PrescriptionItemDraft,
+    SoapNote,
+)
+from app.services.clinical_client import get_available_drugs
 
 logger = get_logger(__name__)
 
@@ -69,6 +78,26 @@ VOICE_ALLOWED_EXTENSIONS = (".wav", ".webm", ".m4a", ".mp3", ".ogg", ".flac")
 VOICE_MAX_BYTES = 25 * 1024 * 1024  # Groq's per-file STT ceiling
 VALID_DEPARTMENT_IDS = (1, 2, 3)
 VALID_PRIORITIES = ("P1", "P2", "P3")
+
+# Privacy rule for the ambient consultation: audio is NEVER written to disk.
+# Starlette spools every multipart file part above 1 MB into a SpooledTemporaryFile
+# that rolls over into the OS temp directory, which would put a consultation
+# recording on disk for as long as the upload is being parsed. Raising the spool
+# watermark above the accepted audio ceiling keeps uploads in RAM for their whole
+# lifetime, so the only bytes that ever exist are the ones returned by
+# ``UploadFile.read()`` - and those are dropped again right after Whisper runs.
+MultiPartParser.spool_max_size = VOICE_MAX_BYTES
+
+#: Speech-to-text model mandated for the ambient consultation pipeline.
+AMBIENT_STT_MODEL = "whisper-large-v3-turbo"
+
+#: Vocabulary bias for Whisper so it keeps Vietnamese clinical wording intact.
+AMBIENT_STT_PROMPT = (
+    "Khám lâm sàng, hỏi bệnh giữa bác sĩ và bệnh nhân: đau bụng, đau ngực, khó thở, "
+    "sốt, ho, khạc đờm, nổi ban, mụn nước, ngứa, zona, lở miệng, sút cân, đổ mồ hôi đêm, "
+    "gầy mòn, tiêu chảy, buồn nôn, dị ứng thuốc, tiền sử bệnh, xét nghiệm, siêu âm, "
+    "chẩn đoán, kê đơn, tái khám."
+)
 
 VOICE_STT_PROMPT = (
     "Khám bệnh, đau thắt ngực, khó thở, huyết áp, hồi hộp, tim mạch, sốt cao, "
@@ -102,6 +131,7 @@ Quy tắc bắt buộc:
 #: rejected by POST /api/v1/admin/models so a typo cannot poison the gateway.
 AVAILABLE_MODELS: dict[str, list[str]] = {
     "llm_models": [
+        "openai/gpt-oss-120b",
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
         "mixtral-8x7b-32768",
@@ -150,7 +180,39 @@ class ModelConfigPayload(BaseModel):
     vlm_model: str = Field(min_length=1)
 
 
-app = FastAPI(title="Smart Clinic - AI Gateway API", version="3.0")
+def _warm_up_knowledge_embedder() -> None:
+    """Pre-load BAAI/bge-m3 in the background (skipped when pgvector is down).
+
+    The ambient copilot's Step 4 searches ``clinic_knowledge_nodes`` with bge-m3;
+    loading the model inside the first consultation would stall the visit for
+    roughly a minute, so it is paid once at boot instead.
+    """
+    settings = get_settings()
+    try:
+        if not ambient.pgvector_reachable(settings):
+            logger.info("Embedder warm-up skipped: pgvector is unreachable.")
+            return
+        from app.ingestion.embedder import warm_up_embedder
+
+        warm_up_embedder(settings)
+        logger.info("Knowledge embedder warmed up (%s).", settings.EMBEDDING_MODEL)
+    except Exception as exc:  # never let a warm-up crash the gateway
+        logger.warning("Knowledge embedder warm-up failed: %s", exc)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    threading.Thread(
+        target=_warm_up_knowledge_embedder, daemon=True, name="bge-m3-warmup"
+    ).start()
+    yield
+
+
+app = FastAPI(
+    title="Smart Clinic - AI Gateway API",
+    version="3.0",
+    lifespan=_lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -338,8 +400,9 @@ def _wav_has_no_speech(audio: bytes) -> Optional[bool]:
 
 #: WHO ICD-10 morphology: letter, 2 digits, optional sub-code. 'U' is excluded
 #: because it is reserved for special-purpose codes, and the LLM is told to
-#: return "" rather than guess, so anything malformed is dropped.
-_ICD10_RE = re.compile(r"^[A-TV-Z][0-9][0-9AB](\.[0-9A-TV-Z]{1,4})?$", re.IGNORECASE)
+#: return "" rather than guess, so anything malformed is dropped. Shared with
+#: the ambient copilot so both pipelines enforce one identical contract.
+_ICD10_RE = ambient.ICD10_RE
 
 _DEPARTMENT_NAMES = {
     1: "Khoa Nội Tổng quát & Tim mạch",
@@ -422,6 +485,144 @@ def _transcribe_voice(audio: bytes, filename: str, settings) -> str:
         )
         raise VoiceAudioDecodeError(_NO_SPEECH_MESSAGE)
     return text
+
+
+def _transcribe_ambient(audio: bytes, filename: str, settings) -> str:
+    """Ambient Step 1: Groq Whisper on the in-memory buffer, nothing persisted.
+
+    ``audio`` is the raw bytes object handed over by ``UploadFile.read()``; it is
+    passed straight to Groq and the caller drops its reference the moment this
+    returns, so no audio ever reaches ``data/`` or the OS temp directory.
+    """
+    from groq import BadRequestError
+    from groq import Groq
+
+    if not settings.GROQ_API_KEY:
+        raise VoiceAudioDecodeError("Thiếu GROQ_API_KEY trong .env.")
+
+    client = Groq(api_key=settings.GROQ_API_KEY)
+    logger.info("Ambient STT request using model '%s'", AMBIENT_STT_MODEL)
+    try:
+        completion = client.audio.transcriptions.create(
+            file=(filename, audio),
+            model=AMBIENT_STT_MODEL,
+            language="vi",
+            prompt=AMBIENT_STT_PROMPT,
+            response_format="text",
+        )
+    except BadRequestError as exc:
+        raise VoiceAudioDecodeError(
+            f"Không giải mã được tệp audio ({filename}): {exc}"
+        ) from exc
+
+    text = (completion or "").strip()
+    if not text or _looks_like_whisper_hallucination(text):
+        logger.warning(
+            "Rejected ambient transcription as hallucination/noise: %r",
+            (text or "")[:120],
+        )
+        raise VoiceAudioDecodeError(_NO_SPEECH_MESSAGE)
+    return text
+
+
+def _resolve_ambient_filename(file: UploadFile) -> str:
+    """Audio filename for Whisper; browser blobs often arrive without a suffix."""
+    filename = (file.filename or "").strip()
+    extension = Path(filename).suffix.lower()
+
+    if extension:
+        if extension not in VOICE_ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Định dạng audio không hỗ trợ: {extension}. "
+                f"Chấp nhận: {', '.join(VOICE_ALLOWED_EXTENSIONS)}",
+            )
+        return filename
+
+    content_type = (file.content_type or "").lower()
+    if "webm" in content_type:
+        extension = ".webm"
+    elif "wav" in content_type:
+        extension = ".wav"
+    elif "mp4" in content_type or "m4a" in content_type:
+        extension = ".m4a"
+    elif "ogg" in content_type:
+        extension = ".ogg"
+    elif "mp3" in content_type or "mpeg" in content_type:
+        extension = ".mp3"
+    else:
+        extension = ".webm"  # Mặc định của Web MediaRecorder
+    return f"consultation{extension}"
+
+
+def _ambient_llm_model(settings) -> str:
+    """Chat model for the ambient pipeline: gpt-oss-120b or llama-3.3-70b."""
+    active = _runtime_model("llm_model", settings.LLM_MODEL_ID)
+    if active in ambient.PREFERRED_LLM_MODELS:
+        return active
+    return ambient.PREFERRED_LLM_MODELS[0]
+
+
+def _clinical_profile(
+    department_id: int,
+    allergies: str,
+    patient_history: str,
+    doctor_id: Optional[int] = None,
+    patient_id: Optional[int] = None,
+) -> str:
+    """Compact text block fed to every ambient prompt."""
+    lines = []
+    department_name = _DEPARTMENT_NAMES.get(department_id, "")
+    lines.append(
+        f"department_id={department_id}" + (f" ({department_name})" if department_name else "")
+    )
+    if doctor_id is not None:
+        lines.append(f"doctor_id={doctor_id}")
+    if patient_id is not None:
+        lines.append(f"patient_id={patient_id}")
+    lines.append(f"allergies={(allergies or '').strip() or '(chưa rõ)'}")
+    lines.append(f"patient_history={(patient_history or '').strip() or '(chưa có)'}")
+    return "\n".join(lines)
+
+
+def _ambient_rag_query(diarization, raw_transcript: str) -> str:
+    """Guideline lookup query: complaints/symptoms beat the raw transcript."""
+    parts = diarization.chief_complaints + diarization.symptoms
+    if not parts:
+        return raw_transcript[:600]
+    return ("Phác đồ điều trị " + "; ".join(parts))[:800]
+
+
+async def _retrieve_knowledge_safely(
+    query: str, settings
+) -> tuple[str, list[str], list[str]]:
+    """RAG retrieval with a hard ceiling; a slow/down cluster degrades to a warning.
+
+    ``asyncio.wait_for`` cannot kill the worker thread, but it does stop the
+    request from hanging while a cold bge-m3 load finishes in the background.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(ambient.retrieve_knowledge_context, query, settings),
+            timeout=ambient.RAG_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Knowledge retrieval exceeded %.0fs; continuing without RAG",
+            ambient.RAG_TIMEOUT_SECONDS,
+        )
+        return (
+            "",
+            [],
+            [
+                f"Truy xuất phác đồ quá {int(ambient.RAG_TIMEOUT_SECONDS)} giây; "
+                "bỏ qua RAG để không làm chậm buổi khám."
+            ],
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        detail = f"{type(exc).__name__}: {exc}".strip().splitlines()[0][:200]
+        logger.warning("Knowledge retrieval failed: %s", detail)
+        return "", [], [f"Không truy xuất được phác đồ Bộ Y tế ({detail})."]
 
 
 def _retrieve_triage_context(transcription: str, settings) -> tuple[str, list[str], list[str]]:
@@ -1297,6 +1498,340 @@ async def voice_schedule_triage(
         # Stage 2 problems degrade inside _run_voice_triage.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Ambient AI Clinical Copilot for the Doctor EHR portal
+# Privacy: consultation audio lives only in RAM for the Whisper call - it is
+# never written to data/, the OS temp directory or the database. Only the
+# structured textual insights below (transcript, symptoms, SOAP, ICD-10,
+# prescription draft) leave this process.
+# ---------------------------------------------------------------------------
+
+
+class AmbientConsultationResponse(BaseModel):
+    """Structured outcome of one in-memory ambient consultation."""
+
+    success: bool = True
+    raw_transcript: str
+    diarized_transcript: list[DiarizedTurn] = Field(
+        default_factory=list, description="Câu thoại đã gán vai doctor/patient"
+    )
+    has_red_flags: bool = False
+    red_flag_alert: str = ""
+    recommended_inquiry: str = ""
+    chief_complaints: list[str] = Field(default_factory=list)
+    symptoms: list[str] = Field(default_factory=list)
+    soap_note: SoapNote
+    diagnoses: list[IcdDiagnosis] = Field(default_factory=list)
+    prescription_draft: list[PrescriptionItemDraft] = Field(default_factory=list)
+    formulary_source: str = Field(
+        default="", description="Endpoint hoặc PostgreSQL lấy danh mục thuốc"
+    )
+    rag_sources: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    latency_ms: float = 0.0
+
+
+class CopilotChatRequest(BaseModel):
+    """Doctor follow-up text plus the draft it should update."""
+
+    message: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="Phản hồi/xác nhận của bác sĩ, ví dụ 'Bệnh nhân xác nhận đã nhiễm HIV 2 năm'",
+    )
+
+    @field_validator("message")
+    @classmethod
+    def _clean_message(cls, value: str) -> str:
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("Tin nhắn của bác sĩ không được để trống.")
+        return cleaned
+    soap_note: Optional[SoapNote] = None
+    diagnoses: list[IcdDiagnosis] = Field(default_factory=list)
+    prescription_draft: list[PrescriptionItemDraft] = Field(default_factory=list)
+    raw_transcript: str = ""
+    diarized_transcript: list[DiarizedTurn] = Field(default_factory=list)
+    allergies: str = ""
+    patient_history: str = ""
+    department_id: int = 1
+    doctor_id: Optional[int] = None
+    patient_id: Optional[int] = None
+
+
+class CopilotChatResponse(BaseModel):
+    """Updated SOAP note / ICD-10 list / prescription draft after one message."""
+
+    success: bool = True
+    assistant_message: str = ""
+    soap_note: SoapNote
+    diagnoses: list[IcdDiagnosis] = Field(default_factory=list)
+    prescription_draft: list[PrescriptionItemDraft] = Field(default_factory=list)
+    formulary_source: str = ""
+    rag_sources: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    latency_ms: float = 0.0
+
+
+def _formulary_warnings(formulary) -> tuple[list, list[str]]:
+    """Drugs plus the degradation warning when a formulary source was down."""
+    warnings: list[str] = []
+    if formulary.error:
+        warnings.append(formulary.error)
+    return formulary.drugs, warnings
+
+
+@app.post(
+    "/api/v1/clinical/ambient-consultation",
+    response_model=AmbientConsultationResponse,
+)
+async def ambient_consultation(
+    audio_file: UploadFile = File(
+        ..., description="Ghi âm buổi khám (.wav, .webm, .m4a, .mp3, .ogg, .flac)"
+    ),
+    department_id: int = Form(1),
+    doctor_id: Optional[int] = Form(None),
+    patient_id: Optional[int] = Form(None),
+    allergies: str = Form("", description='Dị ứng, ví dụ "Penicillin, Aspirin"'),
+    patient_history: str = Form(""),
+):
+    """Ambient voice consultation, zero audio storage.
+
+    Step 1 transcribes the upload straight out of RAM and drops the bytes;
+    Steps 2-5 turn that transcript into a diarized dialogue, a red-flag scan, a
+    SOAP note, ICD-10 diagnoses and a prescription draft matched against the
+    live in-stock formulary (pgvector guidelines + ClinicalConsultationService
+    are retrieved in parallel).
+    """
+    started = time.perf_counter()
+    settings = get_settings()
+
+    try:
+        # Rejecting an unsupported upload early still goes through the same
+        # close path, so the in-memory buffer is dropped on every branch.
+        filename = _resolve_ambient_filename(audio_file)
+
+        # --- Step 1: in-memory speech-to-text ------------------------------
+        audio_bytes = await audio_file.read()
+        try:
+            if not audio_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp audio rỗng."
+                )
+            if len(audio_bytes) > VOICE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"File audio vượt quá {VOICE_MAX_BYTES // (1024 * 1024)} MB.",
+                )
+            if _wav_has_no_speech(audio_bytes) is True:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Không phát hiện giọng nói trong tệp WAV (âm thanh im lặng "
+                    "hoặc chỉ có nhiễu). Vui lòng ghi âm lại gần micro hơn.",
+                )
+
+            raw_transcript = await asyncio.to_thread(
+                _transcribe_ambient, audio_bytes, filename, settings
+            )
+        finally:
+            # Privacy rule: the buffer exists only while Whisper is running.
+            del audio_bytes
+
+        logger.info(
+            "Ambient STT (%d chars): %s", len(raw_transcript), raw_transcript[:120]
+        )
+
+        llm_model = _ambient_llm_model(settings)
+        clinical_profile = _clinical_profile(
+            department_id, allergies, patient_history, doctor_id, patient_id
+        )
+
+        # --- Step 2: semantic diarization & role labelling -----------------
+        diarization = await asyncio.to_thread(
+            ambient.diarize_dialogue,
+            raw_transcript,
+            clinical_profile,
+            llm_model,
+            settings,
+        )
+        logger.info(
+            "Ambient step 2: %d turn(s), %d complaint(s), %d symptom(s)",
+            len(diarization.turns),
+            len(diarization.chief_complaints),
+            len(diarization.symptoms),
+        )
+
+        # --- Step 3: red flags & infectious disease scanner ----------------
+        red_flags = await asyncio.to_thread(
+            ambient.scan_red_flags, diarization, clinical_profile, llm_model, settings
+        )
+        logger.info("Ambient step 3: has_red_flags=%s", red_flags.has_red_flags)
+
+        # --- Step 4: parallel knowledge RAG + in-stock formulary -----------
+        knowledge_result, formulary = await asyncio.gather(
+            _retrieve_knowledge_safely(
+                _ambient_rag_query(diarization, raw_transcript), settings
+            ),
+            get_available_drugs(settings),
+        )
+        knowledge_context, rag_sources, warnings = knowledge_result
+        drugs, formulary_warnings = _formulary_warnings(formulary)
+        warnings.extend(formulary_warnings)
+        logger.info(
+            "Ambient step 4: %d guideline chunk(s) [%s] + %d in-stock drug(s) [%s]",
+            len(rag_sources),
+            ", ".join(rag_sources) or "-",
+            len(drugs),
+            formulary.source or "unavailable",
+        )
+
+        # --- Step 5: SOAP + ICD-10 + prescription draft ---------------------
+        draft = await asyncio.to_thread(
+            ambient.synthesise_clinical_note,
+            diarization,
+            red_flags,
+            clinical_profile,
+            knowledge_context,
+            drugs,
+            llm_model,
+            settings,
+        )
+        warnings.extend(draft.warnings)
+
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.info(
+            "Ambient consultation done: turns=%d red_flags=%s diagnoses=%d rx=%d (%.0f ms)",
+            len(diarization.turns),
+            red_flags.has_red_flags,
+            len(draft.diagnoses),
+            len(draft.prescription_draft),
+            latency_ms,
+        )
+        return AmbientConsultationResponse(
+            success=True,
+            raw_transcript=raw_transcript,
+            diarized_transcript=diarization.turns,
+            has_red_flags=red_flags.has_red_flags,
+            red_flag_alert=red_flags.red_flag_alert,
+            recommended_inquiry=red_flags.recommended_inquiry,
+            chief_complaints=diarization.chief_complaints,
+            symptoms=diarization.symptoms,
+            soap_note=draft.soap_note,
+            diagnoses=draft.diagnoses,
+            prescription_draft=draft.prescription_draft,
+            formulary_source=formulary.source,
+            rag_sources=rag_sources,
+            warnings=warnings,
+            latency_ms=latency_ms,
+        )
+    except HTTPException:
+        raise
+    except VoiceAudioDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except ambient.AmbientPipelineError as exc:
+        logger.error("Ambient pipeline rejected model output: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Không xử lý được phiên khám: {exc}",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Lỗi hệ thống khi xử lý ambient consultation: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi xử lý Ambient Consultation: {type(exc).__name__}: {exc}",
+        ) from exc
+    finally:
+        # Closing the upload drops the spooled buffer; nothing was ever on disk.
+        await audio_file.close()
+
+
+@app.post("/api/v1/clinical/copilot-chat", response_model=CopilotChatResponse)
+async def copilot_chat(payload: CopilotChatRequest):
+    """Apply one doctor follow-up message to the current clinical draft.
+
+    Example: *"Bệnh nhân xác nhận đã nhiễm HIV 2 năm trước và đang uống ARV"* -
+    the SOAP note, the secondary diagnoses (e.g. ``B20``) and the medication
+    contraindications are revised in place, still strictly matched against the
+    live in-stock formulary.
+    """
+    started = time.perf_counter()
+    settings = get_settings()
+    llm_model = _ambient_llm_model(settings)
+    clinical_profile = _clinical_profile(
+        payload.department_id,
+        payload.allergies,
+        payload.patient_history,
+        payload.doctor_id,
+        payload.patient_id,
+    )
+    conversation_history = "\n".join(
+        f"{turn.speaker}: {turn.text}" for turn in payload.diarized_transcript
+    ) or payload.raw_transcript[:1500]
+
+    try:
+        knowledge_result, formulary = await asyncio.gather(
+            _retrieve_knowledge_safely(payload.message, settings),
+            get_available_drugs(settings),
+        )
+        knowledge_context, rag_sources, warnings = knowledge_result
+        drugs, formulary_warnings = _formulary_warnings(formulary)
+        warnings.extend(formulary_warnings)
+
+        previous = ClinicalDraft(
+            soap_note=payload.soap_note or SoapNote(),
+            diagnoses=list(payload.diagnoses),
+            prescription_draft=list(payload.prescription_draft),
+        )
+        draft, assistant_message = await asyncio.to_thread(
+            ambient.revise_clinical_note,
+            payload.message,
+            previous,
+            clinical_profile,
+            knowledge_context,
+            drugs,
+            llm_model,
+            settings,
+            conversation_history,
+        )
+        warnings.extend(draft.warnings)
+
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.info(
+            "Copilot chat: diagnoses=%d rx=%d warnings=%d (%.0f ms)",
+            len(draft.diagnoses),
+            len(draft.prescription_draft),
+            len(warnings),
+            latency_ms,
+        )
+        return CopilotChatResponse(
+            success=True,
+            assistant_message=assistant_message,
+            soap_note=draft.soap_note,
+            diagnoses=draft.diagnoses,
+            prescription_draft=draft.prescription_draft,
+            formulary_source=formulary.source,
+            rag_sources=rag_sources,
+            warnings=warnings,
+            latency_ms=latency_ms,
+        )
+    except HTTPException:
+        raise
+    except ambient.AmbientPipelineError as exc:
+        logger.error("Copilot chat rejected model output: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Không cập nhật được hồ sơ: {exc}",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Lỗi hệ thống khi xử lý copilot-chat: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi xử lý Copilot Chat: {type(exc).__name__}: {exc}",
         ) from exc
 
 

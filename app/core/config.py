@@ -45,6 +45,19 @@ class Settings(BaseSettings):
     SCHEDULE_DB_NAME: str = "clinic_management_doctorschedule_service"
     SCHEDULE_DB_CONNECT_TIMEOUT: int = 5
 
+    # ClinicalConsultationService (Spring Boot @ :8083) - in-stock formulary for
+    # the ambient copilot. The HTTP endpoint is tried first; the PostgreSQL
+    # instance behind it is the fallback so a stopped Spring Boot process does
+    # not blind the prescription draft.
+    CLINICAL_SERVICE_BASE_URL: str = "http://localhost:8083"
+    CLINICAL_SERVICE_TIMEOUT: float = 2.0
+    CLINICAL_DB_HOST: str = "localhost"
+    CLINICAL_DB_PORT: int = 5432
+    CLINICAL_DB_USER: str = "postgres"
+    CLINICAL_DB_PASSWORD: str = "123"
+    CLINICAL_DB_NAME: str = "clinic_management_clinicalconsultation_service"
+    CLINICAL_DB_CONNECT_TIMEOUT: int = 5
+
     # External API keys
     GROQ_API_KEY: str = ""
     LLAMA_CLOUD_API_KEY: str = ""
@@ -91,6 +104,19 @@ class Settings(BaseSettings):
         return (
             f"postgresql://{self.SCHEDULE_DB_USER}:{self.SCHEDULE_DB_PASSWORD}"
             f"@{self.SCHEDULE_DB_HOST}:{self.SCHEDULE_DB_PORT}/postgres"
+        )
+
+    @property
+    def clinical_db_dsn(self) -> str:
+        """DSN for the ClinicalConsultationService database (formulary fallback).
+
+            Built only from the ``CLINICAL_DB_*`` settings: the drug catalogue is
+            owned by that service, so credentials never fall back to the pgvector
+            connection even when the shared local defaults happen to match.
+        """
+        return (
+            f"postgresql://{self.CLINICAL_DB_USER}:{self.CLINICAL_DB_PASSWORD}"
+            f"@{self.CLINICAL_DB_HOST}:{self.CLINICAL_DB_PORT}/{self.CLINICAL_DB_NAME}"
         )
 
     def validate_api_keys(self) -> None:
