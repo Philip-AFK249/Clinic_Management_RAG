@@ -221,6 +221,8 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "http://localhost:8008",
+        "http://127.0.0.1:8008",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
     ],
@@ -1461,46 +1463,6 @@ async def voice_schedule_triage(
         await file.close()
 
 
-    """Two-stage voice triage: Whisper + RAG + LLM, then a real roster query."""
-    filename = (file.filename or "").strip()
-    extension = Path(filename).suffix.lower()
-    if extension not in VOICE_ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Định dạng audio không hỗ trợ: {extension or '(không có)'}. "
-            f"Chấp nhận: {', '.join(VOICE_ALLOWED_EXTENSIONS)}",
-        )
-
-    audio = await file.read()
-    await file.close()
-    if not audio:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp audio rỗng."
-        )
-    if len(audio) > VOICE_MAX_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File audio vượt quá {VOICE_MAX_BYTES // (1024 * 1024)} MB.",
-        )
-    if _wav_has_no_speech(audio) is True:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Không phát hiện giọng nói trong tệp WAV (âm thanh im lặng hoặc chỉ có nhiễu). "
-            "Vui lòng ghi âm lại gần micro hơn.",
-        )
-
-    try:
-        return await asyncio.to_thread(
-            _run_voice_triage, audio, filename, target_date
-        )
-    except ValueError as exc:
-        # Only Stage 1 failures (bad audio, unrecognisable speech) reach here;
-        # Stage 2 problems degrade inside _run_voice_triage.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-
-
 # ---------------------------------------------------------------------------
 # Ambient AI Clinical Copilot for the Doctor EHR portal
 # Privacy: consultation audio lives only in RAM for the Whisper call - it is
@@ -2273,4 +2235,4 @@ async def list_ocr_logs():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app.api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app.api:app", host="0.0.0.0", port=8008, reload=True)
