@@ -93,12 +93,14 @@ AMBIENT_STT_MODEL = "whisper-large-v3-turbo"
 
 #: Vocabulary bias for Whisper so it keeps Vietnamese clinical wording intact.
 #: The clinical terms lead the prompt so phonetically close words ("dị ứng" vs
-#: "dương", "phát ban" vs "pháp bản") survive the first decode pass, and the
-#: scripted Q&A pair seeds the doctor/patient alternation the diarizer needs.
+#: "dương", "phát ban" vs "pháp bản") survive the first decode pass. The prompt
+#: is strictly comma-separated medical vocabulary: any scripted dialogue marker
+#: (e.g. "Bác sĩ hỏi:... Bệnh nhân trả lời:...") primes Whisper's repetition
+#: hallucination loops such as "Bệnh nhân trả lời, chàm, bệnh nhân trả lời...".
 AMBIENT_STT_PROMPT = (
-    "Khám lâm sàng, hỏi bệnh giữa bác sĩ và bệnh nhân, triệu chứng, dị ứng thức ăn, "
-    "dị ứng thuốc, phát ban, mẩn ngứa, bọng nước, mụn nước, chàm, ghẻ, vảy nến, sốt, đau ngực. "
-    "Bác sĩ hỏi: Anh có bị dị ứng không? Bệnh nhân trả lời: Tôi không bị dị ứng."
+    "Khám lâm sàng, chẩn đoán, phác đồ điều trị, triệu chứng, tiền sử dị ứng, "
+    "dị ứng thức ăn, phát ban, mẩn ngứa, bọng nước, mụn nước, chàm, ghẻ, vảy nến, "
+    "viêm da cơ địa, hen phế quản, khó thở, ho có đờm, đau ngực, huyết áp, sốt."
 )
 
 VOICE_STT_PROMPT = (

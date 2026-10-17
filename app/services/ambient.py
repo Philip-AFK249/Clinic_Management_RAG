@@ -305,7 +305,7 @@ Dựa trên [TRANSCRIPT THÔ] do mô hình nhận dạng giọng nói tạo ra, 
 
 {"diarized_turns": [{"speaker": "doctor", "text": "..."}], "chief_complaints": ["..."], "symptoms": ["..."]}
 
-Analyze Vietnamese conversational doctor-patient interaction. Any interrogative inquiry asking about medical history, allergies, symptom duration, dietary intake, or physical examination requests (e.g., 'Anh/chị/bác có bị... không?', 'Bị bao lâu rồi?', 'Ăn uống gì lạ không?', 'Để bác sĩ xem/khám...') MUST be attributed to speaker: 'doctor'. When a single paragraph contains both a question and a subsequent answer, you MUST split them into alternating 'doctor' and 'patient' turns.
+Analyze Vietnamese conversational doctor-patient interaction. Any interrogative inquiry asking about medical history, allergies, symptom duration, dietary intake, or physical examination requests (e.g., 'Anh/chị/bác có bị... không?', 'Bị bao lâu rồi?', 'Ăn uống gì lạ không?', 'Để bác sĩ xem/khám...') MUST be attributed to speaker: 'doctor'. When a single paragraph contains both a question and a subsequent answer, you MUST split them into alternating 'doctor' and 'patient' turns. Opening greetings inviting the patient into the examination room (e.g. 'Rồi, mời anh vào', 'Chào bác, mời ngồi', 'Hôm nay anh thấy thế nào?') are 100% spoken by the 'doctor'. Never assign room entry invitations to the patient.
 
 Quy tắc phân vai:
 1. doctor: câu hỏi thăm khám, chỉ định thăm khám/vận động ("nào, bác sĩ khám bụng nhé", "hít thở sâu nào"), yêu cầu xét nghiệm, giải thích chẩn đoán, tư vấn và kê đơn. Câu hỏi khai thác bệnh sử/dị ứng/thời gian triệu chứng/ăn uống đều là doctor, kể cả khi Whisper ghi sai chính tả.
@@ -375,9 +375,10 @@ Bắt buộc:
 # ---------------------------------------------------------------------------
 
 _DOCTOR_CUES = re.compile(
-    r"^(nào|để (tôi|bác sĩ)|tôi (khám|sẽ|nghe|cho)|bác sĩ|khám (bạn|bệnh nhân|phần|hộ)|"
+    r"^(nào|rồi,? mời|mời (anh|chị|bác|em|bạn)|để (tôi|bác sĩ)|tôi (khám|sẽ|nghe|cho)|"
+    r"bác sĩ|chào (anh|chị|bác|em|bạn)|hôm nay (sao|thế nào|bị gì)|"
     r"(anh|chị|bạn|em|bác)\s+(có|đang|bị|ăn|uống|dùng|thấy)|"
-    r"hít thở sâu|nằm xuống|tái khám|uống thuốc|xét nghiệm|chào (bạn|chị|anh|em|bác))",
+    r"hít thở sâu|nằm xuống|tái khám|uống thuốc|xét nghiệm)",
     re.IGNORECASE,
 )
 
