@@ -92,11 +92,13 @@ MultiPartParser.spool_max_size = VOICE_MAX_BYTES
 AMBIENT_STT_MODEL = "whisper-large-v3-turbo"
 
 #: Vocabulary bias for Whisper so it keeps Vietnamese clinical wording intact.
+#: The clinical terms lead the prompt so phonetically close words ("dị ứng" vs
+#: "dương", "phát ban" vs "pháp bản") survive the first decode pass, and the
+#: scripted Q&A pair seeds the doctor/patient alternation the diarizer needs.
 AMBIENT_STT_PROMPT = (
-    "Khám lâm sàng, hỏi bệnh giữa bác sĩ và bệnh nhân: đau bụng, đau ngực, khó thở, "
-    "sốt, ho, khạc đờm, nổi ban, mụn nước, ngứa, zona, lở miệng, sút cân, đổ mồ hôi đêm, "
-    "gầy mòn, tiêu chảy, buồn nôn, dị ứng thuốc, tiền sử bệnh, xét nghiệm, siêu âm, "
-    "chẩn đoán, kê đơn, tái khám."
+    "Khám lâm sàng, hỏi bệnh giữa bác sĩ và bệnh nhân, triệu chứng, dị ứng thức ăn, "
+    "dị ứng thuốc, phát ban, mẩn ngứa, bọng nước, mụn nước, chàm, ghẻ, vảy nến, sốt, đau ngực. "
+    "Bác sĩ hỏi: Anh có bị dị ứng không? Bệnh nhân trả lời: Tôi không bị dị ứng."
 )
 
 VOICE_STT_PROMPT = (
@@ -202,9 +204,11 @@ def _warm_up_knowledge_embedder() -> None:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    threading.Thread(
-        target=_warm_up_knowledge_embedder, daemon=True, name="bge-m3-warmup"
-    ).start()
+    # Loaded during startup, not on a side thread: the RAG step is now capped
+    # at ambient.RAG_TIMEOUT_SECONDS (2.5s), and a request that arrives while
+    # bge-m3 is still loading would wait on the embedder lock, trip that cap
+    # and silently lose the guideline context. A warm retrieval costs ~0.6s.
+    await asyncio.to_thread(_warm_up_knowledge_embedder)
     yield
 
 
@@ -610,14 +614,14 @@ async def _retrieve_knowledge_safely(
         )
     except TimeoutError:
         logger.warning(
-            "Knowledge retrieval exceeded %.0fs; continuing without RAG",
+            "Knowledge retrieval exceeded %gs; continuing without RAG",
             ambient.RAG_TIMEOUT_SECONDS,
         )
         return (
             "",
             [],
             [
-                f"Truy xuất phác đồ quá {int(ambient.RAG_TIMEOUT_SECONDS)} giây; "
+                f"Truy xuất phác đồ quá {ambient.RAG_TIMEOUT_SECONDS:g} giây; "
                 "bỏ qua RAG để không làm chậm buổi khám."
             ],
         )
@@ -1626,19 +1630,25 @@ async def ambient_consultation(
             len(diarization.symptoms),
         )
 
-        # --- Step 3: red flags & infectious disease scanner ----------------
-        red_flags = await asyncio.to_thread(
-            ambient.scan_red_flags, diarization, clinical_profile, llm_model, settings
-        )
-        logger.info("Ambient step 3: has_red_flags=%s", red_flags.has_red_flags)
-
-        # --- Step 4: parallel knowledge RAG + in-stock formulary -----------
-        knowledge_result, formulary = await asyncio.gather(
+        # --- Steps 3 + 4 run concurrently: the red-flag scan is an LLM call,
+        # the guideline RAG is CPU-bound embedding and the formulary is a DB
+        # lookup - none of them depend on each other, so wall-clock time is
+        # whichever of the three is slowest rather than their sum.
+        red_flags, knowledge_result, formulary = await asyncio.gather(
+            asyncio.to_thread(
+                ambient.scan_red_flags,
+                diarization,
+                clinical_profile,
+                llm_model,
+                settings,
+            ),
             _retrieve_knowledge_safely(
                 _ambient_rag_query(diarization, raw_transcript), settings
             ),
             get_available_drugs(settings),
         )
+        logger.info("Ambient step 3: has_red_flags=%s", red_flags.has_red_flags)
+
         knowledge_context, rag_sources, warnings = knowledge_result
         drugs, formulary_warnings = _formulary_warnings(formulary)
         warnings.extend(formulary_warnings)

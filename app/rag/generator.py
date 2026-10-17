@@ -88,6 +88,8 @@ class GroqClient:
         temperature: float,
         stream: bool,
         response_format: dict | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ):
         kwargs = {
             "model": model,
@@ -100,6 +102,10 @@ class GroqClient:
         }
         if response_format:
             kwargs["response_format"] = response_format
+        if max_completion_tokens:
+            kwargs["max_completion_tokens"] = max_completion_tokens
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         return self.client.chat.completions.create(**kwargs)
 
     def _create_with_fallback(
@@ -110,13 +116,22 @@ class GroqClient:
         stream: bool,
         response_format: dict | None = None,
         model: str | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ):
         # ``model`` lets the admin dashboard swap LLMs at runtime; when it is
         # not supplied the configured default (settings.LLM_MODEL_ID) applies.
         model = model or self.settings.LLM_MODEL_ID
         try:
             return self._create_completion(
-                model, system_prompt, user_prompt, temperature, stream, response_format
+                model,
+                system_prompt,
+                user_prompt,
+                temperature,
+                stream,
+                response_format,
+                max_completion_tokens,
+                reasoning_effort,
             )
         except NotFoundError:
             logger.warning(
@@ -126,7 +141,14 @@ class GroqClient:
             fallback_model = self._pick_fallback_model()
             logger.info("Falling back to LLM model '%s'.", fallback_model)
             return self._create_completion(
-                fallback_model, system_prompt, user_prompt, temperature, stream, response_format
+                fallback_model,
+                system_prompt,
+                user_prompt,
+                temperature,
+                stream,
+                response_format,
+                max_completion_tokens,
+                reasoning_effort,
             )
 
     # ---------- building blocks ----------
@@ -156,6 +178,8 @@ class GroqClient:
         temperature: float = 0.1,
         response_format: dict | None = None,
         model: str | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         completion = self._create_with_fallback(
             system_prompt,
@@ -164,6 +188,8 @@ class GroqClient:
             stream=False,
             response_format=response_format,
             model=model,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
         )
         return completion.choices[0].message.content  # type: ignore[return-value]
 

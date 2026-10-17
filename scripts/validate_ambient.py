@@ -342,6 +342,81 @@ def test_revision_merge() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Diarization sensitivity (doctor inquiry attributed to the doctor)
+# ---------------------------------------------------------------------------
+
+
+SENSITIVITY_DIALOGUE = (
+    "Bác sĩ: Chào anh, hôm nay anh bị làm sao ạ\n"
+    "Bệnh nhân: Em bị nổi mụn nước ngứa ở bên trái đã năm ngày nay\n"
+    "Bác sĩ: Anh có bị dị ứng hay ăn uống nhầm cái gì không\n"
+    "Bệnh nhân: Dạ em không bị dị ứng gì hết\n"
+    "Bác sĩ: Anh có đang uống thuốc gì không\n"
+    "Bệnh nhân: Dạ em đang bôi acyclovir ở nhà thôi"
+)
+
+
+def test_diarization_sensitivity() -> list[Any]:
+    """The reported bug: a clinical question folded into a patient turn."""
+    print("\n=== Diarization sensitivity (doctor inquiry splitting) ===")
+
+    question = "Anh có bị dị ứng hay ăn uống nhầm cái gì không?"
+    typo = "Anh có bị dưỡng hay ăn uống nhầm cái gì không"
+    check(bool(ambient._DOCTOR_CUES.search(question)),
+          "doctor cues match the allergy inquiry")
+    check(bool(ambient._DOCTOR_CUES.search(typo)),
+          "doctor cues still match after a Whisper typo (dị ứng -> dưỡng)")
+    check(not ambient._DOCTOR_CUES.search("tôi bị đau rát năm ngày nay"),
+          "doctor cues do not match plain patient speech")
+
+    split = ambient._split_question_then_answer(
+        "Anh có bị dị ứng hay ăn uống nhầm cái gì không? tôi không bị dị ứng", "patient"
+    )
+    check(split == [
+        ("doctor", "Anh có bị dị ứng hay ăn uống nhầm cái gì không"),
+        ("patient", "tôi không bị dị ứng"),
+    ], "merged question+answer is split into alternating turns", str(split))
+    check(ambient._split_question_then_answer("tôi bị đau 5 ngày nay rồi", "patient")
+          == [("patient", "tôi bị đau 5 ngày nay rồi")],
+          "patient speech is never split")
+
+    from app.api import _ambient_llm_model, get_settings
+
+    started = __import__("time").perf_counter()
+    result = ambient.diarize_dialogue(
+        SENSITIVITY_DIALOGUE,
+        "Khoa Da liễu (department_id=3). Dị ứng: không. Tiền sử: khoẻ mạnh.",
+        _ambient_llm_model(get_settings()),
+        get_settings(),
+    )
+    elapsed = __import__("time").perf_counter() - started
+    speakers = [turn.speaker for turn in result.turns]
+    print(f"       diarization of the reported dialogue: {elapsed:.1f}s "
+          f"-> {' / '.join(speakers)}")
+    for turn in result.turns:
+        print(f"          {turn.speaker:8s} | {turn.text[:70]}")
+
+    check(len(result.turns) >= 4, "the dialogue produced at least four turns")
+    check(all(a != b for a, b in zip(speakers, speakers[1:])),
+          "turns alternate doctor/patient", str(speakers))
+    question_turn = next(
+        (t for t in result.turns if "dị ứng" in t.text.lower()
+         and ("?" in t.text or "không" in t.text.lower())),
+        None,
+    )
+    check(question_turn is not None and question_turn.speaker == "doctor",
+          "the allergy inquiry is attributed to the doctor",
+          str(question_turn))
+    if question_turn is not None:
+        idx = result.turns.index(question_turn)
+        following = result.turns[idx + 1] if idx + 1 < len(result.turns) else None
+        check(following is not None and following.speaker == "patient",
+              "the patient's answer immediately follows as its own turn",
+              str(following))
+    return result.turns
+
+
+# ---------------------------------------------------------------------------
 # HTTP-level pipeline checks
 # ---------------------------------------------------------------------------
 
@@ -635,6 +710,7 @@ def main() -> int:
     test_strict_json_parsing()
     test_prescription_reconciliation()
     test_revision_merge()
+    test_diarization_sensitivity()
     formulary = test_formulary_fetch()
 
     # --- HTTP pipeline -----------------------------------------------------

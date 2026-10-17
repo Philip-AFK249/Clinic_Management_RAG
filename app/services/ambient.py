@@ -36,6 +36,20 @@ PREFERRED_LLM_MODELS = ("openai/gpt-oss-120b", "llama-3.3-70b-versatile")
 _MAX_TURN_CHARS = 800
 _MAX_FIELD_CHARS = 2000
 
+#: Token budget for every ambient JSON completion: short outputs serialise
+#: fast, and a runaway generation cannot stall the consultation.
+AMBIENT_MAX_COMPLETION_TOKENS = 600
+
+#: Reasoning effort for the reasoning models this pipeline targets. gpt-oss
+#: burns its completion budget on hidden reasoning first (600+ tokens at the
+#: default effort), which alone exhausts the 600-token ceiling above; 'low'
+#: keeps the JSON inside the budget and the reply fast. Models outside the
+#: gpt-oss family reject the parameter, so only they get it.
+AMBIENT_REASONING_EFFORT = "low"
+
+#: Reasoning-capable models understood by ``AMBIENT_REASONING_EFFORT``.
+_REASONING_MODELS = ("gpt-oss",)
+
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 _JSON_REMINDER = (
@@ -211,20 +225,37 @@ def complete_json(
     model: str,
     settings: Settings | None = None,
     temperature: float = 0.1,
+    max_completion_tokens: int | None = AMBIENT_MAX_COMPLETION_TOKENS,
 ) -> dict:
     """Run one chat completion and return a validated JSON object.
 
     Tries ``response_format=json_object`` first (best compliance), falls back to
     a plain completion when the model rejects it, and retries once with a
-    stricter reminder before giving up.
+    stricter reminder before giving up. Temperature and the token budget are
+    kept low so the answer comes back as small, deterministic JSON.
     """
     from app.rag.generator import get_groq_client
 
     client = get_groq_client()
     failures: list[str] = []
+    reasoning_effort = (
+        AMBIENT_REASONING_EFFORT
+        if any(name in (model or "").lower() for name in _REASONING_MODELS)
+        else None
+    )
 
     for attempt in range(2):
         system = system_prompt if attempt == 0 else system_prompt + _JSON_REMINDER
+        # Attempt 0 honours the tight latency budget. A long transcript can
+        # push the answer past that ceiling (finish_reason=length, unparseable
+        # JSON), so the retry - which exists anyway for malformed output - is
+        # given a larger budget instead of failing the consultation.
+        budget = max_completion_tokens
+        if attempt == 1 and budget:
+            budget = budget * 4
+            logger.info(
+                "Ambient JSON retry with a raised token ceiling (%d)", budget
+            )
         try:
             try:
                 raw = client.complete(
@@ -233,6 +264,8 @@ def complete_json(
                     temperature=temperature,
                     response_format={"type": "json_object"},
                     model=model,
+                    max_completion_tokens=budget,
+                    reasoning_effort=reasoning_effort,
                 )
             except Exception as exc:  # model refuses json_object / transient API error
                 logger.warning(
@@ -242,7 +275,12 @@ def complete_json(
                     exc,
                 )
                 raw = client.complete(
-                    system, user_prompt, temperature=temperature, model=model
+                    system,
+                    user_prompt,
+                    temperature=temperature,
+                    model=model,
+                    max_completion_tokens=budget,
+                    reasoning_effort=reasoning_effort,
                 )
             return parse_llm_json(raw)
         except AmbientPipelineError as exc:
@@ -267,11 +305,13 @@ Dựa trên [TRANSCRIPT THÔ] do mô hình nhận dạng giọng nói tạo ra, 
 
 {"diarized_turns": [{"speaker": "doctor", "text": "..."}], "chief_complaints": ["..."], "symptoms": ["..."]}
 
+Analyze Vietnamese conversational doctor-patient interaction. Any interrogative inquiry asking about medical history, allergies, symptom duration, dietary intake, or physical examination requests (e.g., 'Anh/chị/bác có bị... không?', 'Bị bao lâu rồi?', 'Ăn uống gì lạ không?', 'Để bác sĩ xem/khám...') MUST be attributed to speaker: 'doctor'. When a single paragraph contains both a question and a subsequent answer, you MUST split them into alternating 'doctor' and 'patient' turns.
+
 Quy tắc phân vai:
-1. doctor: câu hỏi thăm khám, chỉ định thăm khám/vận động ("nào, bác sĩ khám bụng nhé", "hít thở sâu nào"), yêu cầu xét nghiệm, giải thích chẩn đoán, tư vấn và kê đơn.
+1. doctor: câu hỏi thăm khám, chỉ định thăm khám/vận động ("nào, bác sĩ khám bụng nhé", "hít thở sâu nào"), yêu cầu xét nghiệm, giải thích chẩn đoán, tư vấn và kê đơn. Câu hỏi khai thác bệnh sử/dị ứng/thời gian triệu chứng/ăn uống đều là doctor, kể cả khi Whisper ghi sai chính tả.
 2. patient: lời phàn nàn, mô tả cảm giác đau/khó chịu, diễn biến theo thời gian, tiền sử, trả lời câu hỏi của bác sĩ.
 3. speaker CHỈ được là "doctor" hoặc "patient". Không bịa thêm nội dung không có trong transcript; giữ nguyên tiếng Việt y khoa.
-4. Gộp các câu liên tiếp của cùng một người nói thành một turn; tách turn khi đổi người nói. Mỗi turn 1-2 câu.
+4. Gộp các câu liên tiếp của cùng một người nói thành một turn; tách turn khi đổi người nói. Mỗi turn 1-2 câu. Một câu hỏi và câu trả lời LUÔN ở hai turn riêng biệt xen kẽ doctor/patient.
 5. chief_complaints: 2-6 vấn đề chính rút gọn (ví dụ: "Zona đau rát vùng liên sườn bên trái 5 ngày").
 6. symptoms: danh sách triệu chứng cụ thể nghe được (kèm thời gian nếu có), tối đa 12 mục."""
 
@@ -324,7 +364,10 @@ Bắt buộc:
 2. Giữ nguyên phần hồ sơ không bị ảnh hưởng; chỉ sửa những gì phản hồi yêu cầu.
 3. Cập nhật plan: chỉ định xét nghiệm, điều trị, theo dõi, tái khám theo thông tin mới.
 4. prescription_draft CHỈ dùng drugId có trong [THUỐC TRONG KHO]; loại thuốc bệnh nhân dị ứng/đang chống chỉ định; quantity tính theo tổng thời gian điều trị.
-5. ICD-10 có thật, đúng định dạng, đúng một isPrimary=true, aiConfidence 0-100."""
+5. ICD-10 có thật, đúng định dạng, đúng một isPrimary=true, aiConfidence 0-100.
+6. Trả về JSON NHỎ: chỉ đưa vào những mục THAY ĐỊNH (assistant_message luôn có);
+   bỏ qua hoàn toàn soap_note / diagnoses / prescription_draft không đổi - hệ thống
+   tự giữ nguyên phần hồ sơ cũ đó. Không diễn đạt lại nội dung không thay đổi."""
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +376,8 @@ Bắt buộc:
 
 _DOCTOR_CUES = re.compile(
     r"^(nào|để (tôi|bác sĩ)|tôi (khám|sẽ|nghe|cho)|bác sĩ|khám (bạn|bệnh nhân|phần|hộ)|"
-    r"anh/chị|bạn (có|đang|bị)|em (có|đang|bị)|hít thở sâu|nằm xuống|tái khám|"
-    r"uống (thuốc|thuận này)|dùng (thuốc|thuận này)|cần làm|sẽ làm|xét nghiệm|siêu âm|"
-    r"chào (bạn|chị|anh|em))",
+    r"(anh|chị|bạn|em|bác)\s+(có|đang|bị|ăn|uống|dùng|thấy)|"
+    r"hít thở sâu|nằm xuống|tái khám|uống thuốc|xét nghiệm|chào (bạn|chị|anh|em|bác))",
     re.IGNORECASE,
 )
 
@@ -355,6 +397,29 @@ def _guess_speaker(text: str, previous: Optional[str]) -> str:
         return "patient"
     # Consultations open with the doctor, then alternate.
     return "patient" if previous == "doctor" else "doctor"
+
+
+#: Whisper routinely drops punctuation, but when a question mark does survive
+#: it is a reliable boundary between the doctor's inquiry and the answer.
+_QUESTION_SPLIT = re.compile(r"\s*\?\s*")
+
+
+def _split_question_then_answer(text: str, speaker: str) -> list[tuple[str, str]]:
+    """Break a turn holding a doctor question *and* the answer into two turns.
+
+    The model occasionally lumps the pair into a single "patient" turn, which
+    then swallows the clinical history question. The split only fires when the
+    sentence before the question mark reads as a doctor's inquiry, so patient
+    speech is never chopped up.
+    """
+    match = _QUESTION_SPLIT.search(text)
+    if not match:
+        return [(speaker, text)]
+    question = text[: match.start()].strip()
+    answer = text[match.end() :].strip()
+    if len(question) < 5 or not answer or not _DOCTOR_CUES.search(question):
+        return [(speaker, text)]
+    return [("doctor", question), ("patient", answer)]
 
 
 def _clean_lines(value: Any, limit: int, max_chars: int) -> list[str]:
@@ -411,13 +476,14 @@ def diarize_dialogue(
             continue
         speaker = _normalise_speaker(speaker) or _guess_speaker(text, previous)
         text = " ".join(text.split())[:_MAX_TURN_CHARS]
-        if turns and turns[-1].speaker == speaker:
-            # Merge consecutive utterances of the same speaker into one turn.
-            merged = f"{turns[-1].text} {text}".strip()[:_MAX_TURN_CHARS]
-            turns[-1] = DiarizedTurn(speaker=speaker, text=merged)
-            continue
-        turns.append(DiarizedTurn(speaker=speaker, text=text))
-        previous = speaker
+        for segment_speaker, segment_text in _split_question_then_answer(text, speaker):
+            if turns and turns[-1].speaker == segment_speaker:
+                # Merge consecutive utterances of the same speaker into one turn.
+                merged = f"{turns[-1].text} {segment_text}".strip()[:_MAX_TURN_CHARS]
+                turns[-1] = DiarizedTurn(speaker=segment_speaker, text=merged)
+                continue
+            turns.append(DiarizedTurn(speaker=segment_speaker, text=segment_text))
+            previous = segment_speaker
 
     if not turns:
         raise AmbientPipelineError(
@@ -499,10 +565,11 @@ def _as_bool(value: Any) -> bool:
 # Step 4 - knowledge RAG (degrades instead of failing)
 # ---------------------------------------------------------------------------
 
-#: Hard ceiling for one retrieval call. Generous enough for a cold bge-m3
-#: load (which the gateway warms up at startup) but still bounded, so a sick
-#: cluster can never hang a consultation.
-RAG_TIMEOUT_SECONDS = 90.0
+#: Hard ceiling for one retrieval call: 2.5s. bge-m3 embedding is CPU-bound
+#: and used to stall consultations for up to 90s on a cold cluster, so a
+#: retrieval that cannot finish inside this budget is simply skipped (with a
+#: warning) - a prompt without MoH guideline context beats a doctor waiting.
+RAG_TIMEOUT_SECONDS = 2.5
 
 
 def pgvector_reachable(settings: Settings) -> bool:
@@ -819,7 +886,7 @@ def synthesise_clinical_note(
         _build_user_prompt(diarization, red_flags, clinical_profile, knowledge_context, drugs),
         model,
         settings,
-        temperature=0.2,
+        temperature=0.1,
     )
 
     warnings: list[str] = []
@@ -889,7 +956,7 @@ def revise_clinical_note(
     )
 
     payload = complete_json(
-        REVISION_SYSTEM_PROMPT, user_prompt, model, settings, temperature=0.2
+        REVISION_SYSTEM_PROMPT, user_prompt, model, settings, temperature=0.1
     )
 
     assistant_message = _text(payload.get("assistant_message"), 800) or (
