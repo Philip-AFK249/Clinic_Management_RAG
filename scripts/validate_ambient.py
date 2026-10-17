@@ -417,6 +417,111 @@ def test_diarization_sensitivity() -> list[Any]:
 
 
 # ---------------------------------------------------------------------------
+# Vital-signs emergency screening (deterministic, no network)
+# ---------------------------------------------------------------------------
+
+
+def test_vital_signs_thresholds() -> None:
+    print("\n=== Deterministic vital-sign thresholds ===")
+    crisis = ambient.VitalSigns(
+        blood_pressure="190/110", heart_rate=95, spo2=88, temperature="38.5"
+    )
+    flags = crisis.critical_alerts()
+    check(len(flags) == 2, "190/110 + SpO2 88 triggers both emergencies", str(flags))
+    check(any(p == "Huyết áp kịch phát" for _, p in flags),
+          "hypertensive-crisis pattern label present")
+    check(any(p == "SpO2 hạ thấp" for _, p in flags),
+          "hypoxia pattern label present")
+    check("HA >= 180/120" in flags[0][0], "hypertensive alert text as specified",
+          flags[0][0] if flags else "")
+    check("SpO2 < 90%" in flags[1][0], "hypoxia alert text as specified",
+          flags[1][0] if len(flags) > 1 else "")
+    check(
+        "HA: 190/110" in crisis.format_block() and "SpO2: 88%" in crisis.format_block()
+        and "Mạch: 95 ck/p" in crisis.format_block() and "38.5°C" in crisis.format_block(),
+        "format_block renders every measurement",
+        crisis.format_block(),
+    )
+
+    boundary = ambient.VitalSigns(blood_pressure="180/120")
+    check(len(boundary.critical_alerts()) == 1,
+          "180/120 is the inclusive crisis boundary")
+    systolic_only = ambient.VitalSigns(blood_pressure="185/90")
+    check(len(systolic_only.critical_alerts()) == 1,
+          "systolic >= 180 alone is enough")
+    diastolic_only = ambient.VitalSigns(blood_pressure="150/125")
+    check(len(diastolic_only.critical_alerts()) == 1,
+          "diastolic >= 120 alone is enough")
+    normal = ambient.VitalSigns(blood_pressure="120/80", spo2=98)
+    check(normal.critical_alerts() == [], "normal vitals produce no emergency")
+    spo2_edge = ambient.VitalSigns(spo2=90)
+    check(spo2_edge.critical_alerts() == [],
+          "SpO2 == 90 is not strictly below the threshold")
+    unparseable = ambient.VitalSigns(blood_pressure="cao")
+    check(unparseable.critical_alerts() == [],
+          "unparseable blood pressure never false-positives")
+    empty = ambient.VitalSigns()
+    check(
+        "chưa đo" in empty.format_block() and "SpO2: --%" in empty.format_block(),
+        "empty vitals render placeholders",
+        empty.format_block(),
+    )
+
+    # Merge behaviour: vitals outrank a benign LLM answer.
+    diarization = ambient.DiarizationResult(
+        turns=[ambient.DiarizedTurn(speaker="patient", text="tôi khỏe cảm ơn bác sĩ")]
+    )
+    original_complete_json = ambient.complete_json
+    ambient.complete_json = lambda *args, **kwargs: {
+        "has_red_flags": False, "red_flag_alert": "",
+        "recommended_inquiry": "", "matched_patterns": [],
+    }
+    try:
+        merged = ambient.scan_red_flags(diarization, "profile", "model", None,
+                                        vitals=crisis)
+    finally:
+        ambient.complete_json = original_complete_json
+    check(merged.has_red_flags is True,
+          "vitals force has_red_flags=True over a benign LLM answer")
+    check("Huyết áp kịch phát" in merged.matched_patterns
+          and "SpO2 hạ thấp" in merged.matched_patterns,
+          "merged matched_patterns carry both vitals labels",
+          str(merged.matched_patterns))
+    check("HA >= 180/120" in merged.red_flag_alert and "SpO2 < 90%" in merged.red_flag_alert,
+          "merged alert carries both emergency messages",
+          merged.red_flag_alert[:160])
+    check(bool(merged.recommended_inquiry),
+          "a recommended_inquiry is supplied when vitals are critical")
+
+    # A failed LLM pass must not swallow critical vitals.
+    def _boom(*args, **kwargs):
+        raise ambient.AmbientPipelineError("simulated LLM outage")
+
+    ambient.complete_json = _boom
+    try:
+        survived = ambient.scan_red_flags(diarization, "profile", "model", None,
+                                          vitals=crisis)
+        check(survived.has_red_flags is True,
+              "critical vitals survive a failed red-flag LLM pass")
+    except ambient.AmbientPipelineError:
+        check(False, "critical vitals survive a failed red-flag LLM pass",
+              "AmbientPipelineError propagated despite critical vitals")
+    finally:
+        ambient.complete_json = original_complete_json
+
+    # Without vitals the failure path must still raise (unchanged contract).
+    ambient.complete_json = _boom
+    try:
+        ambient.scan_red_flags(diarization, "profile", "model", None)
+        check(False, "LLM failure still raises when vitals are normal",
+              "no exception raised")
+    except ambient.AmbientPipelineError:
+        check(True, "LLM failure still raises when vitals are normal")
+    finally:
+        ambient.complete_json = original_complete_json
+
+
+# ---------------------------------------------------------------------------
 # HTTP-level pipeline checks
 # ---------------------------------------------------------------------------
 
@@ -614,6 +719,46 @@ def test_ambient_endpoint(client, audio_files: dict[str, bytes],
     return body
 
 
+def test_vitals_red_flags(client, audio_files: dict[str, bytes]) -> None:
+    """Abnormal triage vitals must force has_red_flags=True through the API."""
+    print("\n=== POST /api/v1/clinical/ambient-consultation (abnormal vitals) ===")
+    response = client.post(
+        "/api/v1/clinical/ambient-consultation",
+        files={
+            "audio_file": ("consultation.wav", audio_files["tone"], "audio/wav")
+        },
+        data={
+            "department_id": "1",
+            "allergies": "",
+            "patient_history": "Tăng huyết áp mạn, trước khỏe mạnh",
+            "blood_pressure": "190/110",
+            "heart_rate": "95",
+            "spo2": "88",
+            "temperature": "38.5",
+        },
+    )
+    if not check(response.status_code == 200, "vitals endpoint returns 200",
+                 f"{response.status_code} {response.text[:300]}"):
+        return
+    body = response.json()
+    check(body["has_red_flags"] is True,
+          "abnormal vitals force has_red_flags=True in the JSON response")
+    alert = body.get("red_flag_alert") or ""
+    check("HA >= 180/120" in alert, "hypertensive-crisis alert in red_flag_alert",
+          alert[:160])
+    check("SpO2 < 90%" in alert, "hypoxia alert in red_flag_alert", alert[:160])
+    soap = body.get("soap_note") or {}
+    objective = soap.get("objective") or ""
+    check(
+        "190/110" in objective and "SpO2: 88%" in objective,
+        "SOAP objective carries the [DẤU HIỆU SINH TỒN] measurements",
+        objective[:200],
+        hard=False,
+    )
+    print(f"       red_flag_alert = {alert[:200]}")
+    print(f"       soap.objective = {objective[:200]}")
+
+
 def test_copilot_chat(client, draft: dict[str, Any], formulary: list[AvailableDrug]) -> None:
     if not draft:
         print("\n=== POST /api/v1/clinical/copilot-chat SKIPPED (no draft) ===")
@@ -710,6 +855,7 @@ def main() -> int:
     test_strict_json_parsing()
     test_prescription_reconciliation()
     test_revision_merge()
+    test_vital_signs_thresholds()
     test_diarization_sensitivity()
     formulary = test_formulary_fetch()
 
@@ -721,6 +867,7 @@ def main() -> int:
             test_silence_guard(client, audio_files)
             test_real_stt_error_path(audio_files)
             draft = test_ambient_endpoint(client, audio_files, formulary)
+            test_vitals_red_flags(client, audio_files)
             test_copilot_chat(client, draft, formulary)
     finally:
         api._transcribe_ambient = stubbed

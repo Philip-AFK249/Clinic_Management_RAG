@@ -161,6 +161,62 @@ class RedFlagResult:
     matched_patterns: list[str] = field(default_factory=list)
 
 
+#: Bedside vital thresholds that demand immediate action. Checked
+#: deterministically before the LLM runs, so a hypertensive crisis or severe
+#: hypoxia is never left to chance.
+_HYPERTENSIVE_CRISIS_SYSTOLIC = 180
+_HYPERTENSIVE_CRISIS_DIASTOLIC = 120
+_SEVERE_HYPOXIA_SPO2 = 90  # SpO2 strictly below this is an emergency
+
+_BLOOD_PRESSURE_RE = re.compile(r"(\d{2,3})\s*/\s*(\d{2,3})")
+
+
+@dataclass
+class VitalSigns:
+    """Triage/nursing measurements taken before the consultation starts."""
+
+    blood_pressure: str = ""
+    heart_rate: Optional[int] = None
+    spo2: Optional[int] = None
+    temperature: str = ""
+
+    def format_block(self) -> str:
+        """One-line rendering injected into every ambient prompt."""
+        return (
+            f"HA: {self.blood_pressure or 'chưa đo'}, "
+            f"Mạch: {self.heart_rate or '--'} ck/p, "
+            f"SpO2: {self.spo2 or '--'}%, "
+            f"Nhiệt độ: {self.temperature or '--'}°C"
+        )
+
+    def parse_blood_pressure(self) -> tuple[Optional[int], Optional[int]]:
+        """``(systolic, diastolic)`` from a "190/110" style string."""
+        match = _BLOOD_PRESSURE_RE.search(self.blood_pressure or "")
+        if not match:
+            return None, None
+        return int(match.group(1)), int(match.group(2))
+
+    def critical_alerts(self) -> list[tuple[str, str]]:
+        """Deterministic emergencies as ``(alert, matched_pattern)`` pairs."""
+        flags: list[tuple[str, str]] = []
+        systolic, diastolic = self.parse_blood_pressure()
+        if (
+            systolic is not None and systolic >= _HYPERTENSIVE_CRISIS_SYSTOLIC
+        ) or (
+            diastolic is not None and diastolic >= _HYPERTENSIVE_CRISIS_DIASTOLIC
+        ):
+            flags.append((
+                "⚠️ CẤP CỨU: Tăng huyết áp kịch phát (HA >= 180/120 mmHg)",
+                "Huyết áp kịch phát",
+            ))
+        if self.spo2 is not None and self.spo2 < _SEVERE_HYPOXIA_SPO2:
+            flags.append((
+                "⚠️ CẤP CỨU: Suy hô hấp cấp / Thiếu oxy nghiêm trọng (SpO2 < 90%)",
+                "SpO2 hạ thấp",
+            ))
+        return flags
+
+
 @dataclass
 class ClinicalDraft:
     """Structured outcome of one synthesis / revision pass."""
@@ -342,7 +398,7 @@ Dựa trên hội thoại khám bệnh, triệu chứng, tiền sử, phác đ�
  "prescription_draft": [{"drugId": 1, "drugName": "...", "routeFrequency": "...", "duration": "...", "quantity": 35}]}
 
 Bắt buộc:
-1. SOAP: subjective = lời bệnh nhân tự kể + bệnh sử; objective = dấu hiệu thăm khám khách quan (ghi "Chưa có thông tin" nếu hội thoại không nêu); assessment = chẩn đoán phân biệt; plan = chỉ định xét nghiệm, điều trị, theo dõi, tái khám. Tiếng Việt y khoa, không đoán thừa.
+1. SOAP: subjective = lời bệnh nhân tự kể + bệnh sử; objective BẮT BUỘC mở đầu nguyên văn bằng khối [DẤU HIỆU SINH TỒN] trong [HỒ SƠ LÂM SÀNG] (ví dụ "HA: 190/110, Mạch: 95 ck/p, SpO2: 88%, Nhiệt độ: 38.5°C"), rồi mới ghi tiếp các dấu hiệu thăm khám khách quan nghe được trong hội thoại (nếu không có thì ghi "Chưa có thông tin"); assessment = chẩn đoán phân biệt; plan = chỉ định xét nghiệm, điều trị, theo dõi, tái khám. Tiếng Việt y khoa, không đoán thừa.
 2. diagnoses: mã ICD-10 đúng định dạng (chữ + 2 chữ số, ví dụ B02.9, J06.9, L51.2, B20); CHỈ dùng mã có thật; isPrimary=true đúng một cái (chẩn đoán chính); aiConfidence integer 0-100. Không tự bịa mã.
 3. prescription_draft: CHỈ chọn thuốc có trong [THUỐC TRONG KHO] và ghi đúng drugId từ danh sách đó; tuyệt đối không kê thuốc ngoài danh sách.
    - Tôn trọng [DỊ ỨNG] (ví dụ dị ứng Penicillin thì không được kê Amoxicillin/Cephalosporin nếu tiền sử ghi rõ).
@@ -529,29 +585,65 @@ def scan_red_flags(
     clinical_profile: str,
     model: str,
     settings: Settings | None = None,
+    vitals: VitalSigns | None = None,
 ) -> RedFlagResult:
-    """Step 3: look for opportunistic-infection / severe-drug-reaction patterns."""
+    """Step 3: infectious-drug-reaction dialogue patterns + vital thresholds.
+
+    Vital signs (blood pressure, SpO2) are screened *deterministically* first,
+    so a hypertensive crisis or severe hypoxia forces ``has_red_flags=True``
+    even when the dialogue-based LLM pass finds nothing - or fails outright.
+    """
+    vitals = vitals or VitalSigns()
+    vitals_flags = vitals.critical_alerts()
+
     findings = " | ".join(
         diarization.chief_complaints + diarization.symptoms
     ) or "(không tóm tắt được triệu chứng)"
-    payload = complete_json(
-        RED_FLAG_SYSTEM_PROMPT,
-        (
-            f"[HỒ SƠ LÂM SÀNG]\n{clinical_profile}\n\n"
-            f"[HỘI THOẠI ĐÃ PHÂN LOẠI]\n{diarization.transcript_text}\n\n"
-            f"[TRIỆU CHỨNG TÓM TẮT]\n{findings}"
-        ),
-        model,
-        settings,
-        temperature=0.1,
-    )
+    try:
+        payload = complete_json(
+            RED_FLAG_SYSTEM_PROMPT,
+            (
+                f"[HỒ SƠ LÂM SÀNG]\n{clinical_profile}\n\n"
+                f"[HỘI THOẠI ĐÃ PHÂN LOẠI]\n{diarization.transcript_text}\n\n"
+                f"[TRIỆU CHỨNG TÓM TẮT]\n{findings}"
+            ),
+            model,
+            settings,
+            temperature=0.1,
+        )
+    except AmbientPipelineError:
+        if not vitals_flags:
+            raise
+        # Critical vitals must survive a failed LLM pass: the deterministic
+        # emergency outranks a missing dialogue scan.
+        logger.warning(
+            "Red-flag LLM pass failed; returning vital-threshold flags only."
+        )
+        payload = {}
 
-    return RedFlagResult(
+    result = RedFlagResult(
         has_red_flags=_as_bool(payload.get("has_red_flags")),
         red_flag_alert=str(payload.get("red_flag_alert") or "").strip()[:_MAX_FIELD_CHARS],
         recommended_inquiry=str(payload.get("recommended_inquiry") or "").strip()[:600],
         matched_patterns=_clean_lines(payload.get("matched_patterns"), limit=8, max_chars=200),
     )
+
+    if vitals_flags:
+        result.has_red_flags = True
+        alerts = [alert for alert, _ in vitals_flags]
+        result.red_flag_alert = " | ".join(
+            filter(None, [result.red_flag_alert, *alerts])
+        )[:_MAX_FIELD_CHARS]
+        patterns = [pattern for _, pattern in vitals_flags]
+        result.matched_patterns = patterns + [
+            pattern for pattern in result.matched_patterns if pattern not in patterns
+        ]
+        if not result.recommended_inquiry:
+            result.recommended_inquiry = (
+                "Theo dõi sát dấu hiệu sinh tồn và đánh giá ngay nguy cơ cấp cứu "
+                "từ huyết áp / SpO2 bất thường."
+            )
+    return result
 
 
 def _as_bool(value: Any) -> bool:

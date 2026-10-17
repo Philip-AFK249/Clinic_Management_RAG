@@ -577,6 +577,7 @@ def _clinical_profile(
     patient_history: str,
     doctor_id: Optional[int] = None,
     patient_id: Optional[int] = None,
+    vitals: Optional[ambient.VitalSigns] = None,
 ) -> str:
     """Compact text block fed to every ambient prompt."""
     lines = []
@@ -590,6 +591,9 @@ def _clinical_profile(
         lines.append(f"patient_id={patient_id}")
     lines.append(f"allergies={(allergies or '').strip() or '(chưa rõ)'}")
     lines.append(f"patient_history={(patient_history or '').strip() or '(chưa có)'}")
+    if vitals is not None:
+        lines.append("[DẤU HIỆU SINH TỒN]")
+        lines.append(vitals.format_block())
     return "\n".join(lines)
 
 
@@ -1565,13 +1569,18 @@ async def ambient_consultation(
     patient_id: Optional[int] = Form(None),
     allergies: str = Form("", description='Dị ứng, ví dụ "Penicillin, Aspirin"'),
     patient_history: str = Form(""),
+    blood_pressure: str = Form("", description='Huyết áp đo tại phòng, ví dụ "120/80"'),
+    heart_rate: Optional[int] = Form(None, description="Mạch (lần/phút)"),
+    spo2: Optional[int] = Form(None, description="SpO2 (%)"),
+    temperature: str = Form("", description="Nhiệt độ (°C), ví dụ 38.5"),
 ):
     """Ambient voice consultation, zero audio storage.
 
     Step 1 transcribes the upload straight out of RAM and drops the bytes;
-    Steps 2-5 turn that transcript into a diarized dialogue, a red-flag scan, a
-    SOAP note, ICD-10 diagnoses and a prescription draft matched against the
-    live in-stock formulary (pgvector guidelines + ClinicalConsultationService
+    Steps 2-5 turn that transcript into a diarized dialogue, a red-flag scan
+    (dialogue patterns + deterministic vital-sign thresholds), a SOAP note,
+    ICD-10 diagnoses and a prescription draft matched against the live
+    in-stock formulary (pgvector guidelines + ClinicalConsultationService
     are retrieved in parallel).
     """
     started = time.perf_counter()
@@ -1613,8 +1622,15 @@ async def ambient_consultation(
         )
 
         llm_model = _ambient_llm_model(settings)
+        vitals = ambient.VitalSigns(
+            blood_pressure=" ".join((blood_pressure or "").split()),
+            heart_rate=heart_rate,
+            spo2=spo2,
+            temperature=" ".join((temperature or "").split()),
+        )
         clinical_profile = _clinical_profile(
-            department_id, allergies, patient_history, doctor_id, patient_id
+            department_id, allergies, patient_history, doctor_id, patient_id,
+            vitals=vitals,
         )
 
         # --- Step 2: semantic diarization & role labelling -----------------
@@ -1643,6 +1659,7 @@ async def ambient_consultation(
                 clinical_profile,
                 llm_model,
                 settings,
+                vitals=vitals,
             ),
             _retrieve_knowledge_safely(
                 _ambient_rag_query(diarization, raw_transcript), settings
