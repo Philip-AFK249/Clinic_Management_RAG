@@ -1,5 +1,13 @@
 """Ambient consultation intelligence: diarization, red flags, SOAP/ICD/Rx draft.
 
+The gateway runs this module in **single-pass** mode: ``heuristic_fast_diarize``
+splits the transcript into doctor/patient turns with compiled regexes (display
+only, zero LLM cost) and ``single_pass_ambient_synthesis`` produces chief
+complaints, red flags, SOAP note, ICD-10 diagnoses and the prescription draft
+in exactly ONE LLM call. The older three-pass flow (``diarize_dialogue`` +
+``scan_red_flags`` + ``synthesise_clinical_note``) is kept only because
+``scripts/validate_ambient.py`` still exercises it; no gateway endpoint calls it.
+
 Everything in this module works on **text only**. Audio never reaches it - the
 gateway transcribes the in-memory buffer in ``app/api.py`` and drops the bytes
 before any of these functions runs, so only structured clinical text (dialogue
@@ -39,6 +47,12 @@ _MAX_FIELD_CHARS = 2000
 #: Token budget for every ambient JSON completion: short outputs serialise
 #: fast, and a runaway generation cannot stall the consultation.
 AMBIENT_MAX_COMPLETION_TOKENS = 600
+
+#: Budget for the ONE single-pass completion: complaints + red flags + SOAP +
+#: ICD-10 + prescription in a single object needs more room than the old
+#: per-step budget, but still a hard ceiling so a runaway generation cannot
+#: stall the consultation.
+SINGLE_PASS_MAX_COMPLETION_TOKENS = 800
 
 #: Reasoning effort for the reasoning models this pipeline targets. gpt-oss
 #: burns its completion budget on hidden reasoning first (600+ tokens at the
@@ -425,9 +439,176 @@ Bắt buộc:
    bỏ qua hoàn toàn soap_note / diagnoses / prescription_draft không đổi - hệ thống
    tự giữ nguyên phần hồ sơ cũ đó. Không diễn đạt lại nội dung không thay đổi."""
 
+#: The gateway's ONLY clinical LLM call: one prompt that replaces the old
+#: diarization + red-flag + synthesis chain (DIARIZATION_SYSTEM_PROMPT,
+#: RED_FLAG_SYSTEM_PROMPT, SYNTHESIS_SYSTEM_PROMPT above).
+SINGLE_PASS_SYSTEM_PROMPT = """Bạn là bác sĩ ghi chép hồ sơ bệnh án điện tử cho bác sĩ lâm sàng, thực hiện phân tích trong MỘT lần gọi duy nhất.
+Dựa trên [HỒ SƠ LÂM SÀNG], [HỘI THOẠI KHÁM BỆNH THÔ], [PHÁC ĐỒ BỘ Y TẾ] và [THUỐC TRONG KHO], trả về đúng MỘT đối tượng JSON chứa đầy đủ khiếu nại chính, triệu chứng, cờ đỏ, ghi chú SOAP, chẩn đoán ICD-10 và dự thảo đơn thuốc.
+
+JSON BẮT BUỘC đúng cấu trúc này:
+{"chief_complaints": ["..."],
+ "symptoms": ["..."],
+ "has_red_flags": false,
+ "red_flag_alert": "",
+ "recommended_inquiry": "",
+ "matched_patterns": [],
+ "soap_note": {"subjective": "...", "objective": "...", "assessment": "...", "plan": "..."},
+ "diagnoses": [{"icd10Code": "K21", "diseaseName": "Trào ngược dạ dày thực quản", "isPrimary": true, "aiConfidence": 90}],
+ "prescription_draft": [{"drugId": 1, "drugName": "...", "routeFrequency": "...", "duration": "...", "quantity": 14}]}
+
+Bắt buộc:
+1. Phân biệt câu hỏi thăm khám của BÁC SĨ với lời phàn nàn của BỆNH NHÂN. Câu hỏi sàng lọc của bác sĩ - kể cả câu phủ định ("Bác có sốt hay đau ngực không?", "Anh có bị dị ứng gì không?") - KHÔNG ĐƯỢC ghi thành khiếu nại hay triệu chứng của bệnh nhân. Chỉ ghi những gì bệnh nhân tự kể hoặc xác nhận. Câu trả lời phủ định ("Dạ không, tôi chỉ bị ngứa lưng thôi") chỉ mang nội dung bệnh nhân trả lời.
+2. chief_complaints: 1-4 vấn đề chính rút gọn (tiếng Việt).
+3. symptoms: triệu chứng cụ thể kèm thời gian nếu nghe được, tối đa 12 mục.
+4. has_red_flags: true CHỈ khi có dấu hiệu đe dọa tính mạng - sốc phản vệ, phản ứng thuốc nặng (Stevens-Johnson / toxic epidermal necrolysis), nhiễm trùng cơ hội (HIV, Lao, zona diện rộng / nhiều rễ da), sốt kéo dài không rõ nguyên nhân kèm gầy sút cân, ho khạc đờm lẫn máu, đau ngực dữ dội, khó thở nặng, lú lẫn. red_flag_alert = cảnh báo chi tiết cho bác sĩ (tiếng Việt, có thể mở đầu bằng "⚠️"); recommended_inquiry = MỘT câu nên hỏi bệnh nhân ngay; matched_patterns = các dấu hiệu khớp (ngắn gọn). Không có → false, chuỗi rỗng, mảng rỗng. Không kết luận chắc chắn bệnh, chỉ cảnh báo để khai thác thêm.
+5. soap_note: subjective = lời bệnh nhân tự kể + bệnh sử; objective BẮT BUỘC mở đầu nguyên văn khối [DẤU HIỆU SINH TỒN] trong [HỒ SƠ LÂM SÀNG] (ví dụ "HA: 190/110, Mạch: 95 ck/p, SpO2: 88%, Nhiệt độ: 38.5°C"), rồi mới ghi tiếp thăm khám khách quan nghe được trong hội thoại (không có thì ghi "Chưa có thông tin"); assessment = chẩn đoán phân biệt; plan = chỉ định xét nghiệm, điều trị, theo dõi, tái khám. Tiếng Việt y khoa, không đoán thừa.
+6. diagnoses: CHỈ mã ICD-10 có thật, đúng định dạng (chữ + 2 chữ số, ví dụ B02.9, J06.9, L51.2, B20); đúng một isPrimary=true (chẩn đoán chính); aiConfidence integer 0-100. Không tự bịa mã.
+7. prescription_draft: CHỈ thuốc có trong [THUỐC TRONG KHO] và đúng drugId của danh sách đó; tuyệt đối không kê thuốc ngoài kho. Tôn trọng [DỊ ỨNG] (dị ứng Penicillin thì không được kê Amoxicillin/Cephalosporin). Tôn trọng cảnh báo [CỜ ĐỎ]/[TƯƠNG TÁC]: nếu thuốc có nguy cơ thì ghi chú vào plan thay vì kê. Ưu tiên thuốc còn tồn kho tốt. routeFrequency: ví dụ "Uống 3 lần/ngày sau ăn"; duration: "7 ngày"; quantity = tổng số viên/ml cho toàn bộ thời gian điều trị (vd 3 lần/ngày x 7 ngày = 21 viên).
+8. Thiếu dữ kiện thì ghi "Chưa có thông tin", không bịa. Trả về đúng MỘT đối tượng JSON thuần (bắt đầu bằng '{', kết thúc bằng '}'), không markdown, không văn bản ngoài JSON."""
+
 
 # ---------------------------------------------------------------------------
-# Step 2 - semantic diarization & role labelling
+# Step 2 (display only) - deterministic heuristic diarization, zero LLM cost
+# ---------------------------------------------------------------------------
+
+#: Explicit speaker markers the recorder/Whisper sometimes yields verbatim
+#: ("Bác sĩ: ...", "Bệnh nhân: ..."). When present they beat cue matching.
+_TURN_LABEL_RE = re.compile(
+    r"(?P<label>bác\s*sĩ|bệnh\s*nhân|bs\.?|bn\.?|doctor|patient)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+#: Sentence boundary: punctuation is kept on the sentence it terminates.
+_SENTENCE_RE = re.compile(r"[^.?!]*[.?!]+|[^.?!]+")
+
+#: Doctor inquiry & directive cues. ``_classify_utterance`` checks the patient
+#: openers first, so an "em bị ..." answer is never stolen by a doctor cue
+#: that sits further into the sentence.
+HEURISTIC_DOCTOR_CUES = re.compile(
+    r"mời\s+(anh|chị|bác|em|bạn)"
+    r"|ngồi\s+xuống"
+    r"|khám\s+(cho|bụng|họng|phổi)"
+    r"|bị\s+(bao lâu|thế nào|sao\b|từ khi nào)"
+    r"|có\s+(bị|thấy|đau|sốt|ho|ngứa|dị ứng)[^?!.]*\s?không"
+    r"|uống thuốc gì"
+    r"|ăn gì"
+    r"|đo huyết áp"
+    r"|hít\s+(thở\s+)?sâu"
+    r"|để\s+(tôi|bác sĩ)"
+    r"|tôi kê"
+    r"|tái khám"
+    r"|chào\s+(anh|chị|bác|em|bạn)",
+    re.IGNORECASE,
+)
+
+#: Patient response cues, anchored at the start of the utterance so a
+#: "Dạ không, tôi chỉ bị ngứa lưng thôi" answer keeps its own turn.
+HEURISTIC_PATIENT_CUES = re.compile(
+    r"^(dạ không|dạ có|dạ|vâng|thưa|em bị|tôi bị|nó cứ|"
+    r"đau lắm|ngứa lắm|mệt mỏi|uống mà không đỡ)",
+    re.IGNORECASE,
+)
+
+#: Symptom vocabulary used only as a tie-breaker for continuation sentences
+#: ("Khó thở vài hôm nay.") that carry neither an opener nor a doctor cue.
+HEURISTIC_SYMPTOM_CUES = re.compile(
+    r"đau|rát|sốt|ho\b|khó thở|ngứa|mệt|chóng mặt|buồn nôn|nôn|tiêu chảy|"
+    r"nổi|mẩn|chảy máu|sưng|tê\b|mấy ngày|kéo dài|từ hồi|tiền sử",
+    re.IGNORECASE,
+)
+
+
+def _label_speaker(label: str) -> Optional[str]:
+    """Map a literal ``Bác sĩ``/``BN`` marker onto a turn speaker."""
+    cleaned = re.sub(r"[.\s]+", " ", (label or "").strip().lower()).strip()
+    return _normalise_speaker(cleaned)
+
+
+def _labelled_segments(text: str) -> list[tuple[Optional[str], str]]:
+    """Split on ``Bác sĩ:`` / ``Bệnh nhân:`` markers, keeping stray prose."""
+    matches = list(_TURN_LABEL_RE.finditer(text))
+    if not matches:
+        return [(None, text)]
+    segments: list[tuple[Optional[str], str]] = []
+    prefix = text[: matches[0].start()].strip()
+    if prefix:
+        segments.append((None, prefix))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        segments.append((_label_speaker(match.group("label")), text[match.end() : end]))
+    return segments
+
+
+def _sentences(text: str) -> list[str]:
+    """Punctuation-split one segment into non-empty sentences."""
+    return [
+        match.group().strip()
+        for match in _SENTENCE_RE.finditer(text or "")
+        if match.group().strip()
+    ]
+
+
+def _classify_utterance(text: str, previous: Optional[str]) -> str:
+    """Label one sentence from Vietnamese medical conversation cues only.
+
+    Precedence: patient opener > doctor cue > trailing '?' > symptom
+    vocabulary > plain alternation. The opener wins first so a "Dạ không, ..."
+    answer is never stolen by a cue further into the sentence; the doctor cue
+    wins over the symptom tie-breaker so a screening question ("Bác có sốt
+    hay đau ngực không?") never lands on the patient.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return previous or "doctor"
+    if HEURISTIC_PATIENT_CUES.match(stripped):
+        return "patient"
+    if HEURISTIC_DOCTOR_CUES.search(stripped) or stripped.endswith("?"):
+        return "doctor"
+    if HEURISTIC_SYMPTOM_CUES.search(stripped):
+        return "patient"
+    # No cue either way: the consultation opens with the doctor, then alternate.
+    return "patient" if previous == "doctor" else "doctor"
+
+
+def heuristic_fast_diarize(raw_transcript: str) -> list[DiarizedTurn]:
+    """Display-only diarization: doctor/patient turns without any LLM call.
+
+    The clinical single-pass reads ``raw_transcript`` directly; this only
+    produces what ``LiveTranscriptPanel`` renders. Cost is sub-millisecond
+    regex work, so the gateway runs it synchronously on the event loop.
+    Consecutive sentences of the same speaker are merged into one turn.
+    """
+    turns: list[DiarizedTurn] = []
+    previous: Optional[str] = None
+
+    def _append(speaker: str, text: str) -> None:
+        nonlocal previous
+        cleaned = " ".join(text.split())[:_MAX_TURN_CHARS].strip()
+        if not cleaned:
+            return
+        if turns and turns[-1].speaker == speaker:
+            merged = f"{turns[-1].text} {cleaned}".strip()[:_MAX_TURN_CHARS]
+            turns[-1] = DiarizedTurn(speaker=speaker, text=merged)
+        else:
+            turns.append(DiarizedTurn(speaker=speaker, text=cleaned))
+        previous = speaker
+
+    for labelled_speaker, segment in _labelled_segments(raw_transcript or ""):
+        for sentence in _sentences(segment):
+            speaker = labelled_speaker or _classify_utterance(sentence, previous)
+            _append(speaker, sentence)
+
+    logger.info(
+        "Heuristic diarization: %d turn(s) from %d chars",
+        len(turns),
+        len(raw_transcript or ""),
+    )
+    return turns
+
+
+# ---------------------------------------------------------------------------
+# Legacy step 2 (three-pass flow) - semantic diarization & role labelling.
+# Kept only for scripts/validate_ambient.py; no gateway endpoint calls it.
 # ---------------------------------------------------------------------------
 
 _DOCTOR_CUES = re.compile(
@@ -570,7 +751,7 @@ def _normalise_speaker(value: str) -> Optional[str]:
         return None
     if value in {"doctor", "bác sĩ", "bac si", "bac_si", "bs", "md", "physician"}:
         return "doctor"
-    if value in {"patient", "bệnh nhân", "benh nhan", "benh_nhan"}:
+    if value in {"patient", "bệnh nhân", "benh nhan", "benh_nhan", "bn"}:
         return "patient"
     return None
 
@@ -578,6 +759,45 @@ def _normalise_speaker(value: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Step 3 - red flags & infectious disease scanner
 # ---------------------------------------------------------------------------
+
+
+def merge_vital_red_flags(red_flags: RedFlagResult, vitals: VitalSigns | None) -> bool:
+    """Fold deterministic vital-sign emergencies into an LLM red-flag answer.
+
+    Returns True when vitals forced the emergency, i.e. ``has_red_flags`` is
+    now True for a reason the model did not have to notice (hypertensive
+    crisis, severe hypoxia). Shared by the single-pass gateway path and the
+    legacy ``scan_red_flags`` pass so both merge identically.
+    """
+    flags = (vitals or VitalSigns()).critical_alerts()
+    if not flags:
+        return False
+
+    red_flags.has_red_flags = True
+    alerts = [alert for alert, _ in flags]
+    red_flags.red_flag_alert = " | ".join(
+        filter(None, [red_flags.red_flag_alert, *alerts])
+    )[:_MAX_FIELD_CHARS]
+    patterns = [pattern for _, pattern in flags]
+    red_flags.matched_patterns = patterns + [
+        pattern for pattern in red_flags.matched_patterns if pattern not in patterns
+    ]
+    if not red_flags.recommended_inquiry:
+        red_flags.recommended_inquiry = (
+            "Theo dõi sát dấu hiệu sinh tồn và đánh giá ngay nguy cơ cấp cứu "
+            "từ huyết áp / SpO2 bất thường."
+        )
+    return True
+
+
+def append_inquiry_to_plan(plan: str, recommended_inquiry: str) -> str:
+    """Deterministic "ask more now" line appended to the SOAP plan at most once."""
+    if not recommended_inquiry:
+        return plan
+    line = f"CẦN KHAI THÁC THÊM: {recommended_inquiry}"
+    if line in plan:
+        return plan
+    return (f"{plan} | {line}" if plan else line)[:4000]
 
 
 def scan_red_flags(
@@ -629,20 +849,8 @@ def scan_red_flags(
     )
 
     if vitals_flags:
-        result.has_red_flags = True
-        alerts = [alert for alert, _ in vitals_flags]
-        result.red_flag_alert = " | ".join(
-            filter(None, [result.red_flag_alert, *alerts])
-        )[:_MAX_FIELD_CHARS]
-        patterns = [pattern for _, pattern in vitals_flags]
-        result.matched_patterns = patterns + [
-            pattern for pattern in result.matched_patterns if pattern not in patterns
-        ]
-        if not result.recommended_inquiry:
-            result.recommended_inquiry = (
-                "Theo dõi sát dấu hiệu sinh tồn và đánh giá ngay nguy cơ cấp cứu "
-                "từ huyết áp / SpO2 bất thường."
-            )
+        # Deterministic emergencies outrank whatever the model answered.
+        merge_vital_red_flags(result, vitals)
     return result
 
 
@@ -989,16 +1197,100 @@ def synthesise_clinical_note(
     prescription, rx_warnings = reconcile_prescription(payload.get("prescription_draft"), drugs)
     warnings.extend(rx_warnings)
 
-    if red_flags.has_red_flags and red_flags.recommended_inquiry:
-        soap_note.plan = (
-            f"{soap_note.plan} | CẦN KHAI THÁC THÊM: {red_flags.recommended_inquiry}"
-        )
+    if red_flags.has_red_flags:
+        soap_note.plan = append_inquiry_to_plan(soap_note.plan, red_flags.recommended_inquiry)
 
     return ClinicalDraft(
         soap_note=soap_note,
         diagnoses=diagnoses,
         prescription_draft=prescription,
         warnings=warnings,
+    )
+
+
+def _build_single_pass_user_prompt(
+    raw_transcript: str,
+    clinical_profile: str,
+    knowledge_context: str,
+    drugs: list[AvailableDrug],
+) -> str:
+    """Four structured blocks for the ONE extraction call."""
+    return (
+        f"[HỒ SƠ LÂM SÀNG]\n{clinical_profile}\n\n"
+        f"[HỘI THOẠI KHÁM BỆNH THÔ]\n{(raw_transcript or '').strip() or '(trống)'}\n\n"
+        f"[PHÁC ĐỒ BỘ Y TẾ]\n{knowledge_context or '(Không tra được phác đồ trong phiên này)'}\n\n"
+        "[THUỐC TRONG KHO] (id | mã | tên | hàm lượng | dạng | tồn kho | BHYT)\n"
+        f"{_formulary_block(drugs)}"
+    )
+
+
+def single_pass_ambient_synthesis(
+    raw_transcript: str,
+    clinical_profile: str,
+    knowledge_context: str,
+    drugs: list[AvailableDrug],
+    model: str,
+    settings: Settings | None = None,
+) -> tuple[ClinicalDraft, RedFlagResult, list[str], list[str]]:
+    """The gateway's ONLY LLM call: complaints + red flags + SOAP/ICD/Rx.
+
+    Replaces the old ``diarize_dialogue`` -> ``scan_red_flags`` ->
+    ``synthesise_clinical_note`` chain: the raw transcript (not an LLM-written
+    diarization of it) is ingested once, so a doctor's negative screening
+    question is judged with the full clinical profile in context instead of
+    being transcribed into a patient turn first.
+
+    Returns ``(draft, red_flags, chief_complaints, symptoms)``.
+    """
+    payload = complete_json(
+        SINGLE_PASS_SYSTEM_PROMPT,
+        _build_single_pass_user_prompt(
+            raw_transcript, clinical_profile, knowledge_context, drugs
+        ),
+        model,
+        settings,
+        temperature=0.1,
+        max_completion_tokens=SINGLE_PASS_MAX_COMPLETION_TOKENS,
+    )
+
+    chief_complaints = _clean_lines(payload.get("chief_complaints"), limit=4, max_chars=240)
+    symptoms = _clean_lines(payload.get("symptoms"), limit=16, max_chars=200)
+    red_flags = RedFlagResult(
+        has_red_flags=_as_bool(payload.get("has_red_flags")),
+        red_flag_alert=_text(payload.get("red_flag_alert"), _MAX_FIELD_CHARS),
+        recommended_inquiry=_text(payload.get("recommended_inquiry"), 600),
+        matched_patterns=_clean_lines(payload.get("matched_patterns"), limit=8, max_chars=200),
+    )
+
+    warnings: list[str] = []
+    soap_note = sanitise_soap(payload.get("soap_note"))
+    diagnoses, diagnosis_warnings = sanitise_diagnoses(payload.get("diagnoses"))
+    warnings.extend(diagnosis_warnings)
+    prescription, rx_warnings = reconcile_prescription(payload.get("prescription_draft"), drugs)
+    warnings.extend(rx_warnings)
+
+    if red_flags.has_red_flags:
+        soap_note.plan = append_inquiry_to_plan(soap_note.plan, red_flags.recommended_inquiry)
+
+    logger.info(
+        "Single-pass synthesis: red_flags=%s complaints=%d symptoms=%d "
+        "diagnoses=%d rx=%d",
+        red_flags.has_red_flags,
+        len(chief_complaints),
+        len(symptoms),
+        len(diagnoses),
+        len(prescription),
+    )
+    return (
+        ClinicalDraft(
+            soap_note=soap_note,
+            diagnoses=diagnoses,
+            prescription_draft=prescription,
+            warnings=warnings,
+        ),
+        red_flags,
+        chief_complaints,
+        symptoms,
     )
 
 

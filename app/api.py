@@ -609,14 +609,6 @@ def _clinical_profile(
     return "\n".join(lines)
 
 
-def _ambient_rag_query(diarization, raw_transcript: str) -> str:
-    """Guideline lookup query: complaints/symptoms beat the raw transcript."""
-    parts = diarization.chief_complaints + diarization.symptoms
-    if not parts:
-        return raw_transcript[:600]
-    return ("Phác đồ điều trị " + "; ".join(parts))[:800]
-
-
 async def _retrieve_knowledge_safely(
     query: str, settings
 ) -> tuple[str, list[str], list[str]]:
@@ -1197,15 +1189,38 @@ def _check_database(settings) -> DatabaseStatus:
 
 
 def _resolve_raw_file(filename: str) -> Path:
-    """Map a bare filename onto data/raw_docs/, refusing anything that escapes it."""
-    candidate = (RAW_DOCS_DIR / filename).resolve()
-    try:
-        candidate.relative_to(RAW_DOCS_DIR.resolve())
-    except ValueError:
+    """Map a filename onto data/raw_docs/, refusing anything that escapes it.
+
+    Administrators often type the bare stem in the pipeline modal ("chẩn đoán
+    sớm 2" instead of "chẩn đoán sớm 2.docx"), so a name with a missing or
+    unsupported suffix first probes ``data/raw_docs/`` for the same stem plus a
+    supported extension before it is rejected.
+    """
+    clean_name = (filename or "").strip()
+    raw_root = RAW_DOCS_DIR.resolve()
+
+    def _inside(path: Path) -> bool:
+        try:
+            path.relative_to(raw_root)
+        except ValueError:
+            return False
+        return True
+
+    candidate = (RAW_DOCS_DIR / clean_name).resolve()
+    if not _inside(candidate):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Đường dẫn không hợp lệ.",
         )
+
+    # Smart extension auto-probe: bare stem (or e.g. ".txt") -> <stem>.pdf/.docx
+    if not candidate.suffix or candidate.suffix.lower() not in RAW_DOC_EXTENSIONS:
+        for ext in RAW_DOC_EXTENSIONS:
+            probe = (RAW_DOCS_DIR / f"{clean_name}{ext}").resolve()
+            if _inside(probe) and probe.is_file():
+                candidate = probe
+                break
+
     if candidate.suffix.lower() not in RAW_DOC_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1653,14 +1668,15 @@ async def ambient_consultation(
     spo2: Optional[int] = Form(None, description="SpO2 (%)"),
     temperature: str = Form("", description="Nhiệt độ (°C), ví dụ 38.5"),
 ):
-    """Ambient voice consultation, zero audio storage.
+    """Ambient voice consultation, zero audio storage, single-pass extraction.
 
     Step 1 transcribes the upload straight out of RAM and drops the bytes;
-    Steps 2-5 turn that transcript into a diarized dialogue, a red-flag scan
-    (dialogue patterns + deterministic vital-sign thresholds), a SOAP note,
-    ICD-10 diagnoses and a prescription draft matched against the live
-    in-stock formulary (pgvector guidelines + ClinicalConsultationService
-    are retrieved in parallel).
+    Step 2 splits the transcript into doctor/patient turns with the
+    deterministic heuristic diarizer (display only, no LLM); the guideline RAG
+    and the live in-stock formulary are then fetched concurrently; ONE LLM call
+    produces chief complaints, red flags, the SOAP note, ICD-10 diagnoses and a
+    prescription draft; vital-sign emergencies are merged in deterministically
+    before the response is assembled.
     """
     started = time.perf_counter()
     settings = get_settings()
@@ -1712,83 +1728,76 @@ async def ambient_consultation(
             vitals=vitals,
         )
 
-        # --- Step 2: semantic diarization & role labelling -----------------
-        diarization = await asyncio.to_thread(
-            ambient.diarize_dialogue,
-            raw_transcript,
-            clinical_profile,
-            llm_model,
-            settings,
-        )
-        logger.info(
-            "Ambient step 2: %d turn(s), %d complaint(s), %d symptom(s)",
-            len(diarization.turns),
-            len(diarization.chief_complaints),
-            len(diarization.symptoms),
-        )
+        # --- Step 2: deterministic display diarization (zero LLM cost) -----
+        # Compiled-regex rule engine, sub-millisecond, so it runs on the loop.
+        diarized_turns = ambient.heuristic_fast_diarize(raw_transcript)
+        stt_done = time.perf_counter()
 
-        # --- Steps 3 + 4 run concurrently: the red-flag scan is an LLM call,
-        # the guideline RAG is CPU-bound embedding and the formulary is a DB
-        # lookup - none of them depend on each other, so wall-clock time is
-        # whichever of the three is slowest rather than their sum.
-        red_flags, knowledge_result, formulary = await asyncio.gather(
-            asyncio.to_thread(
-                ambient.scan_red_flags,
-                diarization,
-                clinical_profile,
-                llm_model,
-                settings,
-                vitals=vitals,
-            ),
-            _retrieve_knowledge_safely(
-                _ambient_rag_query(diarization, raw_transcript), settings
-            ),
+        # --- Steps 3 + 4 run concurrently: the guideline RAG is CPU-bound
+        # embedding and the formulary is a DB lookup - neither depends on the
+        # other, so wall-clock time is whichever is slowest rather than the sum.
+        knowledge_result, formulary = await asyncio.gather(
+            _retrieve_knowledge_safely(raw_transcript[:600], settings),
             get_available_drugs(settings),
         )
-        logger.info("Ambient step 3: has_red_flags=%s", red_flags.has_red_flags)
+        prep_done = time.perf_counter()
 
         knowledge_context, rag_sources, warnings = knowledge_result
         drugs, formulary_warnings = _formulary_warnings(formulary)
         warnings.extend(formulary_warnings)
         logger.info(
-            "Ambient step 4: %d guideline chunk(s) [%s] + %d in-stock drug(s) [%s]",
+            "Ambient prep: %d turn(s), %d guideline chunk(s) [%s] + %d in-stock drug(s) [%s]",
+            len(diarized_turns),
             len(rag_sources),
             ", ".join(rag_sources) or "-",
             len(drugs),
             formulary.source or "unavailable",
         )
 
-        # --- Step 5: SOAP + ICD-10 + prescription draft ---------------------
-        draft = await asyncio.to_thread(
-            ambient.synthesise_clinical_note,
-            diarization,
-            red_flags,
+        # --- Step 5: ONE LLM call - complaints + red flags + SOAP/ICD/Rx ----
+        draft, red_flags, chief_complaints, symptoms = await asyncio.to_thread(
+            ambient.single_pass_ambient_synthesis,
+            raw_transcript,
             clinical_profile,
             knowledge_context,
             drugs,
             llm_model,
             settings,
         )
+        synth_done = time.perf_counter()
         warnings.extend(draft.warnings)
+
+        # --- Step 6: deterministic vital-sign emergencies -------------------
+        # Hypertensive crisis / hypoxia outrank whatever the model answered.
+        if ambient.merge_vital_red_flags(red_flags, vitals):
+            draft.soap_note.plan = ambient.append_inquiry_to_plan(
+                draft.soap_note.plan, red_flags.recommended_inquiry
+            )
+        logger.info("Ambient red flags: has_red_flags=%s", red_flags.has_red_flags)
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         logger.info(
-            "Ambient consultation done: turns=%d red_flags=%s diagnoses=%d rx=%d (%.0f ms)",
-            len(diarization.turns),
+            "Ambient single-pass done: turns=%d complaints=%d red_flags=%s "
+            "diagnoses=%d rx=%d | stt=%.0fms prep=%.0fms llm=%.0fms (%.0f ms)",
+            len(diarized_turns),
+            len(chief_complaints),
             red_flags.has_red_flags,
             len(draft.diagnoses),
             len(draft.prescription_draft),
+            (stt_done - started) * 1000,
+            (prep_done - stt_done) * 1000,
+            (synth_done - prep_done) * 1000,
             latency_ms,
         )
         return AmbientConsultationResponse(
             success=True,
             raw_transcript=raw_transcript,
-            diarized_transcript=diarization.turns,
+            diarized_transcript=diarized_turns,
             has_red_flags=red_flags.has_red_flags,
             red_flag_alert=red_flags.red_flag_alert,
             recommended_inquiry=red_flags.recommended_inquiry,
-            chief_complaints=diarization.chief_complaints,
-            symptoms=diarization.symptoms,
+            chief_complaints=chief_complaints,
+            symptoms=symptoms,
             soap_note=draft.soap_note,
             diagnoses=draft.diagnoses,
             prescription_draft=draft.prescription_draft,
