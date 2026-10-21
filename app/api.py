@@ -116,16 +116,28 @@ Nhiệm vụ: đọc lời kể của bệnh nhân và NGỮ CẢNH TRIỆU CH�
 Quy tắc bắt buộc:
 1. CHỈ dùng thông tin trong [NGỮ CẢNH TRIỆU CHỨNG] để suy ra bệnh và mã ICD-10. Nếu ngữ cảnh không nói, đặt icd10_code là chuỗi rỗng "" - TUYỆT ĐỐI không tự bịa mã bệnh.
 2. department_id chỉ được là 1, 2 hoặc 3:
-   - 1 = Khoa Nội Tổng quát & Tim mạch (triệu chứng tim mạch, hô hấp, nội khoa chung, tiêu hóa)
-   - 2 = Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng (triệu chứng hô hấp, dị ứng, tai mũi họng, da liễu dị ứng)
-   - 3 = Khoa Da liễu (triệu chứng da, tóc, móng)
+   - 1 = Khoa Nội Tổng quát & Tim mạch (tim mạch, tình trạng nội khoa nặng cấp tính, cấp cứu chuyển hóa)
+   - 2 = Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng / Tai Mũi Họng (sốc phản vệ, hen phế quản, suy hô hấp cấp, tai mũi họng)
+   - 3 = Khoa Da liễu (phát ban, ngứa, tổn thương da do nấm/vi khuẩn, ghẻ)
 3. department_name phải khớp đúng tên khoa ứng với department_id.
 4. priority_level: "P1" = cấp cứu (đau ngực dữ dội, khó thở nặng, lơ mơ, sốc phản vệ, loét da diện rộng cấp), "P2" = ưu tiên khám trong ngày, "P3" = khám thường.
 5. KHÔNG BAO GIỜ suy đoán danh sách bác sĩ, ca trực, phòng khám hay số suất còn trống. Lịch làm việc sẽ được tra cứu từ cơ sở dữ liệu riêng.
 6. chief_complaint_summary: tóm tắt triệu chứng chính trong 1-2 câu tiếng Việt để bệnh nhân trình bày với bác sĩ.
+7. TRIỆU CHỨNG ĐA CƠ QUAN / ĐA CHUYÊN KHOA (bắt buộc):
+   - Khi lời kể bao phủ nhiều chuyên khoa (ví dụ: đau ngực dữ dội kèm ngứa/nổi mụn nước ngoài da), KHÔNG được chọn bừa một khoa và KHÔNG được bỏ sót khoa còn lại.
+   - Thang ưu tiên lâm sàng: P1 (Cấp cứu) > P2 (Ưu tiên) > P3 (Thường quy).
+   - department_id = khoa có mức nguy cơ/độ khẩn cao NHẤT trong các khoa liên quan; priority_level theo chính khoa đó.
+     Ví dụ: đau ngực dữ dội lan cánh tay + ngứa mụn nước bắp chân → department_id 1, priority_level "P1", secondary_department_id 3.
+   - secondary_department_id = khoa phụ (khoa còn lại) và secondary_department_name đúng tên khoa phụ đó.
+   - Nếu triệu chứng chỉ nằm ở MỘT chuyên khoa: secondary_department_id = null, secondary_department_name = null, multi_specialty_note = "".
+   - Nếu hai triệu chứng cùng mức ưu tiên, chọn triệu chứng nguy hiểm/gây tàn phế hơn làm khoa chính.
+   - multi_specialty_note: 1 câu tiếng Việt nêu hướng xử trí (khoa nào xử trí trước, khoa nào hội chẩn sau).
 
 Định dạng JSON bắt buộc:
-{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P2", "chief_complaint_summary": "..."}"""
+{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "..."}
+
+Ví dụ đầu ra khi đa chuyên khoa:
+{"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu."}"""
 
 # ---------------------------------------------------------------------------
 # Runtime model configuration (admin dashboard - hot swappable, no restart)
@@ -696,6 +708,37 @@ def _sanitise_triage_payload(payload: dict) -> tuple[dict, list[str]]:
     # The departments table is authoritative; the LLM only proposes a name.
     department_name = _DEPARTMENT_NAMES[department_id]
 
+    # Multi-organ complaints: the secondary department must be a different,
+    # valid khoa; anything else collapses to None instead of leaking a bogus id.
+    secondary_department_id: Optional[int] = None
+    raw_secondary = payload.get("secondary_department_id")
+    if raw_secondary is not None and str(raw_secondary).strip().lower() not in (
+        "",
+        "null",
+        "none",
+    ):
+        try:
+            parsed_secondary = int(raw_secondary)
+        except (TypeError, ValueError):
+            parsed_secondary = 0
+        if parsed_secondary not in VALID_DEPARTMENT_IDS:
+            warnings.append(
+                f"secondary_department_id không hợp lệ ({raw_secondary!r}); bỏ qua khoa phụ."
+            )
+        elif parsed_secondary == department_id:
+            warnings.append(
+                "secondary_department_id trùng department_id; bỏ qua khoa phụ."
+            )
+        else:
+            secondary_department_id = parsed_secondary
+
+    secondary_department_name = (
+        _DEPARTMENT_NAMES[secondary_department_id]
+        if secondary_department_id is not None
+        else None
+    )
+    multi_specialty_note = _text("multi_specialty_note", 500)
+
     return (
         {
             "disease_guess": _text("disease_guess", 300) or "Chưa xác định",
@@ -704,6 +747,9 @@ def _sanitise_triage_payload(payload: dict) -> tuple[dict, list[str]]:
             "department_name": department_name,
             "priority_level": priority,
             "chief_complaint_summary": _text("chief_complaint_summary", 400),
+            "secondary_department_id": secondary_department_id,
+            "secondary_department_name": secondary_department_name,
+            "multi_specialty_note": multi_specialty_note,
         },
         warnings,
     )
@@ -774,6 +820,31 @@ def _schedule_rolled_to_tomorrow(schedule: dict[str, Any]) -> bool:
 
 
 def _build_advice(
+    priority: str,
+    recommended_shift: str,
+    schedule: dict[str, Any],
+    department_name: str,
+    connected: bool = True,
+    secondary_department_name: Optional[str] = None,
+) -> str:
+    """Deterministic advice - never generated by the LLM, never invents a roster.
+
+    ``secondary_department_name`` is the khoa phụ of a multi-organ complaint; when
+    present the advice gains an explicit "primary first, then consult" sentence.
+    """
+    advice = _build_base_advice(
+        priority, recommended_shift, schedule, department_name, connected
+    )
+    if secondary_department_name:
+        advice += (
+            f" Lưu ý: Bệnh nhân có triệu chứng phối hợp liên quan đến "
+            f"{secondary_department_name}. Đề nghị khám và xử trí ưu tiên tại "
+            f"{department_name} trước, sau đó phối hợp hội chẩn chuyên khoa liên quan."
+        )
+    return advice
+
+
+def _build_base_advice(
     priority: str,
     recommended_shift: str,
     schedule: dict[str, Any],
@@ -890,16 +961,18 @@ def _run_voice_triage(
         schedule_payload,
         schedule_payload["department_name"],
         connected=connected,
+        secondary_department_name=facts.get("secondary_department_name"),
     )
     facts["department_name"] = schedule_payload["department_name"]
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
     logger.info(
-        "Voice triage: dept=%s priority=%s icd=%s shift=%s target_date=%s "
+        "Voice triage: dept=%s priority=%s icd=%s secondary=%s shift=%s target_date=%s "
         "schedule_connected=%s (%.0f ms)",
         facts["department_id"],
         facts["priority_level"],
         facts["icd10_code"] or "-",
+        facts.get("secondary_department_id") or "-",
         recommended_shift,
         schedule_payload.get("target_date", "-"),
         connected,
@@ -931,6 +1004,12 @@ class VoiceScheduleTriageResponse(BaseModel):
     department_name: str
     priority_level: str
     chief_complaint_summary: str
+    secondary_department_id: Optional[int] = Field(
+        default=None,
+        description="Khoa phụ cần khám kèm nếu có triệu chứng đa cơ quan",
+    )
+    secondary_department_name: Optional[str] = Field(default=None)
+    multi_specialty_note: Optional[str] = Field(default="")
     recommended_shift: str
     advice: str
     schedule: dict[str, Optional[SessionSchedule]] = Field(
