@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import psycopg
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
@@ -154,6 +154,12 @@ class DoctorShiftInfo(BaseModel):
     total_capacity: int
     available_capacity: int
     is_full: bool
+
+    @computed_field
+    @property
+    def doctorId(self) -> int:
+        """camelCase twin of ``doctor_id`` (same ``doctors.id`` value)."""
+        return self.doctor_id
 
 
 class SessionSchedule(BaseModel):
