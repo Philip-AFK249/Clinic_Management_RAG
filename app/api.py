@@ -1914,6 +1914,155 @@ async def copilot_chat(payload: CopilotChatRequest):
         ) from exc
 
 
+@app.post("/api/v1/clinical/copilot-chat/voice", response_model=CopilotChatResponse)
+async def copilot_chat_voice(
+    audio_file: UploadFile = File(..., description="Ghi âm bổ sung của bác sĩ"),
+    draft_payload: str = Form(..., description="JSON stringified of current draft context"),
+):
+    """Apply one doctor follow-up *audio* clip to the current clinical draft.
+
+    The extra clip (e.g. the patient mentions a new allergy mid-consultation)
+    is transcribed in RAM, then fed to the same revision pass as the text
+    copilot so the existing SOAP note, ICD-10 list and prescription draft are
+    updated in place instead of being regenerated from scratch.
+    """
+    started = time.perf_counter()
+    settings = get_settings()
+
+    try:
+        filename = _resolve_ambient_filename(audio_file)
+        audio_bytes = await audio_file.read()
+        try:
+            if not audio_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp audio rỗng."
+                )
+            if len(audio_bytes) > VOICE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"File audio vượt quá {VOICE_MAX_BYTES // (1024 * 1024)} MB.",
+                )
+            if _wav_has_no_speech(audio_bytes) is True:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Không phát hiện giọng nói trong tệp WAV (âm thanh im lặng "
+                    "hoặc chỉ có nhiễu). Vui lòng ghi âm lại gần micro hơn.",
+                )
+
+            doctor_voice_text = await asyncio.to_thread(
+                _transcribe_ambient, audio_bytes, filename, settings
+            )
+        finally:
+            del audio_bytes
+
+        try:
+            data = json.loads(draft_payload)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid draft_payload JSON: {exc}",
+            ) from exc
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="draft_payload phải là một đối tượng JSON.",
+            )
+
+        llm_model = _ambient_llm_model(settings)
+        clinical_profile = _clinical_profile(
+            data.get("department_id", 1),
+            data.get("allergies", ""),
+            data.get("patient_history", ""),
+            data.get("doctor_id"),
+            data.get("patient_id"),
+        )
+        conversation_history = "\n".join(
+            f"{turn.get('speaker', '')}: {turn.get('text', '')}"
+            for turn in data.get("diarized_transcript") or []
+            if isinstance(turn, dict)
+        ) or str(data.get("raw_transcript", ""))[:1500]
+
+        try:
+            previous = ClinicalDraft(
+                soap_note=(
+                    SoapNote(**data["soap_note"])
+                    if isinstance(data.get("soap_note"), dict)
+                    else SoapNote()
+                ),
+                diagnoses=[IcdDiagnosis(**d) for d in data.get("diagnoses") or []],
+                prescription_draft=[
+                    PrescriptionItemDraft(**p)
+                    for p in data.get("prescription_draft") or []
+                ],
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"draft_payload không hợp lệ: {exc}",
+            ) from exc
+
+        knowledge_result, formulary = await asyncio.gather(
+            _retrieve_knowledge_safely(doctor_voice_text, settings),
+            get_available_drugs(settings),
+        )
+        knowledge_context, rag_sources, warnings = knowledge_result
+        drugs, formulary_warnings = _formulary_warnings(formulary)
+        warnings.extend(formulary_warnings)
+
+        draft, assistant_message = await asyncio.to_thread(
+            ambient.revise_clinical_note,
+            doctor_voice_text,
+            previous,
+            clinical_profile,
+            knowledge_context,
+            drugs,
+            llm_model,
+            settings,
+            conversation_history,
+        )
+        warnings.extend(draft.warnings)
+
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.info(
+            "Copilot chat voice: diagnoses=%d rx=%d warnings=%d (%.0f ms)",
+            len(draft.diagnoses),
+            len(draft.prescription_draft),
+            len(warnings),
+            latency_ms,
+        )
+        return CopilotChatResponse(
+            success=True,
+            assistant_message=f'Đã nghe: "{doctor_voice_text}". {assistant_message}',
+            soap_note=draft.soap_note,
+            diagnoses=draft.diagnoses,
+            prescription_draft=draft.prescription_draft,
+            formulary_source=formulary.source,
+            rag_sources=rag_sources,
+            warnings=warnings,
+            latency_ms=latency_ms,
+        )
+    except HTTPException:
+        raise
+    except VoiceAudioDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except ambient.AmbientPipelineError as exc:
+        logger.error("Copilot chat voice rejected model output: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Không cập nhật được hồ sơ: {exc}",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Lỗi hệ thống khi xử lý copilot-chat/voice: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi xử lý Copilot Chat Voice: {type(exc).__name__}: {exc}",
+        ) from exc
+    finally:
+        await audio_file.close()
+
+
 # ---------------------------------------------------------------------------
 # Admin: AI Gateway & RAG Knowledge management
 # ---------------------------------------------------------------------------
