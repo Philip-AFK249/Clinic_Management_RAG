@@ -23,6 +23,20 @@ from app.database import schedule_queries as sq
 
 TARGET_DATE = date(2099, 1, 5)
 TARGET_DATE_STR = TARGET_DATE.isoformat()
+TODAY = TARGET_DATE
+
+
+def _frozen_datetime(frozen_at: datetime):
+    """Return a datetime subclass whose ``now()`` always yields ``frozen_at``."""
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return frozen_at.replace(tzinfo=None)
+            return frozen_at.astimezone(tz)
+
+    return _FrozenDateTime
 
 _PLACEHOLDER_RE = re.compile(r"%\((\w+)\)s")
 _TIME_LITERAL_RE = re.compile(r"\bTIME\s+'([^']+)'", re.IGNORECASE)
@@ -161,6 +175,7 @@ class _ScheduleHarness:
         session: str,
         duty_type: str = "OUTPATIENT",
         max_patients_per_slot: int = 4,
+        shift_date: date = TARGET_DATE,
     ) -> int:
         cursor = self.connection.execute(
             "INSERT INTO doctor_shifts "
@@ -170,7 +185,7 @@ class _ScheduleHarness:
             (
                 doctor_id,
                 department_id,
-                TARGET_DATE_STR,
+                shift_date.isoformat(),
                 session,
                 duty_type,
                 max_patients_per_slot,
@@ -190,16 +205,17 @@ class _ScheduleHarness:
         department_id: int,
         slot_start_time: str,
         status: str = "BOOKED",
+        appointment_date: date = TARGET_DATE,
     ) -> None:
         self.connection.execute(
             "INSERT INTO slot_assignments "
             "(ticket_number, doctor_id, department_id, appointment_date, "
             "slot_start_time, status) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                f"T{doctor_id}-{slot_start_time}",
+                f"T{doctor_id}-{appointment_date.isoformat()}-{slot_start_time}",
                 doctor_id,
                 department_id,
-                TARGET_DATE_STR,
+                appointment_date.isoformat(),
                 slot_start_time,
                 status,
             ),
@@ -296,6 +312,59 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
             "bookings belonging to department 2 must not count against dept 1's shift",
         )
         self.assertEqual(doctor["available_capacity"], 15)
+
+    def _load_today_at_3pm(self) -> dict:
+        """Run _load_schedule as if it is 15:00 Asia/Ho_Chi_Minh today."""
+        now = datetime(2099, 1, 5, 15, 0, tzinfo=sq.CLINIC_TIMEZONE)
+        with patch.object(sq, "datetime", _frozen_datetime(now)):
+            return sq._load_schedule(1, now.date(), object())
+
+    def test_afternoon_recommended_at_3pm_instead_of_morning(self) -> None:
+        self.db.add_shift(
+            doctor_id=1, department_id=1, session="MORNING", shift_date=TODAY
+        )
+        self.db.add_shift(
+            doctor_id=1, department_id=1, session="AFTERNOON", shift_date=TODAY
+        )
+
+        result = self._load_today_at_3pm()
+
+        self.assertTrue(result["morning_elapsed"])
+        self.assertEqual(result["clinic_time"], "15:00")
+        self.assertEqual(result["recommended_shift"], "AFTERNOON")
+        self.assertNotEqual(result["recommended_shift"], "MORNING")
+
+    def test_next_day_when_afternoon_is_unscheduled_after_morning_elapsed(self) -> None:
+        self.db.add_shift(
+            doctor_id=1, department_id=1, session="MORNING", shift_date=TODAY
+        )
+
+        result = self._load_today_at_3pm()
+
+        self.assertTrue(result["morning_elapsed"])
+        self.assertEqual(result["clinic_time"], "15:00")
+        self.assertEqual(result["recommended_shift"], "NEXT_DAY")
+
+    def test_next_day_when_afternoon_is_full_after_morning_elapsed(self) -> None:
+        self.db.add_shift(
+            doctor_id=1, department_id=1, session="MORNING", shift_date=TODAY
+        )
+        self.db.add_shift(
+            doctor_id=1, department_id=1, session="AFTERNOON", shift_date=TODAY
+        )
+        for _ in range(16):
+            self.db.add_assignment(
+                doctor_id=1,
+                department_id=1,
+                slot_start_time="13:00:00",
+                appointment_date=TODAY,
+            )
+
+        result = self._load_today_at_3pm()
+
+        self.assertTrue(result["morning_elapsed"])
+        self.assertTrue(result["afternoon"]["is_full"])
+        self.assertEqual(result["recommended_shift"], "NEXT_DAY")
 
 
 if __name__ == "__main__":

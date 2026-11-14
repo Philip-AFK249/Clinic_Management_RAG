@@ -38,6 +38,10 @@ CLINIC_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
 #: considered finished and any unspecified/today request rolls to tomorrow.
 CLINIC_CLOSING_TIME = time(17, 0)
 
+#: Morning reception ends at 11:30. From then on today's MORNING session can no
+#: longer be recommended, even if it still has unused capacity.
+MORNING_END_TIME = time(11, 30)
+
 #: Session label -> human readable window. Fixed by clinic policy.
 SESSION_WINDOWS: Dict[str, str] = {
     "MORNING": "07:30 - 11:30",
@@ -371,7 +375,26 @@ def _load_schedule(
 
     morning, afternoon = sessions["MORNING"], sessions["AFTERNOON"]
 
-    if morning.doctors and morning.is_full:
+    now_in_clinic = datetime.now(CLINIC_TIMEZONE)
+    is_today = day == now_in_clinic.date()
+    morning_elapsed = is_today and now_in_clinic.time() >= MORNING_END_TIME
+
+    if morning_elapsed:
+        # Today's morning window is over. MORNING must never be recommended:
+        # prefer the still-open afternoon, otherwise send the patient to the
+        # next working day.
+        if (
+            afternoon.doctors
+            and not afternoon.is_full
+            and now_in_clinic.time() < CLINIC_CLOSING_TIME
+        ):
+            recommended = "AFTERNOON"
+        elif not morning.doctors and not afternoon.doctors:
+            # No outpatient duty at all still means NO_DUTY, not NEXT_DAY.
+            recommended = "NO_DUTY"
+        else:
+            recommended = "NEXT_DAY"
+    elif morning.doctors and morning.is_full:
         recommended = "AFTERNOON" if afternoon.doctors and not afternoon.is_full else "NEXT_DAY"
     elif morning.doctors:
         # Both open -> prefer the morning; morning only -> morning.
@@ -394,15 +417,19 @@ def _load_schedule(
         "recommended_shift": recommended,
         "is_fully_booked": morning.is_full and afternoon.is_full,
         "has_outpatient_duty": bool(morning.doctors or afternoon.doctors),
+        "morning_elapsed": morning_elapsed,
+        "clinic_time": now_in_clinic.strftime("%H:%M"),
         "morning": morning.model_dump(),
         "afternoon": afternoon.model_dump(),
         "detail": "",
     }
     logger.info(
-        "Schedule dept=%s date=%s -> %s (M %d/%d full, A %d/%d full)",
+        "Schedule dept=%s date=%s at %s -> %s (morning_elapsed=%s, M %d/%d full, A %d/%d full)",
         department_id,
         day.isoformat(),
+        now_in_clinic.strftime("%H:%M"),
         recommended,
+        morning_elapsed,
         sum(d.booked_count for d in morning.doctors),
         sum(d.total_capacity for d in morning.doctors),
         sum(d.booked_count for d in afternoon.doctors),

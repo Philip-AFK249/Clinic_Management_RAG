@@ -857,6 +857,18 @@ def _build_base_advice(
             "hoặc liên hệ quầy tiếp đón."
         )
 
+    morning_elapsed = schedule.get("morning_elapsed") is True
+    afternoon_data = schedule.get("afternoon") or schedule.get("AFTERNOON") or {}
+    afternoon_open = False
+    if isinstance(afternoon_data, dict):
+        afternoon_open = bool(afternoon_data.get("doctors")) and not afternoon_data.get(
+            "is_full", True
+        )
+
+    if morning_elapsed and recommended_shift == "MORNING":
+        # Defensive: never point at a session that has already ended today.
+        recommended_shift = "AFTERNOON" if afternoon_open else "NEXT_DAY"
+
     shift_labels = {
         "MORNING": f"ca sáng (07:30 - 11:30){day_label}",
         "AFTERNOON": f"ca chiều (13:00 - 17:00){day_label}",
@@ -890,6 +902,12 @@ def _build_base_advice(
         )
 
     if recommended_shift == "NEXT_DAY":
+        if morning_elapsed:
+            return notice + (
+                f"Ca sáng hôm nay tại {department_name} đã kết thúc (sau 11:30) và ca chiều "
+                "hôm nay đã đủ bệnh hoặc không còn ca trực. Đề nghị đặt lịch khám vào ngày mai "
+                "hoặc ngày làm việc kế tiếp. Mức độ ưu tiên: " + priority + "."
+            )
         return notice + (
             f"Cả ca sáng và ca chiều tại {department_name} đã đủ bệnh trong ngày cần xếp. "
             "Đề nghị đặt lịch vào ngày làm việc kế tiếp. Mức độ ưu tiên: " + priority + "."
@@ -902,10 +920,24 @@ def _build_base_advice(
         morning_open = not morning_data.get("is_full", True)
 
     if priority == "P2":
+        if morning_elapsed and recommended_shift == "AFTERNOON":
+            return notice + (
+                f"Nên khám trong ngày tại {department_name}. Ca sáng hôm nay đã kết thúc, "
+                "đề nghị ưu tiên ca chiều (13:00 - 17:00) (còn trống). Nếu bệnh nhân muốn "
+                "khám buổi sáng, vui lòng đặt lịch sáng ngày mai. Nếu triệu chứng nặng lên "
+                "như khó thở dữ dội, đau ngực dữ dội hoặc lơ mơ thì chuyển sang cấp cứu ngay."
+            )
         return notice + (
             f"Nên khám trong ngày tại {department_name}. Đề nghị ưu tiên {slot} "
             f"(còn trống). Nếu triệu chứng nặng lên như khó thở dữ dội, đau ngực "
             "dữ dội hoặc lơ mơ thì chuyển sang cấp cứu ngay."
+        )
+    if morning_elapsed and recommended_shift == "AFTERNOON":
+        return notice + (
+            f"Có thể khám theo lịch thường tại {department_name}, ưu tiên ca chiều "
+            "(13:00 - 17:00) hôm nay. Ca sáng hôm nay đã kết thúc; nếu bệnh nhân muốn "
+            "khám buổi sáng, vui lòng đặt lịch sáng ngày mai. Đề nghị tái khám nếu "
+            "triệu chứng không cải thiện sau 3-5 ngày hoặc nặng thêm."
         )
     return notice + (
         f"Có thể khám theo lịch thường tại {department_name}, ưu tiên {slot}"
