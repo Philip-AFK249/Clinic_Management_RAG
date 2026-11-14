@@ -85,6 +85,7 @@ booked AS (
         COUNT(*) AS booked_count
     FROM slot_assignments sa
     WHERE sa.appointment_date = %(target_date)s
+      AND sa.department_id = %(department_id)s
       AND COALESCE(sa.status, 'BOOKED') = 'BOOKED'
     GROUP BY sa.doctor_id, 2
 )

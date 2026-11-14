@@ -866,6 +866,13 @@ def _build_base_advice(
     }
     slot = shift_labels.get(recommended_shift, recommended_shift)
 
+    # A deleted/replaced outpatient shift leaves the roster empty while the
+    # schedule service itself is still reachable. Treat that exactly like
+    # NO_DUTY so the patient gets an explanation instead of a phantom session.
+    no_outpatient_duty = recommended_shift == "NO_DUTY" or (
+        schedule.get("has_outpatient_duty") is False
+    )
+
     if priority == "P1":
         return notice + (
             f"Triệu chứng thuộc nhóm CẤP CỨU (P1). Đề nghị gọi cấp cứu 115 hoặc đưa người bệnh "
@@ -874,9 +881,10 @@ def _build_base_advice(
             f"đã được đánh giá đủ an toàn để khám ngoại trú."
         )
 
-    if recommended_shift == "NO_DUTY":
+    if no_outpatient_duty:
         return notice + (
-            f"{department_name} không có lịch khám ngoại trú vào ngày cần xếp. "
+            f"{department_name} hiện không có lịch khám ngoại trú vào ngày cần xếp "
+            "(ca trực đã bị xóa, đổi sang nội trú hoặc chưa được xếp lại). "
             "Đề nghị liên hệ phòng tiếp đón hoặc chọn ngày làm việc kế tiếp. "
             "Mức độ ưu tiên: " + priority + "."
         )
@@ -929,19 +937,26 @@ def _run_voice_triage(
         facts["department_id"], target_date, settings
     )
     connected = bool(schedule_payload.get("is_available"))
-    recommended_shift = schedule_payload["recommended_shift"]
+    recommended_shift = schedule_payload.get("recommended_shift") or "MANUAL_PICK"
+    has_outpatient_duty = bool(
+        schedule_payload.get("has_outpatient_duty", connected)
+    )
     schedule: dict[str, Optional[SessionSchedule]] = {}
-    if connected:
+    if connected and has_outpatient_duty and recommended_shift != "NO_DUTY":
         for label in ("morning", "afternoon"):
             data = schedule_payload.get(label)
             if data:
                 schedule[label] = SessionSchedule(**data)
     else:
+        # Service reachable but the roster is empty (shift deleted/replaced),
+        # or the service itself is down: expose no shift availability but keep
+        # the clinical triage answer at HTTP 200.
         schedule["morning"] = None
         schedule["afternoon"] = None
-        warnings.append(schedule_payload.get("error_message") or "")
-        if schedule_payload.get("detail"):
-            warnings.append(f"Chi tiết lỗi lịch trực: {schedule_payload['detail']}")
+        if not connected:
+            warnings.append(schedule_payload.get("error_message") or "")
+            if schedule_payload.get("detail"):
+                warnings.append(f"Chi tiết lỗi lịch trực: {schedule_payload['detail']}")
 
     if _schedule_rolled_to_tomorrow(schedule_payload):
         # schedule_payload["target_date"] already carries the next-day date.
