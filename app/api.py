@@ -1629,7 +1629,11 @@ class AmbientConsultationResponse(BaseModel):
     success: bool = True
     raw_transcript: str
     diarized_transcript: list[DiarizedTurn] = Field(
-        default_factory=list, description="Câu thoại đã gán vai doctor/patient"
+        default_factory=list,
+        description=(
+            "Deprecated, kept for client compatibility. Always empty: raw_transcript "
+            "is the canonical unified script; no heuristic speaker splitting is done."
+        ),
     )
     has_red_flags: bool = False
     red_flag_alert: str = ""
@@ -1717,11 +1721,11 @@ async def ambient_consultation(
 ):
     """Ambient voice consultation, zero audio storage, single-pass extraction.
 
-    Step 1 transcribes the upload straight out of RAM and drops the bytes;
-    Step 2 splits the transcript into doctor/patient turns with the
-    deterministic heuristic diarizer (display only, no LLM); the guideline RAG
-    and the live in-stock formulary are then fetched concurrently; ONE LLM call
-    produces chief complaints, red flags, the SOAP note, ICD-10 diagnoses and a
+    Step 1 transcribes the upload straight out of RAM and drops the bytes. The
+    transcript is kept as one unified clinical script - no heuristic
+    doctor/patient diarization is attempted. The guideline RAG and the live
+    in-stock formulary are then fetched concurrently; ONE LLM call produces
+    chief complaints, red flags, the SOAP note, ICD-10 diagnoses and a
     prescription draft; vital-sign emergencies are merged in deterministically
     before the response is assembled.
     """
@@ -1775,9 +1779,7 @@ async def ambient_consultation(
             vitals=vitals,
         )
 
-        # --- Step 2: deterministic display diarization (zero LLM cost) -----
-        # Compiled-regex rule engine, sub-millisecond, so it runs on the loop.
-        diarized_turns = ambient.heuristic_fast_diarize(raw_transcript)
+        # --- Step 2: keep the unified script, no heuristic speaker split ---
         stt_done = time.perf_counter()
 
         # --- Steps 3 + 4 run concurrently: the guideline RAG is CPU-bound
@@ -1793,8 +1795,7 @@ async def ambient_consultation(
         drugs, formulary_warnings = _formulary_warnings(formulary)
         warnings.extend(formulary_warnings)
         logger.info(
-            "Ambient prep: %d turn(s), %d guideline chunk(s) [%s] + %d in-stock drug(s) [%s]",
-            len(diarized_turns),
+            "Ambient prep: %d guideline chunk(s) [%s] + %d in-stock drug(s) [%s]",
             len(rag_sources),
             ", ".join(rag_sources) or "-",
             len(drugs),
@@ -1824,9 +1825,8 @@ async def ambient_consultation(
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         logger.info(
-            "Ambient single-pass done: turns=%d complaints=%d red_flags=%s "
+            "Ambient single-pass done: complaints=%d red_flags=%s "
             "diagnoses=%d rx=%d | stt=%.0fms prep=%.0fms llm=%.0fms (%.0f ms)",
-            len(diarized_turns),
             len(chief_complaints),
             red_flags.has_red_flags,
             len(draft.diagnoses),
@@ -1839,7 +1839,7 @@ async def ambient_consultation(
         return AmbientConsultationResponse(
             success=True,
             raw_transcript=raw_transcript,
-            diarized_transcript=diarized_turns,
+            diarized_transcript=[],
             has_red_flags=red_flags.has_red_flags,
             red_flag_alert=red_flags.red_flag_alert,
             recommended_inquiry=red_flags.recommended_inquiry,
@@ -1895,9 +1895,11 @@ async def copilot_chat(payload: CopilotChatRequest):
         payload.doctor_id,
         payload.patient_id,
     )
-    conversation_history = "\n".join(
-        f"{turn.speaker}: {turn.text}" for turn in payload.diarized_transcript
-    ) or payload.raw_transcript[:1500]
+    conversation_history = (payload.raw_transcript or "").strip()[:1500]
+    if not conversation_history:
+        conversation_history = "\n".join(
+            turn.text for turn in payload.diarized_transcript if turn.text
+        )[:1500]
 
     try:
         knowledge_result, formulary = await asyncio.gather(
@@ -2023,11 +2025,13 @@ async def copilot_chat_voice(
             data.get("doctor_id"),
             data.get("patient_id"),
         )
-        conversation_history = "\n".join(
-            f"{turn.get('speaker', '')}: {turn.get('text', '')}"
-            for turn in data.get("diarized_transcript") or []
-            if isinstance(turn, dict)
-        ) or str(data.get("raw_transcript", ""))[:1500]
+        conversation_history = str(data.get("raw_transcript") or "").strip()[:1500]
+        if not conversation_history:
+            conversation_history = "\n".join(
+                str(turn.get("text") or "").strip()
+                for turn in data.get("diarized_transcript") or []
+                if isinstance(turn, dict) and str(turn.get("text") or "").strip()
+            )[:1500]
 
         try:
             previous = ClinicalDraft(

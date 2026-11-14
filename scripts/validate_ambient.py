@@ -620,22 +620,13 @@ def test_ambient_endpoint(client, audio_files: dict[str, bytes],
     check(body["raw_transcript"] == CANNED_TRANSCRIPT, "raw transcript preserved")
 
     turns = body["diarized_transcript"]
-    check(bool(turns), "diarized transcript is not empty", str(len(turns)))
     check(
-        all(t.get("speaker") in {"doctor", "patient"} for t in turns),
-        "every turn is labelled doctor/patient",
-        str({t.get("speaker") for t in turns}),
+        turns == [],
+        "heuristic diarization is disabled; unified script is canonical",
+        str(turns),
     )
-    speakers = {t["speaker"] for t in turns}
-    check(
-        speakers == {"doctor", "patient"},
-        "both roles were identified from linguistic cues",
-        str(speakers),
-    )
-    check(any(t["speaker"] == "doctor" for t in turns), "doctor turns present")
-    print("       --- diarized transcript ---")
-    for turn in turns:
-        print(f"       {turn['speaker']}: {turn['text'][:100]}")
+    print("       --- unified transcript ---")
+    print(f"       {body['raw_transcript'][:300]}")
 
     soap = body["soap_note"]
     check(

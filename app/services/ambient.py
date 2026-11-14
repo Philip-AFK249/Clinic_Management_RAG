@@ -1,10 +1,10 @@
-"""Ambient consultation intelligence: diarization, red flags, SOAP/ICD/Rx draft.
+"""Ambient consultation intelligence: unified script, red flags, SOAP/ICD/Rx draft.
 
-The gateway runs this module in **single-pass** mode: ``heuristic_fast_diarize``
-splits the transcript into doctor/patient turns with compiled regexes (display
-only, zero LLM cost) and ``single_pass_ambient_synthesis`` produces chief
-complaints, red flags, SOAP note, ICD-10 diagnoses and the prescription draft
-in exactly ONE LLM call. The older three-pass flow (``diarize_dialogue`` +
+The gateway runs this module in **single-pass** mode: Whisper's output is kept
+as one unified clinical script and ``single_pass_ambient_synthesis`` produces
+chief complaints, red flags, SOAP note, ICD-10 diagnoses and the prescription
+draft in exactly ONE LLM call. No heuristic speaker diarization is performed on
+the gateway path. The older three-pass flow (``diarize_dialogue`` +
 ``scan_red_flags`` + ``synthesise_clinical_note``) is kept only because
 ``scripts/validate_ambient.py`` still exercises it; no gateway endpoint calls it.
 
@@ -465,145 +465,6 @@ Bắt buộc:
 6. diagnoses: CHỈ mã ICD-10 có thật, đúng định dạng (chữ + 2 chữ số, ví dụ B02.9, J06.9, L51.2, B20); đúng một isPrimary=true (chẩn đoán chính); aiConfidence integer 0-100. Không tự bịa mã.
 7. prescription_draft: CHỈ thuốc có trong [THUỐC TRONG KHO] và đúng drugId của danh sách đó; tuyệt đối không kê thuốc ngoài kho. Tôn trọng [DỊ ỨNG] (dị ứng Penicillin thì không được kê Amoxicillin/Cephalosporin). Tôn trọng cảnh báo [CỜ ĐỎ]/[TƯƠNG TÁC]: nếu thuốc có nguy cơ thì ghi chú vào plan thay vì kê. Ưu tiên thuốc còn tồn kho tốt. routeFrequency: ví dụ "Uống 3 lần/ngày sau ăn"; duration: "7 ngày"; quantity = tổng số viên/ml cho toàn bộ thời gian điều trị (vd 3 lần/ngày x 7 ngày = 21 viên).
 8. Thiếu dữ kiện thì ghi "Chưa có thông tin", không bịa. Trả về đúng MỘT đối tượng JSON thuần (bắt đầu bằng '{', kết thúc bằng '}'), không markdown, không văn bản ngoài JSON."""
-
-
-# ---------------------------------------------------------------------------
-# Step 2 (display only) - deterministic heuristic diarization, zero LLM cost
-# ---------------------------------------------------------------------------
-
-#: Explicit speaker markers the recorder/Whisper sometimes yields verbatim
-#: ("Bác sĩ: ...", "Bệnh nhân: ..."). When present they beat cue matching.
-_TURN_LABEL_RE = re.compile(
-    r"(?P<label>bác\s*sĩ|bệnh\s*nhân|bs\.?|bn\.?|doctor|patient)\s*[:\-]\s*",
-    re.IGNORECASE,
-)
-
-#: Sentence boundary: punctuation is kept on the sentence it terminates.
-_SENTENCE_RE = re.compile(r"[^.?!]*[.?!]+|[^.?!]+")
-
-#: Doctor inquiry & directive cues. ``_classify_utterance`` checks the patient
-#: openers first, so an "em bị ..." answer is never stolen by a doctor cue
-#: that sits further into the sentence.
-HEURISTIC_DOCTOR_CUES = re.compile(
-    r"mời\s+(anh|chị|bác|em|bạn)"
-    r"|ngồi\s+xuống"
-    r"|khám\s+(cho|bụng|họng|phổi)"
-    r"|bị\s+(bao lâu|thế nào|sao\b|từ khi nào)"
-    r"|có\s+(bị|thấy|đau|sốt|ho|ngứa|dị ứng)[^?!.]*\s?không"
-    r"|uống thuốc gì"
-    r"|ăn gì"
-    r"|đo huyết áp"
-    r"|hít\s+(thở\s+)?sâu"
-    r"|để\s+(tôi|bác sĩ)"
-    r"|tôi kê"
-    r"|tái khám"
-    r"|chào\s+(anh|chị|bác|em|bạn)",
-    re.IGNORECASE,
-)
-
-#: Patient response cues, anchored at the start of the utterance so a
-#: "Dạ không, tôi chỉ bị ngứa lưng thôi" answer keeps its own turn.
-HEURISTIC_PATIENT_CUES = re.compile(
-    r"^(dạ không|dạ có|dạ|vâng|thưa|em bị|tôi bị|nó cứ|"
-    r"đau lắm|ngứa lắm|mệt mỏi|uống mà không đỡ)",
-    re.IGNORECASE,
-)
-
-#: Symptom vocabulary used only as a tie-breaker for continuation sentences
-#: ("Khó thở vài hôm nay.") that carry neither an opener nor a doctor cue.
-HEURISTIC_SYMPTOM_CUES = re.compile(
-    r"đau|rát|sốt|ho\b|khó thở|ngứa|mệt|chóng mặt|buồn nôn|nôn|tiêu chảy|"
-    r"nổi|mẩn|chảy máu|sưng|tê\b|mấy ngày|kéo dài|từ hồi|tiền sử",
-    re.IGNORECASE,
-)
-
-
-def _label_speaker(label: str) -> Optional[str]:
-    """Map a literal ``Bác sĩ``/``BN`` marker onto a turn speaker."""
-    cleaned = re.sub(r"[.\s]+", " ", (label or "").strip().lower()).strip()
-    return _normalise_speaker(cleaned)
-
-
-def _labelled_segments(text: str) -> list[tuple[Optional[str], str]]:
-    """Split on ``Bác sĩ:`` / ``Bệnh nhân:`` markers, keeping stray prose."""
-    matches = list(_TURN_LABEL_RE.finditer(text))
-    if not matches:
-        return [(None, text)]
-    segments: list[tuple[Optional[str], str]] = []
-    prefix = text[: matches[0].start()].strip()
-    if prefix:
-        segments.append((None, prefix))
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        segments.append((_label_speaker(match.group("label")), text[match.end() : end]))
-    return segments
-
-
-def _sentences(text: str) -> list[str]:
-    """Punctuation-split one segment into non-empty sentences."""
-    return [
-        match.group().strip()
-        for match in _SENTENCE_RE.finditer(text or "")
-        if match.group().strip()
-    ]
-
-
-def _classify_utterance(text: str, previous: Optional[str]) -> str:
-    """Label one sentence from Vietnamese medical conversation cues only.
-
-    Precedence: patient opener > doctor cue > trailing '?' > symptom
-    vocabulary > plain alternation. The opener wins first so a "Dạ không, ..."
-    answer is never stolen by a cue further into the sentence; the doctor cue
-    wins over the symptom tie-breaker so a screening question ("Bác có sốt
-    hay đau ngực không?") never lands on the patient.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return previous or "doctor"
-    if HEURISTIC_PATIENT_CUES.match(stripped):
-        return "patient"
-    if HEURISTIC_DOCTOR_CUES.search(stripped) or stripped.endswith("?"):
-        return "doctor"
-    if HEURISTIC_SYMPTOM_CUES.search(stripped):
-        return "patient"
-    # No cue either way: the consultation opens with the doctor, then alternate.
-    return "patient" if previous == "doctor" else "doctor"
-
-
-def heuristic_fast_diarize(raw_transcript: str) -> list[DiarizedTurn]:
-    """Display-only diarization: doctor/patient turns without any LLM call.
-
-    The clinical single-pass reads ``raw_transcript`` directly; this only
-    produces what ``LiveTranscriptPanel`` renders. Cost is sub-millisecond
-    regex work, so the gateway runs it synchronously on the event loop.
-    Consecutive sentences of the same speaker are merged into one turn.
-    """
-    turns: list[DiarizedTurn] = []
-    previous: Optional[str] = None
-
-    def _append(speaker: str, text: str) -> None:
-        nonlocal previous
-        cleaned = " ".join(text.split())[:_MAX_TURN_CHARS].strip()
-        if not cleaned:
-            return
-        if turns and turns[-1].speaker == speaker:
-            merged = f"{turns[-1].text} {cleaned}".strip()[:_MAX_TURN_CHARS]
-            turns[-1] = DiarizedTurn(speaker=speaker, text=merged)
-        else:
-            turns.append(DiarizedTurn(speaker=speaker, text=cleaned))
-        previous = speaker
-
-    for labelled_speaker, segment in _labelled_segments(raw_transcript or ""):
-        for sentence in _sentences(segment):
-            speaker = labelled_speaker or _classify_utterance(sentence, previous)
-            _append(speaker, sentence)
-
-    logger.info(
-        "Heuristic diarization: %d turn(s) from %d chars",
-        len(turns),
-        len(raw_transcript or ""),
-    )
-    return turns
 
 
 # ---------------------------------------------------------------------------
