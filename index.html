@@ -242,7 +242,7 @@
 
   .char-count { font-size: .75rem; color: var(--muted); margin-top: .25rem; font-variant-numeric: tabular-nums; }
 
-  /* ---------- Actions + toast ---------- */
+  /* ---------- Actions ---------- */
   .actions {
     display: flex; flex-wrap: wrap; gap: .75rem;
     justify-content: flex-end;
@@ -250,41 +250,14 @@
     padding-top: 1rem;
     border-top: 1px solid var(--line);
   }
-  .spinner {
-    width: 1rem; height: 1rem;
-    border: 2px solid rgba(255,255,255,.45);
-    border-top-color: #fff;
-    border-radius: 50%;
-    display: inline-block;
-    vertical-align: -2px;
-    margin-right: .45rem;
-    animation: spin .7s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
-  .toast {
-    position: fixed; top: 1.25rem; right: 1.25rem;
-    max-width: 380px;
-    padding: .9rem 1.1rem;
-    border-radius: 11px;
-    color: #fff;
-    font-weight: 600;
-    box-shadow: 0 8px 24px rgba(15,23,42,.22);
-    transform: translateY(-150%);
-    opacity: 0;
-    transition: transform .3s ease, opacity .3s ease;
-    z-index: 50;
-  }
-  .toast.show { transform: translateY(0); opacity: 1; }
-  .toast.success { background: var(--ok); }
-  .toast.error   { background: var(--err); }
 </style>
 </head>
 <body>
 
 <header class="page">
   <h1>Tiếp đón Bệnh nhân bằng thẻ BHYT</h1>
-  <p>Chụp hoặc tải lên thẻ Bảo hiểm Y tế &mdash; AI sẽ bóc tách dữ liệu, bạn kiểm tra lại trước khi lưu.</p>
+  <p>Chụp hoặc tải lên thẻ Bảo hiểm Y tế &mdash; AI sẽ bóc tách dữ liệu để bạn kiểm tra lại.</p>
 </header>
 
 <div class="shell">
@@ -412,15 +385,11 @@
 
     <div class="actions">
       <button class="ghost" id="btn-reset" type="button">📸 Chụp lại ảnh khác</button>
-      <button class="primary" id="btn-save" type="button">✅ Xác nhận &amp; Lưu thông tin</button>
     </div>
   </section>
 </div>
 
-<div class="toast" id="toast" role="status" aria-live="polite"></div>
-
-<script>
-(function () {
+<script>(function () {
   "use strict";
 
   const $ = (id) => document.getElementById(id);
@@ -434,7 +403,6 @@
   const reviewAlert = $("review-alert");
   const cardImage  = $("card-image");
   const zoomView   = $("zoom-viewport");
-  const saveBtn    = $("btn-save");
 
   // Map the API schema onto the DOM ids used in the verification table.
   const FIELDS = {
@@ -458,14 +426,6 @@
     if (!message) { el.className = "alert"; el.textContent = ""; return; }
     el.className = "alert show " + (type || "error");
     el.textContent = message;
-  }
-
-  function toast(message, type) {
-    const el = $("toast");
-    el.textContent = message;
-    el.className = "toast show " + (type || "success");
-    window.clearTimeout(el._hide);
-    el._hide = window.setTimeout(() => { el.className = "toast"; }, 4200);
   }
 
   function startLatencyCounter() {
@@ -736,68 +696,13 @@
     return currentFileSizeMB;
   }
 
-  /* ---------------- save flow ---------------- */
+  /* ---------------- verification table ---------------- */
 
   Object.values(FIELDS).forEach((id) => {
     const el = $(id);
     if (!el) return;
     el.addEventListener("input", revalidate);
     el.addEventListener("change", revalidate);
-  });
-
-  saveBtn.addEventListener("click", async () => {
-    const codeOk = revalidate();
-    if (!codeOk) {
-      setAlert(reviewAlert,
-        "Mã số BHYT phải đủ 15 ký tự trước khi lưu. Vui lòng đối chiếu với thẻ rồi sửa lại.",
-        "error");
-      $("ma_so_bhyt").focus();
-      return;
-    }
-
-    const payload = {
-      ho_ten: $("ho_ten").value.trim(),
-      ma_so_bhyt: $("ma_so_bhyt").value.trim(),
-      ngay_sinh: $("ngay_sinh").value.trim() || null,
-      gioi_tinh: $("gioi_tinh").value || null,
-      noi_kham_chua_benh_ban_dau: $("noi_kham").value.trim() || null,
-      gia_tri_su_dung_tu: $("han_tu").value.trim() || null,
-      gia_tri_su_dung_den: $("han_den").value.trim() || null,
-      ghi_chu: $("ghi_chu").value.trim() || null
-    };
-
-    const original = saveBtn.innerHTML;
-    saveBtn.disabled = true;
-    saveBtn.innerHTML = '<span class="spinner"></span>Đang lưu...';
-
-    try {
-      const response = await fetch("/api/v1/bhyt/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const result = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        throw new Error(result.detail || "Không thể lưu thông tin.");
-      }
-
-      toast("✔ " + result.message, "success");
-
-      // Surface anything the patient should still double-check before the record is used.
-      const followUps = (result.warnings || []).filter((w) => w !== "");
-      setAlert(
-        reviewAlert,
-        "Mã hồ sơ: " + result.record.id +
-          (followUps.length ? " — " + followUps.join(" | ") : ""),
-        followUps.length ? "info" : "error"
-      );
-    } catch (error) {
-      toast("✖ " + (error.message || "Lỗi khi lưu."), "error");
-    } finally {
-      saveBtn.disabled = false;
-      saveBtn.innerHTML = original;
-    }
   });
 
   $("btn-reset").addEventListener("click", () => {

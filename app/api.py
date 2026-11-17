@@ -20,7 +20,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from starlette.formparsers import MultiPartParser
 
 from app.core.config import (
@@ -41,14 +41,11 @@ from app.database.schedule_queries import (
 )
 from app.parsers.bhyt_vlm import (
     BhytData,
-    alias_camel_keys,
     extract_bhyt_from_bytes,
-    normalise_bhyt_payload,
-    normalise_insurance_code,
     optimize_image,
     validate_bhyt,
 )
-from app.services import ambient, bhyt_store
+from app.services import ambient
 from app.services.ambient import (
     ClinicalDraft,
     DiarizedTurn,
@@ -268,50 +265,6 @@ class BhytOcrResponse(BaseModel):
     image_preview: str
     image_size_kb: float
     raw_text: str = ""
-
-
-class BhytSaveRequest(BaseModel):
-    """Patient-confirmed payload coming back from the verification table.
-
-    Accepts either the Vietnamese snake_case keys or the camelCase keys used by
-    the React frontend / Spring Boot services; both are folded onto snake_case
-    before validation so a mixed payload from either client works unchanged.
-    """
-
-    ho_ten: str = Field(min_length=1, description="Họ tên bệnh nhân đã xác nhận")
-    ma_so_bhyt: str = Field(min_length=1, description="Mã số thẻ BHYT đã xác nhận")
-    ngay_sinh: Optional[str] = None
-    gioi_tinh: Optional[str] = None
-    ma_noi_dkkcb_ban_dau: Optional[str] = None
-    noi_kham_chua_benh_ban_dau: Optional[str] = None
-    gia_tri_su_dung_tu: Optional[str] = None
-    gia_tri_su_dung_den: Optional[str] = None
-    con_han: Optional[bool] = None
-    ghi_chu: Optional[str] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_camel_case(cls, value):
-        if isinstance(value, dict):
-            return alias_camel_keys(value)
-        return value
-
-    @field_validator("ma_so_bhyt")
-    @classmethod
-    def _clean_code(cls, value: str) -> str:
-        return normalise_insurance_code(value) or ""
-
-    @field_validator("ho_ten")
-    @classmethod
-    def _clean_name(cls, value: str) -> str:
-        return " ".join(value.split())
-
-
-class BhytSaveResponse(BaseModel):
-    success: bool = True
-    message: str
-    warnings: list[str] = Field(default_factory=list)
-    record: dict
 
 
 class PipelineFileInfo(BaseModel):
@@ -1085,7 +1038,6 @@ async def health_check():
         "status": "ok",
         "service": "Smart Clinic AI Gateway",
         "vlm_model": _runtime_model("vlm_model", settings.VLM_MODEL_ID),
-        "confirmed_records": bhyt_store.count_records(),
     }
 
 
@@ -1154,31 +1106,6 @@ async def chat_alias(file: UploadFile = File(...)):
         return await _run_ocr(file)
     finally:
         await file.close()
-
-
-@app.post("/api/v1/bhyt/save", response_model=BhytSaveResponse)
-async def save_bhyt_record(payload: BhytSaveRequest):
-    """Persist the payload the patient confirmed in the verification table."""
-    data = normalise_bhyt_payload(payload.model_dump())
-    if not data.ho_ten:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Họ và tên không được để trống.",
-        )
-    if not data.ma_so_bhyt:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Mã số BHYT không được để trống.",
-        )
-
-    warnings = validate_bhyt(data)
-    record = bhyt_store.save_confirmed_record(data.model_dump())
-
-    return BhytSaveResponse(
-        message="Đã xác nhận và lưu thông tin thẻ BHYT thành công.",
-        warnings=warnings,
-        record=record,
-    )
 
 
 class _LogCollector(logging.Handler):
@@ -2182,21 +2109,6 @@ class KnowledgeDocDeleteResponse(BaseModel):
     message: str
 
 
-class OcrLogItem(BaseModel):
-    id: str
-    documentType: str = "BHYT_CARD"
-    patientName: str = ""
-    extractedId: str = ""
-    confidenceScore: int = 0
-    timestamp: str = ""
-    status: str = "SUCCESS"
-
-
-class OcrLogsResponse(BaseModel):
-    logs: list[OcrLogItem] = Field(default_factory=list)
-    total: int = 0
-
-
 KNOWLEDGE_DOCS_SQL = """
 SELECT doc_id, specialty, target_audience, COUNT(*) AS chunk_count, MIN(created_at) AS created_at
 FROM clinic_knowledge_nodes
@@ -2210,10 +2122,6 @@ FROM clinic_knowledge_nodes
 WHERE doc_id = %s
 ORDER BY id ASC;
 """
-
-#: OCR audit rows kept for the dashboard (newest first).
-OCR_LOG_LIMIT = 50
-
 
 def _infrastructure_health(settings) -> dict[str, dict[str, Any]]:
     """Probe ai_gateway / pgvector / embedding_engine without ever raising."""
@@ -2490,63 +2398,6 @@ async def delete_knowledge_doc(doc_id: str):
     message = f"Purged {deleted} chunks for document '{doc_id}'"
     logger.info(message)
     return KnowledgeDocDeleteResponse(success=True, message=message)
-
-
-def _to_ocr_log(record: dict, index: int) -> dict[str, Any]:
-    """Map one confirmed_bhyt.jsonl record onto the dashboard audit row."""
-    verified = bool(record.get("isOcrVerified"))
-    in_validity = bool(record.get("con_han"))
-    return {
-        "id": str(record.get("id") or f"record-{index}"),
-        "documentType": "BHYT_CARD",
-        "patientName": str(record.get("ho_ten") or ""),
-        "extractedId": str(
-            record.get("ma_so_bhyt_formatted") or record.get("ma_so_bhyt") or ""
-        ),
-        "confidenceScore": 99 if verified else 80,
-        "timestamp": str(record.get("created_at") or ""),
-        "status": "SUCCESS" if in_validity else "FLAGGED_FOR_REVIEW",
-    }
-
-
-def _read_ocr_logs(path: Path) -> list[dict[str, Any]]:
-    """Parse confirmed_bhyt.jsonl newest-first, capped at OCR_LOG_LIMIT rows."""
-    parsed: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed JSON line in %s:%d", path.name, line_no)
-                continue
-            if isinstance(record, dict):
-                parsed.append(record)
-
-    parsed.reverse()
-    return [_to_ocr_log(record, index) for index, record in enumerate(parsed[:OCR_LOG_LIMIT])]
-
-
-@app.get("/api/v1/admin/ocr-logs", response_model=OcrLogsResponse)
-async def list_ocr_logs():
-    """Real OCR audit telemetry read from data/bhyt_records/confirmed_bhyt.jsonl."""
-    path = bhyt_store.records_path()
-    if not path.exists():
-        logger.info("Chưa có file audit OCR tại %s", path)
-        return OcrLogsResponse(logs=[], total=0)
-
-    try:
-        logs = await asyncio.to_thread(_read_ocr_logs, path)
-    except OSError as exc:
-        logger.exception("Không đọc được file audit OCR: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Không đọc được confirmed_bhyt.jsonl: {exc}",
-        ) from exc
-
-    return OcrLogsResponse(logs=logs, total=len(logs))
 
 
 if __name__ == "__main__":

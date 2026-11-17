@@ -1,1 +1,1 @@
-"""Persistence for patient-confirmed BHYT records."""
+"""Service layer for clinical and ambient consultation helpers."""
