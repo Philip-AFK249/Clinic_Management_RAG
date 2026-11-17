@@ -46,13 +46,13 @@ _MAX_FIELD_CHARS = 2000
 
 #: Token budget for every ambient JSON completion: short outputs serialise
 #: fast, and a runaway generation cannot stall the consultation.
-AMBIENT_MAX_COMPLETION_TOKENS = 600
+AMBIENT_MAX_COMPLETION_TOKENS = 1200
 
 #: Budget for the ONE single-pass completion: complaints + red flags + SOAP +
 #: ICD-10 + prescription in a single object needs more room than the old
 #: per-step budget, but still a hard ceiling so a runaway generation cannot
 #: stall the consultation.
-SINGLE_PASS_MAX_COMPLETION_TOKENS = 800
+SINGLE_PASS_MAX_COMPLETION_TOKENS = 1800
 
 #: Reasoning effort for the reasoning models this pipeline targets. gpt-oss
 #: burns its completion budget on hidden reasoning first (600+ tokens at the
@@ -434,10 +434,13 @@ Bắt buộc:
 2. Giữ nguyên phần hồ sơ không bị ảnh hưởng; chỉ sửa những gì phản hồi yêu cầu.
 3. Cập nhật plan: chỉ định xét nghiệm, điều trị, theo dõi, tái khám theo thông tin mới.
 4. prescription_draft CHỈ dùng drugId có trong [THUỐC TRONG KHO]; loại thuốc bệnh nhân dị ứng/đang chống chỉ định; quantity tính theo tổng thời gian điều trị.
-5. ICD-10 có thật, đúng định dạng, đúng một isPrimary=true, aiConfidence 0-100.
+5. ICD-10 có thật, đúng định dạng, đúng một isPrimary=true, aiConfidence 0-100. Khi soap_note.assessment có nhắc đến chẩn đoán hoặc mã ICD-10, BẮT BUỘC xuất chẩn đoán đó trong "diagnoses" với đầy đủ {"icd10Code": "...", "diseaseName": "...", "isPrimary": true, "aiConfidence": 90}; TUYỆT ĐỐI KHÔNG trả "diagnoses": [] khi assessment đã có chẩn đoán lâm sàng.
 6. Trả về JSON NHỎ: chỉ đưa vào những mục THAY ĐỊNH (assistant_message luôn có);
    bỏ qua hoàn toàn soap_note / diagnoses / prescription_draft không đổi - hệ thống
-   tự giữ nguyên phần hồ sơ cũ đó. Không diễn đạt lại nội dung không thay đổi."""
+   tự giữ nguyên phần hồ sơ cũ đó. Không diễn đạt lại nội dung không thay đổi.
+   NGOẠI LỆ BẮT BUỘC: nếu bác sĩ yêu cầu gợi ý chẩn đoán/đơn thuốc, hoặc [HỒ SƠ TRƯỚC]
+   chưa có diagnoses, hoặc assessment có chẩn đoán/ICD-10, phải trả về ĐẦY ĐỦ cả mảng
+   "diagnoses" và "prescription_draft" đã cập nhật (không được bỏ qua hai mục này)."""
 
 #: The gateway's ONLY clinical LLM call: one prompt that replaces the old
 #: diarization + red-flag + synthesis chain (DIARIZATION_SYSTEM_PROMPT,
@@ -462,8 +465,8 @@ Bắt buộc:
 3. symptoms: triệu chứng cụ thể kèm thời gian nếu nghe được, tối đa 12 mục.
 4. has_red_flags: true CHỈ khi có dấu hiệu đe dọa tính mạng - sốc phản vệ, phản ứng thuốc nặng (Stevens-Johnson / toxic epidermal necrolysis), nhiễm trùng cơ hội (HIV, Lao, zona diện rộng / nhiều rễ da), sốt kéo dài không rõ nguyên nhân kèm gầy sút cân, ho khạc đờm lẫn máu, đau ngực dữ dội, khó thở nặng, lú lẫn. red_flag_alert = cảnh báo chi tiết cho bác sĩ (tiếng Việt, có thể mở đầu bằng "⚠️"); recommended_inquiry = MỘT câu nên hỏi bệnh nhân ngay; matched_patterns = các dấu hiệu khớp (ngắn gọn). Không có → false, chuỗi rỗng, mảng rỗng. Không kết luận chắc chắn bệnh, chỉ cảnh báo để khai thác thêm.
 5. soap_note: subjective = lời bệnh nhân tự kể + bệnh sử; objective BẮT BUỘC mở đầu nguyên văn khối [DẤU HIỆU SINH TỒN] trong [HỒ SƠ LÂM SÀNG] (ví dụ "HA: 190/110, Mạch: 95 ck/p, SpO2: 88%, Nhiệt độ: 38.5°C"), rồi mới ghi tiếp thăm khám khách quan nghe được trong hội thoại (không có thì ghi "Chưa có thông tin"); assessment = chẩn đoán phân biệt; plan = chỉ định xét nghiệm, điều trị, theo dõi, tái khám. Tiếng Việt y khoa, không đoán thừa.
-6. diagnoses: CHỈ mã ICD-10 có thật, đúng định dạng (chữ + 2 chữ số, ví dụ B02.9, J06.9, L51.2, B20); đúng một isPrimary=true (chẩn đoán chính); aiConfidence integer 0-100. Không tự bịa mã.
-7. prescription_draft: CHỈ thuốc có trong [THUỐC TRONG KHO] và đúng drugId của danh sách đó; tuyệt đối không kê thuốc ngoài kho. Tôn trọng [DỊ ỨNG] (dị ứng Penicillin thì không được kê Amoxicillin/Cephalosporin). Tôn trọng cảnh báo [CỜ ĐỎ]/[TƯƠNG TÁC]: nếu thuốc có nguy cơ thì ghi chú vào plan thay vì kê. Ưu tiên thuốc còn tồn kho tốt. routeFrequency: ví dụ "Uống 3 lần/ngày sau ăn"; duration: "7 ngày"; quantity = tổng số viên/ml cho toàn bộ thời gian điều trị (vd 3 lần/ngày x 7 ngày = 21 viên).
+6. diagnoses: CHỈ mã ICD-10 có thật, đúng định dạng (chữ + 2 chữ số, ví dụ B02.9, J06.9, L51.2, B20); đúng một isPrimary=true (chẩn đoán chính); aiConfidence integer 0-100. Không tự bịa mã. Khi soap_note.assessment có nhắc đến bất kỳ chẩn đoán hoặc mã ICD-10 nào, BẮT BUỘC xuất lại đúng chẩn đoán đó trong "diagnoses" với cấu trúc [{"icd10Code": "...", "diseaseName": "...", "isPrimary": true, "aiConfidence": 90}]. TUYỆT ĐỐI KHÔNG trả "diagnoses": [] khi assessment đã có chẩn đoán lâm sàng.
+7. prescription_draft: CHỈ thuốc có trong [THUỐC TRONG KHO] và đúng drugId của danh sách đó; tuyệt đối không kê thuốc ngoài kho. Nếu assessment có chẩn đoán cần điều trị bằng thuốc, BẮT BUỘC điền "prescription_draft" bằng các thuốc có drugId hợp lệ trong [THUỐC TRONG KHO]; không để [] khi có chỉ định dùng thuốc. Tôn trọng [DỊ ỨNG] (dị ứng Penicillin thì không được kê Amoxicillin/Cephalosporin). Tôn trọng cảnh báo [CỜ ĐỎ]/[TƯƠNG TÁC]: nếu thuốc có nguy cơ thì ghi chú vào plan thay vì kê. Ưu tiên thuốc còn tồn kho tốt. routeFrequency: ví dụ "Uống 3 lần/ngày sau ăn"; duration: "7 ngày"; quantity = tổng số viên/ml cho toàn bộ thời gian điều trị (vd 3 lần/ngày x 7 ngày = 21 viên).
 8. Thiếu dữ kiện thì ghi "Chưa có thông tin", không bịa. Trả về đúng MỘT đối tượng JSON thuần (bắt đầu bằng '{', kết thúc bằng '}'), không markdown, không văn bản ngoài JSON."""
 
 
@@ -823,6 +826,91 @@ def sanitise_soap(raw: Any) -> SoapNote:
     )
 
 
+_ICD10_SCAN_RE = re.compile(
+    r"(?<![A-Za-z0-9.])([A-TV-Z][0-9][0-9AB](?:\.[0-9A-TV-Z]{1,4})?)(?![A-Za-z0-9.])",
+    re.IGNORECASE,
+)
+
+_DIAGNOSIS_BOUNDARY_RE = re.compile(r"[\n\r;|]+")
+
+_DIAGNOSIS_PREFIX_RE = re.compile(
+    r"^(?:chẩn\s*đoán(?:\s+(?:chính|phụ|phân\s*biệt|sơ\s*bộ|xác\s*định|ban\s*đầu))?"
+    r"|mã(?:\s+icd-?10)?|icd-?10)\s*[:\-–—]?\s*",
+    re.IGNORECASE,
+)
+
+_DIAGNOSIS_TRIM_RE = re.compile(r"^[\s:;,\-–—=()\[\].]+|[\s:;,\-–—=()\[\].]+$")
+
+_DIAGNOSIS_CONTINUATION_RE = re.compile(
+    r"^(?:,|;|\)|\]|\bvà\b|\bhoặc\b|\bkèm\b)", re.IGNORECASE
+)
+
+_DIAGNOSIS_CONJUNCTION_RE = re.compile(r"^(?:và|hoặc|kèm)\s+", re.IGNORECASE)
+
+
+def _clean_diagnosis_name(text: str, *, from_end: bool = False) -> str:
+    """Trim a fragment of the assessment down to an adjacent disease name."""
+    parts = _DIAGNOSIS_BOUNDARY_RE.split(text or "")
+    chunk = parts[-1] if from_end else parts[0]
+    chunk = _DIAGNOSIS_TRIM_RE.sub("", chunk)
+    chunk = _DIAGNOSIS_PREFIX_RE.sub("", chunk)
+    chunk = _DIAGNOSIS_CONJUNCTION_RE.sub("", chunk)
+    chunk = _DIAGNOSIS_TRIM_RE.sub("", chunk)
+    return " ".join(chunk.split())[:240]
+
+
+def _extract_diagnoses_from_assessment(assessment: str) -> list[IcdDiagnosis]:
+    """Recover structured ICD-10 items the model only wrote in the SOAP note.
+
+    Some model replies mention real ICD-10 codes inside ``soap_note.assessment``
+    but leave the ``diagnoses`` array empty. Scanning that text keeps the
+    frontend's diagnosis selector populated instead of showing nothing.
+    """
+    text = (assessment or "").strip()
+    if not text:
+        return []
+
+    matches = [
+        match
+        for match in _ICD10_SCAN_RE.finditer(text)
+        if ICD10_RE.match(match.group(1).upper())
+    ]
+    diagnoses: list[IcdDiagnosis] = []
+    seen: set[str] = set()
+    for index, match in enumerate(matches):
+        code = match.group(1).upper()
+        if code in seen:
+            continue
+
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        start = matches[index - 1].end() if index > 0 else 0
+        after_raw = text[match.end():end]
+        before_raw = text[start:match.start()]
+        after_name = _clean_diagnosis_name(after_raw)
+        before_name = _clean_diagnosis_name(before_raw, from_end=True)
+
+        # "Tên bệnh CODE" puts the name before the code, while "CODE - Tên bệnh"
+        # puts it after. A comma/conjunction right after the code means the next
+        # diagnosis starts there, so the adjacent name is the one before it.
+        if _DIAGNOSIS_CONTINUATION_RE.match(after_raw.lstrip()):
+            name = before_name or after_name
+        else:
+            name = after_name or before_name
+        if not name:
+            name = f"Chẩn đoán {code}"
+
+        seen.add(code)
+        diagnoses.append(
+            IcdDiagnosis(
+                icd10Code=code,
+                diseaseName=name,
+                isPrimary=not diagnoses,
+                aiConfidence=85 if not diagnoses else 80,
+            )
+        )
+    return diagnoses
+
+
 def sanitise_diagnoses(raw: Any) -> tuple[list[IcdDiagnosis], list[str]]:
     """Validate ICD-10 codes/confidence and enforce exactly one primary."""
     warnings: list[str] = []
@@ -1126,6 +1214,8 @@ def single_pass_ambient_synthesis(
     warnings: list[str] = []
     soap_note = sanitise_soap(payload.get("soap_note"))
     diagnoses, diagnosis_warnings = sanitise_diagnoses(payload.get("diagnoses"))
+    if not diagnoses:
+        diagnoses = _extract_diagnoses_from_assessment(soap_note.assessment)
     warnings.extend(diagnosis_warnings)
     prescription, rx_warnings = reconcile_prescription(payload.get("prescription_draft"), drugs)
     warnings.extend(rx_warnings)
@@ -1254,6 +1344,9 @@ def apply_revision_payload(
         )
         warnings.append("Mô hình không trả về đơn thuốc mới; giữ nguyên dự thảo cũ.")
     warnings.extend(rx_warnings)
+
+    if not diagnoses:
+        diagnoses = _extract_diagnoses_from_assessment(soap_note.assessment)
 
     return ClinicalDraft(
         soap_note=soap_note,
