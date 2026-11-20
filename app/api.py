@@ -11,6 +11,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
@@ -161,7 +162,10 @@ VOICE_STT_PROMPT = (
     "Khám bệnh, đau thắt ngực, khó thở, huyết áp, hồi hộp, tim mạch, sốt cao, "
     "ho khạc đờm, ho khan, đau rát họng, khò khè, hen suyễn, sổ mũi, viêm xoang, "
     "dị ứng, nổi mẩn đỏ, ngứa ngáy, mụn nước, dát sẩn, vảy nến, zona, sốc phản vệ, "
-    "mề đay, tê bàn chân, tiêu chảy, nôn ói."
+    "mề đay, tê bàn chân, tiêu chảy, nôn ói, "
+    "tiểu buốt, tiểu rắt, nước tiểu đục, đau hông lưng, leo cầu thang, hồi hộp, "
+    "tim đập nhanh, thở không ra hơi, khàn tiếng, mất tiếng, khô họng, rát họng, "
+    "ho khan, nổi mẩn đỏ, ngứa ngáy."
 )
 
 VOICE_TRIAGE_SYSTEM_PROMPT = """Bạn là trợ lý phân loại triệu chứng lâm sàng tại phòng tiếp đón.
@@ -183,9 +187,10 @@ Quy tắc bắt buộc:
    - department_id = khoa có mức nguy cơ/độ khẩn cao NHẤT trong các khoa liên quan; priority_level theo chính khoa đó.
      Ví dụ: đau ngực dữ dội lan cánh tay + ngứa mụn nước bắp chân → department_id 1, priority_level "P1", secondary_department_id 3.
    - secondary_department_id = khoa phụ (khoa còn lại) và secondary_department_name đúng tên khoa phụ đó.
-   - Nếu triệu chứng chỉ nằm ở MỘT chuyên khoa: secondary_department_id = null, secondary_department_name = null, multi_specialty_note = "".
-   - Nếu hai triệu chứng cùng mức ưu tiên, chọn triệu chứng nguy hiểm/gây tàn phế hơn làm khoa chính.
-    - multi_specialty_note: 1 câu tiếng Việt nêu hướng xử trí (khoa nào xử trí trước, khoa nào hội chẩn sau).
+    - Nếu triệu chứng chỉ nằm ở MỘT chuyên khoa: secondary_department_id = null, secondary_department_name = null, multi_specialty_note = "".
+    - Nếu hai triệu chứng cùng mức ưu tiên, chọn triệu chứng nguy hiểm/gây tàn phế hơn làm khoa chính.
+    - TRƯỜNG HỢP 3 CHUYÊN KHOA (bệnh nhân kể lan man): ví dụ khó thở gắng sức/hồi hộp/tim đập nhanh kèm tiểu buốt/nước tiểu đục (Khoa 1) + sốt/viêm họng/khàn tiếng (Khoa 2) + nổi mẩn đỏ/ngứa ngáy (Khoa 3). Bắt buộc: department_id = 1 (chuyên khoa nguy cơ cao nhất), priority_level = "P2" nếu KHÔNG có dấu hiệu P1; secondary_department_id = 2 (chuyên khoa khẩn cấp kế tiếp; nếu không có cụm hô hấp/TMH mà chỉ có da liễu thì chọn 3).
+    - multi_specialty_note PHẢI liệt kê TẤT CẢ các cụm cơ quan đã phát hiện (kể cả cụm phụ) VÀ thứ tự hội chẩn. Không được bỏ sót cụm nào chỉ vì đang hỏi làm rõ.
 8. LÀM RÕ THÍCH ỨNG 1-4 LƯỢT (Claude-style progressive narrowing):
    - KHÔNG ép số lượt hỏi. Nếu lời kể ban đầu hoặc sau 1-2 câu trả lời đã làm rõ kiểu triệu chứng, mức nguy cơ và nhóm tuổi, hãy đặt needs_clarification=false và trả kết quả cuối ngay.
    - Chỉ đặt needs_clarification=true khi round_index <= 4, KHÔNG có dấu hiệu P1 và còn bị thiếu thông tin lâm sàng quan trọng, cụ thể: (a) chưa có [NHÓM TUỔI ĐÃ XÁC NHẬN] trong khi tuổi làm đổi mức nguy cơ hoặc chọn đúng dòng trong [NGỮ CẢNH TRIỆU CHỨNG]; (b) cần chi tiết phân biệt giữa các bệnh đang được gợi ý trong ngữ cảnh (tính chất đau, khởi phát/thời gian, sốt, phát ban, khó thở, tiền sử liên quan) hoặc cần làm rõ triệu chứng lạ ngoài tập dữ liệu.
@@ -200,14 +205,21 @@ Quy tắc bắt buộc:
     - Đặt is_out_of_dataset=true và flag_reason="NEW_SYMPTOM_PATTERN" khi lời kể không được [NGỮ CẢNH TRIỆU CHỨNG] bao phủ rõ ràng dù vẫn có thể gán gần đúng vào một trong 3 khoa.
     - Ví dụ: "nhìn mờ và thấy đốm đen trước mắt" → is_out_of_dataset=true, flag_reason="OUT_OF_SPECIALTY", icd10_code="H35.3" hoặc "H43.9", disease_guess="Đục dịch kính / Tổn thương võng mạc nghi ngờ (Chuyên khoa Mắt)", department_id vẫn là 1/2/3 gần nhất.
     - Nếu triệu chứng đã có trong ngữ cảnh và nằm đúng chuyên khoa 1/2/3, đặt is_out_of_dataset=false và flag_reason="".
+13. KHÔNG BAO GIỜ TRẢ VỀ GỢI Ý TRỐNG, kể cả khi needs_clarification=true:
+    - Dù đang hỏi làm rõ, BẮT BUỘC điền có nghĩa các trường: disease_guess, icd10_code, department_id, department_name, priority_level, chief_complaint_summary, secondary_department_id, secondary_department_name, multi_specialty_note. Đây là "preliminary triage banner" được hiển thị NGAY cho bệnh nhân trong lúc chờ trả lời 1-4 câu hỏi.
+    - Không được trả về chuỗi rỗng/null cho các trường trên (ngoại trừ secondary_department_id/secondary_department_name=null và multi_specialty_note="" khi chỉ có đúng một chuyên khoa). Hãy dùng phán đoán lâm sàng tốt nhất từ lời kể hiện có, KHÔNG chờ câu trả lời để điền.
 
 Định dạng JSON bắt buộc:
 {"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
-Khi needs_clarification=true, clarification_options phải có 2-4 phần tử đúng dạng {"id": "opt_...", "label": "...", "category": "...", "age_group_value": ...}.
+Khi needs_clarification=true, clarification_options phải có 2-4 phần tử đúng dạng {"id": "opt_...", "label": "...", "category": "...", "age_group_value": ...}. 9 trường phán đoán lâm sàng ở trên vẫn BẮT BUỘC có giá trị, không được để trống.
 
 Ví dụ đầu ra khi đa chuyên khoa:
 
-{"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu.", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}"""
+{"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu.", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
+
+Ví dụ khi cần làm rõ nhưng vẫn có preliminary banner (3 chuyên khoa):
+
+{"disease_guess": "Khó thở gắng sức/Nhiễm đường tiết niệu nghi ngờ / Kèm viêm họng và viêm da dị ứng", "icd10_code": "R07.9", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P2", "chief_complaint_summary": "Khó thở khi leo cầu thang, hồi hộp tim đập nhanh, tiểu buốt nước tiểu đục, kèm khàn tiếng và nổi mẩn ngứa", "secondary_department_id": 2, "secondary_department_name": "Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng", "multi_specialty_note": "Các cụm triệu chứng: (1) Tim mạch/Tiết niệu: khó thở gắng sức, hồi hộp, tiểu buốt, nước tiểu đục; (2) Hô hấp/TMH: sốt, khàn tiếng, khô họng; (3) Da liễu: nổi mẩn đỏ, ngứa ngáy. Thứ tự xử trí: Khoa 1 trước, sau đó hội chẩn Khoa 2, cuối cùng Khoa 3.", "needs_clarification": true, "clarifying_question": "Bạn bao nhiêu tuổi và khó thở xuất hiện từ lúc nào ạ?", "clarification_options": [{"id": "opt_age_adult", "label": "Tôi 16-59 tuổi", "category": "age_group", "age_group_value": "nguoi_truong_thanh"}, {"id": "opt_age_senior", "label": "Tôi từ 60 tuổi trở lên", "category": "age_group", "age_group_value": "nguoi_cao_tuoi"}], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}"""
 
 # ---------------------------------------------------------------------------
 # Runtime model configuration (admin dashboard - hot swappable, no restart)
@@ -692,21 +704,206 @@ _FALLBACK_TRIAGE_CONTEXT = (
 )
 
 
+_LONG_TRANSCRIPT_CHARS = 180
+_CLINICAL_QUERY_MAX_CHARS = 1000
+
+#: Whisper's most frequent Vietnamese homophone slips in clinical narratives.
+#: Both the accented form and its tone-mark-less form are mapped so a transcript
+#: with or without diacritics still yields the same high-signal search terms.
+_VOICE_TYPO_CORRECTIONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), replacement)
+    for pattern, replacement in (
+        (r"\bkhô\s+hộp\b", "khô họng"),
+        (r"\bkho\s+hop\b", "khô họng"),
+        (r"\bho\s+khang\b", "ho khan"),
+        (r"\bđeo\s+khẩu\s+thang\b", "leo cầu thang"),
+        (r"\bdeo\s+khau\s+thang\b", "leo cầu thang"),
+        (r"\bcảm\s+thấy\s+bút\b", "tiểu buốt"),
+        (r"\bcam\s+thay\s+but\b", "tiểu buốt"),
+        (r"\btiểu\s+bút\b", "tiểu buốt"),
+        (r"\btieu\s+but\b", "tiểu buốt"),
+        (r"\bchữ\s+chứng\b", "triệu chứng"),
+        (r"\bchu\s+chung\b", "triệu chứng"),
+    )
+)
+
+_CLINICAL_QUERY_KEYWORDS = (
+    "đau", "sốt", "ho", "khó thở", "thở", "khò khè", "hen", "sổ mũi", "viêm",
+    "dị ứng", "nổi mẩn", "mẩn đỏ", "mẩn ngứa", "nổi mụn", "ngứa", "mụn",
+    "dát sẩn", "vảy nến", "zona", "sốc phản vệ", "mề đay", "tê", "tiêu chảy",
+    "nôn", "ói", "buồn nôn", "mệt", "chóng mặt", "tức ngực", "hồi hộp",
+    "tim", "huyết áp", "tiểu", "nước tiểu", "đục", "buốt", "rắt", "hông",
+    "lưng", "leo cầu thang", "khàn", "mất tiếng", "khô họng", "rát họng",
+    "đờm", "chảy máu", "đi cầu", "phân đen", "lơ mơ", "ngất", "co giật",
+    "méo miệng", "liệt", "nói đớ", "phát ban", "bọng nước", "ghẻ", "nấm",
+    "khó chịu", "réo tai", "chảy nước mũi", "đau họng", "nuốt", "khạc",
+    "run", "đánh trống ngực",
+)
+_CLINICAL_QUERY_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;.!?\n]+|\b(?:và|rồi|xong|mà|còn|nữa|cũng|với|cùng|nên|thì|vì|do)\b",
+    re.IGNORECASE,
+)
+
+
+def _fold_vietnamese_for_match(value: str) -> str:
+    """Drop tone marks (and fold đ->d) so keyword checks survive STT slips."""
+    lowered = (value or "").lower().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFD", lowered)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+_CLINICAL_SIGNAL_RE = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(_fold_vietnamese_for_match(keyword))
+        for keyword in sorted(_CLINICAL_QUERY_KEYWORDS, key=len, reverse=True)
+    )
+    + r")\b"
+)
+
+
+def _normalise_voice_typos(text: str) -> str:
+    """Apply the known Whisper homophone fixes without dropping any clause."""
+    normalised = " ".join((text or "").split())
+    for pattern, replacement in _VOICE_TYPO_CORRECTIONS:
+        normalised = pattern.sub(replacement, normalised)
+    return normalised
+
+
+def _extract_clinical_search_query(raw_text: str) -> str:
+    """Condense a rambling transcript into high-signal symptom terms for pgvector.
+
+    Whisper mishears clinical words as everyday homophones ("khô họng" -> "khô
+    hộp", "leo cầu thang" -> "đeo khẩu thang"), and long narratives bury those
+    symptoms between lifestyle chatter. The known confusions are corrected first;
+    for transcripts longer than ``_LONG_TRANSCRIPT_CHARS`` only clauses carrying
+    a clinical signal are kept, so "cơm hộp, trà sữa, tắm khuya" cannot dilute
+    the embedding that drives RAG retrieval.
+    """
+    text = _normalise_voice_typos(raw_text)
+    if not text:
+        return ""
+    if len(text) <= _LONG_TRANSCRIPT_CHARS:
+        return text[:_CLINICAL_QUERY_MAX_CHARS]
+
+    clauses = [
+        " ".join(part.split())
+        for part in _CLINICAL_QUERY_CLAUSE_SPLIT_RE.split(text)
+    ]
+    clinical = [
+        clause
+        for clause in clauses
+        if clause and _CLINICAL_SIGNAL_RE.search(_fold_vietnamese_for_match(clause))
+    ]
+    query = ", ".join(dict.fromkeys(clinical or clauses))
+    return (
+        query[:_CLINICAL_QUERY_MAX_CHARS].strip(" ,;")
+        or text[:_CLINICAL_QUERY_MAX_CHARS]
+    )
+
+
+#: (department_id, acuity rank, display label, folded-text pattern). Higher
+#: acuity wins the primary department; the runner-up in a different department
+#: becomes the secondary consult. Used as the deterministic backstop whenever
+#: the LLM omits the preliminary assessment while asking for clarification.
+_ORGAN_CLUSTER_PATTERNS: tuple[tuple[int, int, str, re.Pattern[str]], ...] = (
+    (
+        1, 4,
+        "Tim mạch / Nội khoa: khó thở gắng sức, hồi hộp, tim đập nhanh, đau tức ngực",
+        re.compile(
+            r"\b(?:leo cau thang|hoi hop|tim dap nhanh|danh trong nguc|tuc nguc"
+            r"|dau nguc|kho tho|tho khong ra hoi)\b"
+        ),
+    ),
+    (
+        1, 3,
+        "Tiết niệu: tiểu buốt, tiểu rắt, nước tiểu đục, đau hông lưng",
+        re.compile(
+            r"\b(?:tieu buot|tieu rat|nuoc tieu duc|dau hong lung|dau lung"
+            r"|cam thay but)\b"
+        ),
+    ),
+    (
+        2, 2,
+        "Hô hấp / Tai Mũi Họng: sốt, viêm họng, khàn tiếng, khô họng, ho khan",
+        re.compile(
+            r"\b(?:vien hong|sot|khan tieng|mat tieng|kho hong|rat hong"
+            r"|ho khan|dau hong|kho khe)\b"
+        ),
+    ),
+    (
+        3, 1,
+        "Da liễu: nổi mẩn đỏ, ngứa ngáy, phát ban",
+        re.compile(
+            r"\b(?:noi man do|ngua ngay|phat ban|man ngua|me day|mun nuoc"
+            r"|bong nuoc|dat san|ngua)\b"
+        ),
+    ),
+)
+
+_CLUSTER_DISEASE_FALLBACK = {
+    4: "Hội chứng đau ngực / Rối loạn nhịp nghi ngờ",
+    3: "Nhiễm đường tiết niệu nghi ngờ",
+    2: "Viêm họng / Viêm thanh quản nghi ngờ",
+    1: "Phát ban ngứa / Viêm da dị ứng nghi ngờ",
+}
+_CLUSTER_ICD10_FALLBACK = {4: "R07.9", 3: "N39.0", 2: "J02.9", 1: "R21"}
+
+
+def _detect_organ_clusters(raw_text: Optional[str]) -> list[tuple[int, int, str]]:
+    """List detected organ clusters, highest acuity first."""
+    folded = _fold_vietnamese_for_match(_normalise_voice_typos(raw_text or ""))
+    clusters: list[tuple[int, int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for department_id, acuity, label, pattern in _ORGAN_CLUSTER_PATTERNS:
+        if not pattern.search(folded):
+            continue
+        key = (department_id, label)
+        if key in seen:
+            continue
+        seen.add(key)
+        clusters.append((department_id, acuity, label))
+    return sorted(clusters, key=lambda item: item[1], reverse=True)
+
+
+def _build_multi_specialty_note(clusters: list[tuple[int, int, str]]) -> str:
+    """Explicitly name every cluster and the consult sequence, dropping none."""
+    labels = " ; ".join(
+        f"{index}. {label}"
+        for index, (_, _, label) in enumerate(clusters, 1)
+    )
+    sequence: list[int] = []
+    for department_id, _, _ in clusters:
+        if department_id not in sequence:
+            sequence.append(department_id)
+    names = [
+        f"Khoa {department_id} ({_DEPARTMENT_NAMES[department_id]})"
+        for department_id in sequence
+    ]
+    return (
+        f"Đã phát hiện {len(clusters)} cụm triệu chứng: {labels}. "
+        f"Thứ tự xử trí/hội chẩn đề xuất: {' -> '.join(names)}."
+    )
+
+
 def _retrieve_triage_context(
     transcription: str, settings, age_group: Optional[str] = None
 ) -> tuple[str, list[str], list[str], float]:
     """Stage 1b: age-filtered RAG chunks, or the built-in department summary.
 
-    The fallback is used only when pgvector is unreachable, retrieval throws, or
-    no row matched - triage must still work on an offline/clinic-local cluster.
+    Only the cleaned clinical query is embedded; the untouched ``transcription``
+    is still handed to the LLM in ``_extract_triage_facts``. The fallback is used
+    only when pgvector is unreachable, retrieval throws, or no row matched -
+    triage must still work on an offline/clinic-local cluster.
     """
     warnings: list[str] = []
+    search_query = _extract_clinical_search_query(transcription) or transcription
     if ambient.pgvector_reachable(settings):
         try:
             from app.rag.retriever import retrieve_context
 
             results = retrieve_context(
-                transcription,
+                search_query,
                 top_k=5,
                 target_audience="tiep_don",
                 age_group=age_group,
@@ -883,13 +1080,17 @@ def _sanitise_triage_payload(
     best_score: float = 1.0,
     round_index: int = 1,
     force_final: bool = False,
+    raw_text: Optional[str] = None,
 ) -> tuple[dict, list[str]]:
     """Validate the LLM's JSON against the clinical contract before using it.
 
     The LLM is untrusted: an out-of-range department, an unknown priority or a
     malformed ICD-10 code is corrected (and reported) rather than passed on.
+    ``raw_text`` lets the clinical backstop fill a preliminary banner whenever
+    the LLM asks for clarification but forgets to populate it.
     """
     warnings: list[str] = []
+    clusters = _detect_organ_clusters(raw_text)
 
     def _text(key: str, limit: int = 500) -> str:
         value = payload.get(key)
@@ -902,13 +1103,16 @@ def _sanitise_triage_payload(
     except (TypeError, ValueError):
         department_id = 0
     if department_id not in VALID_DEPARTMENT_IDS:
+        fallback_department = clusters[0][0] if clusters else 1
         warnings.append(
-            f"department_id không hợp lệ ({payload.get('department_id')!r}); mặc định về khoa 1."
+            f"department_id không hợp lệ ({payload.get('department_id')!r}); "
+            f"mặc định về khoa {fallback_department}."
         )
-        department_id = 1
+        department_id = fallback_department
 
     priority = _text("priority_level", 8).upper().replace(" ", "")
-    if priority not in VALID_PRIORITIES:
+    priority_was_missing = priority not in VALID_PRIORITIES
+    if priority_was_missing:
         # Bias towards urgency rather than down-triage an unparseable answer.
         warnings.append(
             f"priority_level không hợp lệ ({payload.get('priority_level')!r}); mặc định P2."
@@ -977,6 +1181,55 @@ def _sanitise_triage_payload(
                 "Để chúng tôi phân luồng đúng, bạn vui lòng chọn thêm thông tin bên dưới nhé."
             )
 
+    # A clarification round must never blank the preliminary triage banner.
+    # The prompt asks the LLM to fill these fields; this is the deterministic
+    # backstop for omissions, malformed JSON and 3-specialty rambling cases.
+    disease_guess = _text("disease_guess", 300)
+    chief_complaint_summary = _text("chief_complaint_summary", 400)
+    assessment_missing = not disease_guess or disease_guess == "Chưa xác định"
+    if clusters:
+        primary_department, primary_acuity, _ = clusters[0]
+        if needs_clarification and assessment_missing:
+            department_id = primary_department
+            department_name = _DEPARTMENT_NAMES[department_id]
+        if not disease_guess or disease_guess == "Chưa xác định":
+            disease_guess = " / ".join(
+                _CLUSTER_DISEASE_FALLBACK[acuity] for _, acuity, _ in clusters
+            )[:300]
+        if not chief_complaint_summary:
+            chief_complaint_summary = "; ".join(
+                label.split(": ", 1)[-1] for _, _, label in clusters
+            )[:400]
+        if not icd10:
+            icd10 = _CLUSTER_ICD10_FALLBACK.get(primary_acuity, "")
+        if priority_was_missing:
+            priority = "P2" if primary_acuity >= 2 else "P3"
+        if secondary_department_id is None:
+            secondary_department_id = next(
+                (
+                    department
+                    for department, _, _ in clusters[1:]
+                    if department != primary_department
+                ),
+                None,
+            )
+            secondary_department_name = (
+                _DEPARTMENT_NAMES[secondary_department_id]
+                if secondary_department_id is not None
+                else None
+            )
+        distinct_departments = list(dict.fromkeys(dept for dept, _, _ in clusters))
+        if len(distinct_departments) >= 2 and (needs_clarification or not multi_specialty_note):
+            deterministic_note = _build_multi_specialty_note(clusters)
+            multi_specialty_note = (
+                f"{multi_specialty_note} {deterministic_note}".strip()
+                if multi_specialty_note
+                else deterministic_note
+            )[:500]
+    if not chief_complaint_summary and raw_text:
+        chief_complaint_summary = _normalise_voice_typos(raw_text)[:400]
+    disease_guess = disease_guess or "Chưa xác định"
+
     raw_out = payload.get("is_out_of_dataset")
     is_out_of_dataset = raw_out is True or (
         isinstance(raw_out, str) and raw_out.strip().lower() in {"true", "1", "yes"}
@@ -999,12 +1252,12 @@ def _sanitise_triage_payload(
 
     return (
         {
-            "disease_guess": _text("disease_guess", 300) or "Chưa xác định",
+            "disease_guess": disease_guess,
             "icd10_code": icd10,
             "department_id": department_id,
             "department_name": department_name,
             "priority_level": priority,
-            "chief_complaint_summary": _text("chief_complaint_summary", 400),
+            "chief_complaint_summary": chief_complaint_summary,
             "secondary_department_id": secondary_department_id,
             "secondary_department_name": secondary_department_name,
             "multi_specialty_note": multi_specialty_note,
@@ -1119,6 +1372,7 @@ def _extract_triage_facts(
         best_score=best_score,
         round_index=round_index,
         force_final=has_p1,
+        raw_text=transcription,
     )
     if has_p1:
         if facts["priority_level"] != "P1":
@@ -1295,20 +1549,16 @@ def _build_base_advice(
     )
 
 
-def _run_voice_triage(
-    audio: bytes,
-    filename: str,
+def _run_triage_from_transcription(
+    transcription: str,
     target_date: Optional[str],
-    age_group: Optional[str] = None,
-    patient_history: Optional[str] = None,
+    age_group: Optional[str],
+    patient_history: Optional[str],
+    started: float,
+    settings,
 ) -> VoiceScheduleTriageResponse:
-    """Blocking two-stage body, executed off the event loop."""
-    started = time.perf_counter()
-    settings = get_settings()
+    """Stage 1 + Stage 2 shared verbatim by the voice and text triage routes."""
     age_group = _normalise_age_group(age_group)
-
-    transcription = _transcribe_voice(audio, filename, settings)
-    logger.info("STT (%d chars): %s", len(transcription), transcription[:120])
 
     context, sources, warnings, best_score = _retrieve_triage_context(
         transcription, settings, age_group=age_group
@@ -1349,6 +1599,25 @@ def _run_voice_triage(
     )
 
 
+def _run_voice_triage(
+    audio: bytes,
+    filename: str,
+    target_date: Optional[str],
+    age_group: Optional[str] = None,
+    patient_history: Optional[str] = None,
+) -> VoiceScheduleTriageResponse:
+    """Blocking two-stage body: Whisper STT, then the shared triage pipeline."""
+    started = time.perf_counter()
+    settings = get_settings()
+
+    transcription = _transcribe_voice(audio, filename, settings)
+    logger.info("STT (%d chars): %s", len(transcription), transcription[:120])
+
+    return _run_triage_from_transcription(
+        transcription, target_date, age_group, patient_history, started, settings
+    )
+
+
 class ClarificationOption(BaseModel):
     """One tappable chip offered when the spoken symptoms are ambiguous."""
 
@@ -1371,6 +1640,15 @@ class RefineTriageRequest(BaseModel):
     target_date: Optional[str] = None
     clarification_history: list[dict[str, str]] = Field(default_factory=list)
     round_index: int = Field(default=1, ge=1, le=5)
+
+
+class TextTriageRequest(BaseModel):
+    """Typed/edited transcript submitted instead of a Whisper recording."""
+
+    transcription: str = Field(min_length=1, description="Lời kể triệu chứng đã gõ/chỉnh sửa.")
+    target_date: Optional[str] = None
+    age_group: Optional[str] = None
+    patient_history: Optional[str] = None
 
 
 class VoiceScheduleTriageResponse(BaseModel):
@@ -1512,6 +1790,25 @@ def _complete_triage_with_schedule(
         warnings=warnings,
         latency_ms=latency_ms,
         **facts,
+    )
+
+
+def _run_text_triage(payload: TextTriageRequest) -> VoiceScheduleTriageResponse:
+    """Blocking text body: skip Whisper, then run the same Stage 1 + Stage 2."""
+    started = time.perf_counter()
+    settings = get_settings()
+    transcription = " ".join(payload.transcription.split())[:4000]
+    if not transcription:
+        raise ValueError("Thiếu nội dung lời kể cần phân tích.")
+    logger.info("Text triage (%d chars): %s", len(transcription), transcription[:120])
+
+    return _run_triage_from_transcription(
+        transcription,
+        payload.target_date,
+        payload.age_group,
+        payload.patient_history,
+        started,
+        settings,
     )
 
 
@@ -2200,6 +2497,26 @@ async def voice_schedule_triage(
         ) from exc
     finally:
         await file.close()
+
+
+@app.post("/api/v1/triage/text-schedule", response_model=VoiceScheduleTriageResponse)
+async def text_schedule_triage(payload: TextTriageRequest):
+    """Fully typed/edited transcript -> same RAG + LLM + schedule pipeline as voice."""
+    try:
+        return await asyncio.to_thread(_run_text_triage, payload)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        logger.warning("Text triage validation error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except Exception as exc:
+        logger.exception("Lỗi hệ thống khi xử lý text_schedule_triage: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi xử lý Text Triage: {str(exc)}",
+        ) from exc
 
 
 @app.post("/api/v1/triage/refine", response_model=VoiceScheduleTriageResponse)
