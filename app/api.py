@@ -102,6 +102,7 @@ VOICE_MAX_BYTES = 25 * 1024 * 1024  # Groq's per-file STT ceiling
 VALID_DEPARTMENT_IDS = (1, 2, 3)
 VALID_PRIORITIES = ("P1", "P2", "P3")
 TRIAGE_AGE_GROUPS = ("tre_em", "nguoi_truong_thanh", "nguoi_cao_tuoi", "tat_ca")
+MAX_CLARIFICATION_ROUNDS = 4
 OOD_SCORE_THRESHOLD = 0.52
 FLAG_REPORT_DOC_ID = "du_lieu_hoc_tang_cuong"
 FLAG_REPORT_RAW_PATH = RAW_DOCS_DIR / f"{FLAG_REPORT_DOC_ID}.md"
@@ -167,7 +168,7 @@ VOICE_TRIAGE_SYSTEM_PROMPT = """Bạn là trợ lý phân loại triệu chứng
 Nhiệm vụ: đọc lời kể của bệnh nhân và NGỮ CẢNH TRIỆU CHỨNG được cung cấp, rồi trả về đúng MỘT đối tượng JSON.
 
 Quy tắc bắt buộc:
-1. CHỈ dùng thông tin trong [NGỮ CẢNH TRIỆU CHỨNG] để suy ra bệnh và mã ICD-10. Nếu ngữ cảnh không nói, đặt icd10_code là chuỗi rỗng "" - TUYỆT ĐỐI không tự bịa mã bệnh. Dù triệu chứng lạ hoặc thuộc chuyên khoa khác, vẫn PHẢI chọn department_id 1/2/3 gần nhất, disease_guess và priority_level để tiếp đón không bị chặn.
+1. Với triệu chứng ĐÃ CÓ trong [NGỮ CẢNH TRIỆU CHỨNG], chỉ dùng ngữ cảnh để suy ra bệnh và mã ICD-10; nếu ngữ cảnh không nói thì đặt icd10_code="" thay vì tự bịa. Với triệu chứng NGOÀI ngữ cảnh hoặc thuộc chuyên khoa chưa cấu hình, hãy dùng kiến thức y khoa tổng quát để dự đoán icd10_code WHO hợp lý nhất và disease_guess tiếng Việt, KHÔNG được để trống icd10_code chỉ vì thiếu ngữ cảnh. Dù triệu chứng lạ hay thuộc chuyên khoa khác, vẫn PHẢI chọn department_id 1/2/3 gần nhất và priority_level để tiếp đón không bị chặn.
 2. department_id chỉ được là 1, 2 hoặc 3:
    - 1 = Khoa Nội Tổng quát & Tim mạch (tim mạch, tình trạng nội khoa nặng cấp tính, cấp cứu chuyển hóa)
    - 2 = Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng / Tai Mũi Họng (sốc phản vệ, hen phế quản, suy hô hấp cấp, tai mũi họng)
@@ -185,24 +186,27 @@ Quy tắc bắt buộc:
    - Nếu triệu chứng chỉ nằm ở MỘT chuyên khoa: secondary_department_id = null, secondary_department_name = null, multi_specialty_note = "".
    - Nếu hai triệu chứng cùng mức ưu tiên, chọn triệu chứng nguy hiểm/gây tàn phế hơn làm khoa chính.
     - multi_specialty_note: 1 câu tiếng Việt nêu hướng xử trí (khoa nào xử trí trước, khoa nào hội chẩn sau).
-8. LÀM RÕ KHI LỜI KỂ MƠ HỒ (chỉ áp dụng ở lượt đầu, khi chưa có [CÂU TRẢ LỜI LÀM RÕ]):
-   - Nếu bệnh nhân nói lang mang, mô tả mờ, kể nhiều triệu chứng không rõ cái nào là chính, hoặc thiếu độ tuổi / tiền sử để phân biệt nguy cơ thấp và cao (ví dụ người lớn tuổi chỉ nói "mệt, tức ngực" nhưng không rõ tuổi và không nói tiền sử tim mạch), hãy đặt needs_clarification=true.
-   - Khi cần làm rõ, chỉ viết MỘT câu clarifying_question ngắn gọn, đồng cảm bằng tiếng Việt và đưa 3-4 clarification_options cụ thể, dễ chạm: xác nhận nhóm tuổi (nếu chưa có [NHÓM TUỔI]), một mục tiền sử liên quan, và 1-2 mục phân biệt triệu chứng bằng ngôn ngữ đời thường, không dùng thuật ngữ y khoa.
-   - Mỗi option có id duy nhất, label ngắn gọn bằng tiếng Việt, category là "age_group" | "medical_history" | "symptom_detail"; option độ tuổi phải kèm age_group_value là "tre_em" | "nguoi_truong_thanh" | "nguoi_cao_tuoi" | "tat_ca".
-   - Không hỏi lại nếu [NHÓM TUỔI], [TIỀN SỬ] đã có và lời kể đã đủ rõ để phân luồng.
+8. LÀM RÕ THÍCH ỨNG 1-4 LƯỢT (Claude-style progressive narrowing):
+   - KHÔNG ép số lượt hỏi. Nếu lời kể ban đầu hoặc sau 1-2 câu trả lời đã làm rõ kiểu triệu chứng, mức nguy cơ và nhóm tuổi, hãy đặt needs_clarification=false và trả kết quả cuối ngay.
+   - Chỉ đặt needs_clarification=true khi round_index <= 4, KHÔNG có dấu hiệu P1 và còn bị thiếu thông tin lâm sàng quan trọng, cụ thể: (a) chưa có [NHÓM TUỔI ĐÃ XÁC NHẬN] trong khi tuổi làm đổi mức nguy cơ hoặc chọn đúng dòng trong [NGỮ CẢNH TRIỆU CHỨNG]; (b) cần chi tiết phân biệt giữa các bệnh đang được gợi ý trong ngữ cảnh (tính chất đau, khởi phát/thời gian, sốt, phát ban, khó thở, tiền sử liên quan) hoặc cần làm rõ triệu chứng lạ ngoài tập dữ liệu.
+   - Mỗi lượt chỉ hỏi MỘT câu clarifying_question ngắn gọn, đồng cảm bằng tiếng Việt, kèm 2-4 clarification_options cụ thể, dễ chạm, được thiết kế riêng từ [NGỮ CẢNH TRIỆU CHỨNG] và [LỊCH SỬ HỎI ĐÁP LÀM RÕ]. TUYỆT ĐỐI không lặp lại câu hỏi đã có trong lịch sử.
+   - Mỗi option phải có dạng {"id": "opt_...", "label": "...", "category": "age_group" | "medical_history" | "symptom_detail", "age_group_value": "tre_em" | "nguoi_truong_thanh" | "nguoi_cao_tuoi" | "tat_ca" | null}; label dùng tiếng đời thường, không dùng thuật ngữ y khoa khô khan.
+   - Khi round_index >= 4, luôn needs_clarification=false và chốt kết quả, dù thông tin vẫn chưa đầy đủ.
 9. ƯU TIÊN P1 GHI ĐÈ LÀM RÕ: nếu có dấu hiệu đe dọa tính mạng (đau ngực dữ dội/kéo dài, méo miệng/yếu nửa người/nói đớ, khó thở nặng, sốc phản vệ, nôn hoặc đi cầu ra máu), luôn đặt needs_clarification=false và priority_level="P1" ngay, KHÔNG bắt bệnh nhân chờ trả lời.
-10. LƯỢT TINH CHỈNH (khi prompt có [CÂU TRẢ LỜI LÀM RÕ]): luôn đặt needs_clarification=false; tổng hợp lời kể gốc, các câu đã chọn và ngữ cảnh lọc theo nhóm tuổi để trả về chẩn đoán cuối cùng.
-11. [NHÓM TUỔI], [TIỀN SỬ] và [CÂU TRẢ LỜI LÀM RÕ] trong prompt là thông tin đã xác nhận, được phép dùng để suy luận.
+10. LƯỢT TINH CHỈNH (khi prompt có [CÂU TRẢ LỜI LÀM RÕ]): nếu round_index < 4 và còn một chi tiết phân biệt thực sự quan trọng, được phép đặt needs_clarification=true để hỏi tiếp một câu MỚI; ngược lại hãy tổng hợp lời kể gốc, lịch sử hỏi đáp, các câu đã chọn và ngữ cảnh lọc theo nhóm tuổi để trả về chẩn đoán cuối cùng.
+11. [NHÓM TUỔI ĐÃ XÁC NHẬN], [TIỀN SỬ], [LỊCH SỬ HỎI ĐÁP LÀM RÕ] và [CÂU TRẢ LỜI LÀM RÕ] là thông tin đã xác nhận, được phép dùng để suy luận.
 12. PHÁT HIỆN TRIỆU CHỨNG NGOÀI TẬP DỮ LIỆU:
     - Đặt is_out_of_dataset=true và flag_reason="OUT_OF_SPECIALTY" khi lời kể rõ ràng thuộc chuyên khoa ngoài 3 khoa hiện có (Nha khoa, Mắt, Sản phụ khoa, Chỉnh hình, Tâm thần, Nhi khoa chuyên sâu...).
     - Đặt is_out_of_dataset=true và flag_reason="NEW_SYMPTOM_PATTERN" khi lời kể không được [NGỮ CẢNH TRIỆU CHỨNG] bao phủ rõ ràng dù vẫn có thể gán gần đúng vào một trong 3 khoa.
+    - Ví dụ: "nhìn mờ và thấy đốm đen trước mắt" → is_out_of_dataset=true, flag_reason="OUT_OF_SPECIALTY", icd10_code="H35.3" hoặc "H43.9", disease_guess="Đục dịch kính / Tổn thương võng mạc nghi ngờ (Chuyên khoa Mắt)", department_id vẫn là 1/2/3 gần nhất.
     - Nếu triệu chứng đã có trong ngữ cảnh và nằm đúng chuyên khoa 1/2/3, đặt is_out_of_dataset=false và flag_reason="".
 
 Định dạng JSON bắt buộc:
 {"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
-
+Khi needs_clarification=true, clarification_options phải có 2-4 phần tử đúng dạng {"id": "opt_...", "label": "...", "category": "...", "age_group_value": ...}.
 
 Ví dụ đầu ra khi đa chuyên khoa:
+
 {"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu.", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}"""
 
 # ---------------------------------------------------------------------------
@@ -844,7 +848,7 @@ def _sanitise_clarification_options(raw: object, age_group: Optional[str]) -> li
             if len(options) == 4:
                 break
 
-    if len(options) < 3:
+    if len(options) < 2:
         for fallback in _fallback_clarification_options(age_group):
             if len(options) >= 4:
                 break
@@ -854,11 +858,31 @@ def _sanitise_clarification_options(raw: object, age_group: Optional[str]) -> li
     return options
 
 
+def _clarification_turns(
+    history: Optional[list[dict[str, str]]],
+) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
+    for item in history or []:
+        if isinstance(item, dict):
+            question = " ".join(str(item.get("question") or "").split())[:300]
+            answer = " ".join(str(item.get("answer") or "").split())[:500]
+        elif isinstance(item, str):
+            question = ""
+            answer = " ".join(item.split())[:500]
+        else:
+            continue
+        if question or answer:
+            turns.append((question, answer))
+    return turns
+
+
 def _sanitise_triage_payload(
     payload: dict,
     is_refinement: bool = False,
     age_group: Optional[str] = None,
     best_score: float = 1.0,
+    round_index: int = 1,
+    force_final: bool = False,
 ) -> tuple[dict, list[str]]:
     """Validate the LLM's JSON against the clinical contract before using it.
 
@@ -935,7 +959,11 @@ def _sanitise_triage_payload(
     needs_clarification = raw_needs is True or (
         isinstance(raw_needs, str) and raw_needs.strip().lower() in {"true", "1", "yes"}
     )
-    if priority == "P1" or is_refinement:
+    if (
+        priority == "P1"
+        or force_final
+        or (is_refinement and round_index >= MAX_CLARIFICATION_ROUNDS)
+    ):
         needs_clarification = False
 
     clarifying_question = _text("clarifying_question", 240)
@@ -957,13 +985,15 @@ def _sanitise_triage_payload(
     valid_flag_reasons = {"OUT_OF_SPECIALTY", "NEW_SYMPTOM_PATTERN", "LOW_SIMILARITY_MATCH"}
     if flag_reason not in valid_flag_reasons:
         flag_reason = ""
+    explicit_reason = flag_reason
     if is_out_of_dataset and not flag_reason:
         flag_reason = "NEW_SYMPTOM_PATTERN"
     if not needs_clarification and (
         best_score < OOD_SCORE_THRESHOLD or (not icd10 and not is_out_of_dataset)
     ):
         is_out_of_dataset = True
-        flag_reason = "LOW_SIMILARITY_MATCH"
+        if not explicit_reason:
+            flag_reason = "LOW_SIMILARITY_MATCH"
     if not is_out_of_dataset:
         flag_reason = ""
 
@@ -1004,30 +1034,60 @@ def _extract_triage_facts(
     selected_clarifications: Optional[list[str]] = None,
     is_refinement: bool = False,
     best_score: float = 1.0,
+    clarification_history: Optional[list[dict[str, str]]] = None,
+    round_index: int = 1,
 ) -> tuple[dict, list[str]]:
     """Stage 1c: force the LLM into a single JSON object and validate it."""
     from app.rag.generator import get_groq_client
 
+    history_turns = _clarification_turns(clarification_history)
+    answers = [item for item in (selected_clarifications or []) if item]
+    has_p1 = _has_p1_red_flag(
+        " ".join([transcription, patient_history or "", *answers, *(a for _, a in history_turns)])
+    )
     prompt_parts = [
-        f"[NGỮ CẠNH TRIỆU CHỨNG]\n{context}",
+        f"[NGỮ CẢNH TRIỆU CHỨNG]\n{context}",
         f"[LỜI KỂ BỆNH NHÂN]\n{transcription}",
     ]
     if age_group:
         prompt_parts.append(f"[NHÓM TUỔI ĐÃ XÁC NHẬN]\n{AGE_GROUP_LABELS.get(age_group, age_group)}")
     if patient_history:
         prompt_parts.append(f"[TIỀN SỬ BỆNH NHÂN]\n{patient_history.strip()[:500]}")
+    if is_refinement or history_turns:
+        history_lines = [
+            f"- Q: {question or '(không rõ)'} -> A: {answer or '(không có)'}"
+            for question, answer in history_turns
+        ]
+        prompt_parts.append(
+            "[LỊCH SỬ HỎI ĐÁP LÀM RÕ]\n"
+            + ("\n".join(history_lines) or "- (không có)")
+        )
     if is_refinement:
-        answers = [item for item in (selected_clarifications or []) if item]
         prompt_parts.append(
             "[CÂU TRẢ LỜI LÀM RÕ]\n"
             + ("\n".join(f"- {answer[:300]}" for answer in answers) or "- (không có)")
-            + "\nĐây là lượt tinh chỉnh: hãy chốt kết quả cuối cùng, needs_clarification=false."
         )
+        if has_p1 or round_index >= MAX_CLARIFICATION_ROUNDS:
+            mode = (
+                f"[CHẾ ĐỘ LƯỢT LÀM RÕ]\nround_index={round_index}/{MAX_CLARIFICATION_ROUNDS}. "
+                "Đây là lượt chốt hoặc có dấu hiệu P1: bắt buộc needs_clarification=false, "
+                "tổng hợp mọi thông tin đã có để trả kết quả cuối cùng."
+            )
+        else:
+            mode = (
+                f"[CHẾ ĐỘ LƯỢT LÀM RÕ]\nround_index={round_index}/{MAX_CLARIFICATION_ROUNDS}. "
+                "Nếu còn đúng một chi tiết lâm sàng quan trọng chưa biết, được phép đặt "
+                "needs_clarification=true và hỏi tiếp MỘT câu MỚI chưa từng hỏi. "
+                "Nếu đã đủ rõ, đặt needs_clarification=false ngay."
+            )
+        prompt_parts.append(mode)
     else:
         prompt_parts.append(
-            "[CHẾ ĐỘ]\nLượt đầu: áp dụng quy tắc làm rõ và ghi đè P1 trong system prompt."
+            f"[CHẾ ĐỘ]\nLượt đầu round_index=1/{MAX_CLARIFICATION_ROUNDS}: áp dụng quy tắc "
+            "làm rõ thích ứng; nếu có P1 thì chốt ngay không hỏi thêm."
         )
     user_prompt = "\n\n".join(prompt_parts)
+
     llm_model = _runtime_model("llm_model", settings.LLM_MODEL_ID)
     raw = get_groq_client().complete(
         VOICE_TRIAGE_SYSTEM_PROMPT,
@@ -1057,8 +1117,10 @@ def _extract_triage_facts(
         is_refinement=is_refinement,
         age_group=age_group,
         best_score=best_score,
+        round_index=round_index,
+        force_final=has_p1,
     )
-    if not is_refinement and _has_p1_red_flag(f"{transcription} {patient_history or ''}"):
+    if has_p1:
         if facts["priority_level"] != "P1":
             fact_warnings.append("Phát hiện dấu hiệu đe dọa tính mạng; đã ghi đè mức ưu tiên P1.")
         facts["priority_level"] = "P1"
@@ -1258,6 +1320,7 @@ def _run_voice_triage(
         age_group=age_group,
         patient_history=patient_history,
         best_score=best_score,
+        round_index=1,
     )
     warnings.extend(fact_warnings)
 
@@ -1298,7 +1361,7 @@ class ClarificationOption(BaseModel):
 
 
 class RefineTriageRequest(BaseModel):
-    """Answers selected by the patient after the first clarification round."""
+    """Answers selected by the patient in one adaptive clarification round."""
 
     transcription: str
     selected_options: list[str] = Field(default_factory=list)
@@ -1306,6 +1369,8 @@ class RefineTriageRequest(BaseModel):
     age_group: Optional[str] = None
     patient_history: Optional[str] = None
     target_date: Optional[str] = None
+    clarification_history: list[dict[str, str]] = Field(default_factory=list)
+    round_index: int = Field(default=1, ge=1, le=5)
 
 
 class VoiceScheduleTriageResponse(BaseModel):
@@ -1451,7 +1516,7 @@ def _complete_triage_with_schedule(
 
 
 def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResponse:
-    """Re-run triage with the patient's chip answers; never asks again."""
+    """Re-run triage with patient answers; may request one more adaptive round."""
     started = time.perf_counter()
     settings = get_settings()
     age_group = _normalise_age_group(payload.age_group)
@@ -1460,15 +1525,30 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
     selected = [item for item in payload.selected_options if item]
     if payload.extra_note:
         selected.append(payload.extra_note)
+    history_turns = _clarification_turns(payload.clarification_history)
+
     if not age_group:
-        joined = " ".join(selected).lower()
-        age_group = next((group for group in TRIAGE_AGE_GROUPS if group in joined), None)
+        age_sources = [*selected, payload.extra_note or ""]
+        for question, answer in history_turns:
+            age_sources.extend([question, answer])
+        for source in age_sources:
+            lowered = source.lower()
+            age_group = next((group for group in TRIAGE_AGE_GROUPS if group in lowered), None)
+            if age_group:
+                break
+
+    rag_parts: list[str] = [transcription]
+    rag_parts.extend(answer for _, answer in history_turns)
+    rag_parts.extend(selected)
+    rag_query = " ".join(
+        dict.fromkeys(part.strip() for part in rag_parts if part and part.strip())
+    )[:4000]
 
     context, sources, warnings, best_score = _retrieve_triage_context(
-        transcription, settings, age_group=age_group
+        rag_query, settings, age_group=age_group
     )
     facts, fact_warnings = _extract_triage_facts(
-        transcription,
+        rag_query,
         context,
         settings,
         age_group=age_group,
@@ -1476,11 +1556,36 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
         selected_clarifications=selected,
         is_refinement=True,
         best_score=best_score,
+        clarification_history=payload.clarification_history,
+        round_index=payload.round_index,
     )
     warnings.extend(fact_warnings)
+
+    if facts.get("needs_clarification"):
+        logger.info(
+            "Triage refinement round %d/%d: age_group=%s question=%s",
+            payload.round_index,
+            MAX_CLARIFICATION_ROUNDS,
+            age_group or "all",
+            facts.get("clarifying_question", "")[:120],
+        )
+        return VoiceScheduleTriageResponse(
+            success=True,
+            transcription=rag_query,
+            recommended_shift="",
+            advice="",
+            schedule={},
+            schedule_connected=True,
+            target_date=payload.target_date or "",
+            rag_sources=sources,
+            warnings=warnings,
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            **facts,
+        )
+
     return _complete_triage_with_schedule(
         facts,
-        transcription,
+        rag_query,
         payload.target_date,
         sources,
         warnings,
@@ -2694,7 +2799,9 @@ class FlaggedSymptomItem(BaseModel):
     id: Optional[int] = None
     flag_id: str
     transcription: str = ""
+    patient_description: str = ""
     age_group: str = "tat_ca"
+    age_group_label: str = ""
     ai_disease_guess: str = ""
     ai_icd10_code: str = ""
     ai_department_id: Optional[int] = None
@@ -2820,11 +2927,15 @@ def _flag_item(row: dict[str, Any]) -> FlaggedSymptomItem:
         parsed_score = float(raw_score) if raw_score not in (None, "") else None
     except (TypeError, ValueError):
         parsed_score = None
+    transcription = _flag_text(row.get("transcription"))
+    age_group = _normalise_age_group(row.get("age_group")) or "tat_ca"
     return FlaggedSymptomItem(
         id=parsed_id,
         flag_id=_flag_text(row.get("flag_id")),
-        transcription=_flag_text(row.get("transcription")),
-        age_group=_normalise_age_group(row.get("age_group")) or "tat_ca",
+        transcription=transcription,
+        patient_description=transcription,
+        age_group=age_group,
+        age_group_label=AGE_GROUP_LABELS.get(age_group, age_group),
         ai_disease_guess=_flag_text(row.get("ai_disease_guess")),
         ai_icd10_code=_flag_text(row.get("ai_icd10_code")),
         ai_department_id=parsed_department,
