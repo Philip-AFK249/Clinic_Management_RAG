@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import io
 import json
 import logging
 import re
 import threading
 import time
+from collections import Counter
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,7 +20,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.formparsers import MultiPartParser
@@ -32,6 +34,14 @@ from app.core.config import (
 )
 from app.core.logging import get_logger
 from app.database.connection import get_connection
+from app.database.schema import (
+    FLAG_STATUSES,
+    delete_unmatched_log,
+    insert_unmatched_log,
+    list_unmatched_logs,
+    new_flag_id,
+    update_unmatched_log,
+)
 from app.database.schedule_queries import (
     CLINIC_CLOSING_TIME,
     CLINIC_TIMEZONE,
@@ -92,6 +102,22 @@ VOICE_MAX_BYTES = 25 * 1024 * 1024  # Groq's per-file STT ceiling
 VALID_DEPARTMENT_IDS = (1, 2, 3)
 VALID_PRIORITIES = ("P1", "P2", "P3")
 TRIAGE_AGE_GROUPS = ("tre_em", "nguoi_truong_thanh", "nguoi_cao_tuoi", "tat_ca")
+OOD_SCORE_THRESHOLD = 0.52
+FLAG_REPORT_DOC_ID = "du_lieu_hoc_tang_cuong"
+FLAG_REPORT_RAW_PATH = RAW_DOCS_DIR / f"{FLAG_REPORT_DOC_ID}.md"
+FLAG_REPORT_PARSED_PATH = PARSED_MARKDOWN_DIR / f"{FLAG_REPORT_DOC_ID}.md"
+FLAG_REPORT_SECTION_START = "# DỮ LIỆU HUẤN LUYỆN TỪ CA NGOÀI TẬP DỮ LIỆU"
+FLAG_REPORT_SECTION_END = "# KẾT THÚC DỮ LIỆU HUẤN LUYỆN TỪ CA NGOÀI TẬP DỮ LIỆU"
+FLAG_REPORT_COLUMNS = (
+    "STT",
+    "Nhóm tuổi (age_group)",
+    "Triệu chứng khẩu ngữ (Bệnh nhân nói vào Mic)",
+    "Triệu chứng Y khoa chuẩn",
+    "Bệnh nghi ngờ & ICD-10",
+    "Mức độ (priority) MD",
+    "Dấu hiệu đỏ (red_flags) MD",
+    "Hướng xử lý tiếp đón MD",
+)
 AGE_GROUP_LABELS = {
     "tre_em": "Trẻ em (< 16 tuổi)",
     "nguoi_truong_thanh": "Người trưởng thành (16–59 tuổi)",
@@ -141,7 +167,7 @@ VOICE_TRIAGE_SYSTEM_PROMPT = """Bạn là trợ lý phân loại triệu chứng
 Nhiệm vụ: đọc lời kể của bệnh nhân và NGỮ CẢNH TRIỆU CHỨNG được cung cấp, rồi trả về đúng MỘT đối tượng JSON.
 
 Quy tắc bắt buộc:
-1. CHỈ dùng thông tin trong [NGỮ CẢNH TRIỆU CHỨNG] để suy ra bệnh và mã ICD-10. Nếu ngữ cảnh không nói, đặt icd10_code là chuỗi rỗng "" - TUYỆT ĐỐI không tự bịa mã bệnh.
+1. CHỈ dùng thông tin trong [NGỮ CẢNH TRIỆU CHỨNG] để suy ra bệnh và mã ICD-10. Nếu ngữ cảnh không nói, đặt icd10_code là chuỗi rỗng "" - TUYỆT ĐỐI không tự bịa mã bệnh. Dù triệu chứng lạ hoặc thuộc chuyên khoa khác, vẫn PHẢI chọn department_id 1/2/3 gần nhất, disease_guess và priority_level để tiếp đón không bị chặn.
 2. department_id chỉ được là 1, 2 hoặc 3:
    - 1 = Khoa Nội Tổng quát & Tim mạch (tim mạch, tình trạng nội khoa nặng cấp tính, cấp cứu chuyển hóa)
    - 2 = Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng / Tai Mũi Họng (sốc phản vệ, hen phế quản, suy hô hấp cấp, tai mũi họng)
@@ -167,12 +193,17 @@ Quy tắc bắt buộc:
 9. ƯU TIÊN P1 GHI ĐÈ LÀM RÕ: nếu có dấu hiệu đe dọa tính mạng (đau ngực dữ dội/kéo dài, méo miệng/yếu nửa người/nói đớ, khó thở nặng, sốc phản vệ, nôn hoặc đi cầu ra máu), luôn đặt needs_clarification=false và priority_level="P1" ngay, KHÔNG bắt bệnh nhân chờ trả lời.
 10. LƯỢT TINH CHỈNH (khi prompt có [CÂU TRẢ LỜI LÀM RÕ]): luôn đặt needs_clarification=false; tổng hợp lời kể gốc, các câu đã chọn và ngữ cảnh lọc theo nhóm tuổi để trả về chẩn đoán cuối cùng.
 11. [NHÓM TUỔI], [TIỀN SỬ] và [CÂU TRẢ LỜI LÀM RÕ] trong prompt là thông tin đã xác nhận, được phép dùng để suy luận.
+12. PHÁT HIỆN TRIỆU CHỨNG NGOÀI TẬP DỮ LIỆU:
+    - Đặt is_out_of_dataset=true và flag_reason="OUT_OF_SPECIALTY" khi lời kể rõ ràng thuộc chuyên khoa ngoài 3 khoa hiện có (Nha khoa, Mắt, Sản phụ khoa, Chỉnh hình, Tâm thần, Nhi khoa chuyên sâu...).
+    - Đặt is_out_of_dataset=true và flag_reason="NEW_SYMPTOM_PATTERN" khi lời kể không được [NGỮ CẢNH TRIỆU CHỨNG] bao phủ rõ ràng dù vẫn có thể gán gần đúng vào một trong 3 khoa.
+    - Nếu triệu chứng đã có trong ngữ cảnh và nằm đúng chuyên khoa 1/2/3, đặt is_out_of_dataset=false và flag_reason="".
 
 Định dạng JSON bắt buộc:
-{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null}
+{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
+
 
 Ví dụ đầu ra khi đa chuyên khoa:
-{"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu."}"""
+{"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu.", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}"""
 
 # ---------------------------------------------------------------------------
 # Runtime model configuration (admin dashboard - hot swappable, no restart)
@@ -659,7 +690,7 @@ _FALLBACK_TRIAGE_CONTEXT = (
 
 def _retrieve_triage_context(
     transcription: str, settings, age_group: Optional[str] = None
-) -> tuple[str, list[str], list[str]]:
+) -> tuple[str, list[str], list[str], float]:
     """Stage 1b: age-filtered RAG chunks, or the built-in department summary.
 
     The fallback is used only when pgvector is unreachable, retrieval throws, or
@@ -678,6 +709,7 @@ def _retrieve_triage_context(
                 settings=settings,
             )
             if results:
+                best_score = max((result.score for result in results), default=0.0)
                 context = "\n\n---\n\n".join(result.content for result in results)
                 sources: list[str] = []
                 for result in results:
@@ -693,7 +725,7 @@ def _retrieve_triage_context(
                     len(results),
                     age_group or "all",
                 )
-                return context, sources, warnings
+                return context, sources, warnings, float(best_score)
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}".strip().splitlines()[0][:200]
             logger.warning("Triage RAG retrieval failed: %s", detail)
@@ -703,7 +735,9 @@ def _retrieve_triage_context(
         _FALLBACK_TRIAGE_CONTEXT,
         ["Tri thức lâm sàng chuẩn Bộ Y tế (Fast-Triage)"],
         warnings,
+        0.0,
     )
+
 
 
 def _normalise_age_group(value: object) -> Optional[str]:
@@ -821,7 +855,10 @@ def _sanitise_clarification_options(raw: object, age_group: Optional[str]) -> li
 
 
 def _sanitise_triage_payload(
-    payload: dict, is_refinement: bool = False, age_group: Optional[str] = None
+    payload: dict,
+    is_refinement: bool = False,
+    age_group: Optional[str] = None,
+    best_score: float = 1.0,
 ) -> tuple[dict, list[str]]:
     """Validate the LLM's JSON against the clinical contract before using it.
 
@@ -912,6 +949,24 @@ def _sanitise_triage_payload(
                 "Để chúng tôi phân luồng đúng, bạn vui lòng chọn thêm thông tin bên dưới nhé."
             )
 
+    raw_out = payload.get("is_out_of_dataset")
+    is_out_of_dataset = raw_out is True or (
+        isinstance(raw_out, str) and raw_out.strip().lower() in {"true", "1", "yes"}
+    )
+    flag_reason = _text("flag_reason", 64).upper().replace(" ", "_")
+    valid_flag_reasons = {"OUT_OF_SPECIALTY", "NEW_SYMPTOM_PATTERN", "LOW_SIMILARITY_MATCH"}
+    if flag_reason not in valid_flag_reasons:
+        flag_reason = ""
+    if is_out_of_dataset and not flag_reason:
+        flag_reason = "NEW_SYMPTOM_PATTERN"
+    if not needs_clarification and (
+        best_score < OOD_SCORE_THRESHOLD or (not icd10 and not is_out_of_dataset)
+    ):
+        is_out_of_dataset = True
+        flag_reason = "LOW_SIMILARITY_MATCH"
+    if not is_out_of_dataset:
+        flag_reason = ""
+
     return (
         {
             "disease_guess": _text("disease_guess", 300) or "Chưa xác định",
@@ -927,6 +982,9 @@ def _sanitise_triage_payload(
             "clarifying_question": clarifying_question,
             "clarification_options": clarification_options,
             "detected_age_group": detected_age_group,
+            "is_out_of_dataset": is_out_of_dataset,
+            "flag_reason": flag_reason,
+            "similarity_score": float(best_score),
         },
         warnings,
     )
@@ -945,6 +1003,7 @@ def _extract_triage_facts(
     patient_history: Optional[str] = None,
     selected_clarifications: Optional[list[str]] = None,
     is_refinement: bool = False,
+    best_score: float = 1.0,
 ) -> tuple[dict, list[str]]:
     """Stage 1c: force the LLM into a single JSON object and validate it."""
     from app.rag.generator import get_groq_client
@@ -997,6 +1056,7 @@ def _extract_triage_facts(
         payload,
         is_refinement=is_refinement,
         age_group=age_group,
+        best_score=best_score,
     )
     if not is_refinement and _has_p1_red_flag(f"{transcription} {patient_history or ''}"):
         if facts["priority_level"] != "P1":
@@ -1188,7 +1248,7 @@ def _run_voice_triage(
     transcription = _transcribe_voice(audio, filename, settings)
     logger.info("STT (%d chars): %s", len(transcription), transcription[:120])
 
-    context, sources, warnings = _retrieve_triage_context(
+    context, sources, warnings, best_score = _retrieve_triage_context(
         transcription, settings, age_group=age_group
     )
     facts, fact_warnings = _extract_triage_facts(
@@ -1197,6 +1257,7 @@ def _run_voice_triage(
         settings,
         age_group=age_group,
         patient_history=patient_history,
+        best_score=best_score,
     )
     warnings.extend(fact_warnings)
 
@@ -1282,6 +1343,35 @@ class VoiceScheduleTriageResponse(BaseModel):
     clarifying_question: str = ""
     clarification_options: list[ClarificationOption] = Field(default_factory=list)
     detected_age_group: Optional[str] = None
+    is_out_of_dataset: bool = False
+    flag_reason: str = ""
+    flag_id: Optional[str] = None
+    similarity_score: Optional[float] = None
+
+
+def _log_out_of_dataset_facts(facts: dict, transcription: str, settings) -> None:
+    if not facts.get("is_out_of_dataset"):
+        return
+    try:
+        stored = insert_unmatched_log(
+            {
+                "flag_id": new_flag_id(settings),
+                "transcription": transcription[:4000],
+                "age_group": facts.get("detected_age_group") or "tat_ca",
+                "ai_disease_guess": facts.get("disease_guess") or "",
+                "ai_icd10_code": facts.get("icd10_code") or "",
+                "ai_department_id": facts.get("department_id"),
+                "ai_department_name": facts.get("department_name") or "",
+                "ai_priority_level": facts.get("priority_level") or "",
+                "flag_reason": facts.get("flag_reason") or "NEW_SYMPTOM_PATTERN",
+                "similarity_score": facts.get("similarity_score"),
+                "status": "PENDING_DOCTOR",
+            },
+            settings,
+        )
+        facts["flag_id"] = stored.get("flag_id")
+    except Exception as exc:
+        logger.warning("Không ghi nhận ca triệu chứng ngoài tập dữ liệu: %s", exc)
 
 
 def _complete_triage_with_schedule(
@@ -1342,6 +1432,8 @@ def _complete_triage_with_schedule(
         connected,
         latency_ms,
     )
+    _log_out_of_dataset_facts(facts, transcription, settings)
+
     return VoiceScheduleTriageResponse(
         success=True,
         transcription=transcription,
@@ -1372,7 +1464,7 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
         joined = " ".join(selected).lower()
         age_group = next((group for group in TRIAGE_AGE_GROUPS if group in joined), None)
 
-    context, sources, warnings = _retrieve_triage_context(
+    context, sources, warnings, best_score = _retrieve_triage_context(
         transcription, settings, age_group=age_group
     )
     facts, fact_warnings = _extract_triage_facts(
@@ -1383,6 +1475,7 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
         patient_history=payload.patient_history,
         selected_clarifications=selected,
         is_refinement=True,
+        best_score=best_score,
     )
     warnings.extend(fact_warnings)
     return _complete_triage_with_schedule(
@@ -1802,7 +1895,7 @@ async def list_pipeline_files():
     settings = get_settings()
     raw_files: list[PipelineFileInfo] = []
     if RAW_DOCS_DIR.is_dir():
-        for path in sorted(RAW_DOCS_DIR.iterdir(), key=lambda p: p.name.lower()):
+        for path in sorted(RAW_DOCS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if not path.is_file() or path.suffix.lower() not in RAW_DOC_EXTENSIONS:
                 continue
             raw_files.append(
@@ -2597,6 +2690,101 @@ class KnowledgeDocDeleteResponse(BaseModel):
     message: str
 
 
+class FlaggedSymptomItem(BaseModel):
+    id: Optional[int] = None
+    flag_id: str
+    transcription: str = ""
+    age_group: str = "tat_ca"
+    ai_disease_guess: str = ""
+    ai_icd10_code: str = ""
+    ai_department_id: Optional[int] = None
+    ai_department_name: str = ""
+    ai_priority_level: str = ""
+    flag_reason: str = ""
+    similarity_score: Optional[float] = None
+    ticket_number: str = ""
+    patient_name: str = ""
+    confirmed_icd10_code: str = ""
+    confirmed_disease_name: str = ""
+    confirmed_by_doctor: str = ""
+    medical_symptom_standard: str = ""
+    red_flags: str = ""
+    reception_action: str = ""
+    status: str = "PENDING_DOCTOR"
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class FlaggedSymptomCluster(BaseModel):
+    label: str
+    count: int
+
+
+class FlaggedSymptomsStats(BaseModel):
+    total: int = 0
+    pending_doctor: int = 0
+    doctor_confirmed: int = 0
+    trained: int = 0
+    top_clusters: list[FlaggedSymptomCluster] = Field(default_factory=list)
+
+
+class FlaggedSymptomsResponse(BaseModel):
+    items: list[FlaggedSymptomItem] = Field(default_factory=list)
+    stats: FlaggedSymptomsStats = Field(default_factory=FlaggedSymptomsStats)
+
+
+class FlaggedSymptomUpdate(BaseModel):
+    ticket_number: Optional[str] = None
+    patient_name: Optional[str] = None
+    age_group: Optional[str] = None
+    ai_department_id: Optional[int] = None
+    ai_priority_level: Optional[str] = None
+    confirmed_icd10_code: Optional[str] = None
+    confirmed_disease_name: Optional[str] = None
+    medical_symptom_standard: Optional[str] = None
+    red_flags: Optional[str] = None
+    reception_action: Optional[str] = None
+    status: Optional[Literal["PENDING_DOCTOR", "DOCTOR_CONFIRMED", "TRAINED"]] = None
+
+
+class FlaggedSymptomConfirmRequest(BaseModel):
+    confirmed_icd10_code: str = ""
+    confirmed_disease_name: str = ""
+    confirmed_by_doctor: str = ""
+    medical_symptom_standard: str = ""
+    red_flags: str = ""
+    reception_action: str = ""
+
+
+class FlaggedTrainRequest(BaseModel):
+    flag_ids: list[str] = Field(default_factory=list)
+
+
+class FlaggedSymptomMutationResponse(BaseModel):
+    success: bool = True
+    message: str
+    item: Optional[FlaggedSymptomItem] = None
+
+
+class FlaggedSymptomConfirmResponse(BaseModel):
+    success: bool = True
+    message: str
+    items: list[FlaggedSymptomItem] = Field(default_factory=list)
+
+
+class FlaggedSymptomDeleteResponse(BaseModel):
+    success: bool = True
+    message: str
+
+
+class FlaggedTrainResponse(BaseModel):
+    success: bool = True
+    message: str
+    trained_count: int = 0
+    doc_id: str = FLAG_REPORT_DOC_ID
+    chunks: int = 0
+
+
 KNOWLEDGE_DOCS_SQL = """
 SELECT doc_id, specialty, target_audience, COUNT(*) AS chunk_count, MIN(created_at) AS created_at
 FROM clinic_knowledge_nodes
@@ -2610,6 +2798,155 @@ FROM clinic_knowledge_nodes
 WHERE doc_id = %s
 ORDER BY id ASC;
 """
+
+
+def _flag_text(value: object) -> str:
+    return "" if value is None else str(value)
+
+
+def _flag_item(row: dict[str, Any]) -> FlaggedSymptomItem:
+    raw_id = row.get("id")
+    raw_department = row.get("ai_department_id")
+    raw_score = row.get("similarity_score")
+    try:
+        parsed_id = int(raw_id) if raw_id not in (None, "") else None
+    except (TypeError, ValueError):
+        parsed_id = None
+    try:
+        parsed_department = int(raw_department) if raw_department not in (None, "") else None
+    except (TypeError, ValueError):
+        parsed_department = None
+    try:
+        parsed_score = float(raw_score) if raw_score not in (None, "") else None
+    except (TypeError, ValueError):
+        parsed_score = None
+    return FlaggedSymptomItem(
+        id=parsed_id,
+        flag_id=_flag_text(row.get("flag_id")),
+        transcription=_flag_text(row.get("transcription")),
+        age_group=_normalise_age_group(row.get("age_group")) or "tat_ca",
+        ai_disease_guess=_flag_text(row.get("ai_disease_guess")),
+        ai_icd10_code=_flag_text(row.get("ai_icd10_code")),
+        ai_department_id=parsed_department,
+        ai_department_name=_flag_text(row.get("ai_department_name")),
+        ai_priority_level=_flag_text(row.get("ai_priority_level")),
+        flag_reason=_flag_text(row.get("flag_reason")),
+        similarity_score=parsed_score,
+        ticket_number=_flag_text(row.get("ticket_number")),
+        patient_name=_flag_text(row.get("patient_name")),
+        confirmed_icd10_code=_flag_text(row.get("confirmed_icd10_code")),
+        confirmed_disease_name=_flag_text(row.get("confirmed_disease_name")),
+        confirmed_by_doctor=_flag_text(row.get("confirmed_by_doctor")),
+        medical_symptom_standard=_flag_text(row.get("medical_symptom_standard")),
+        red_flags=_flag_text(row.get("red_flags")),
+        reception_action=_flag_text(row.get("reception_action")),
+        status=_flag_text(row.get("status")) or "PENDING_DOCTOR",
+        created_at=_flag_text(row.get("created_at")),
+        updated_at=_flag_text(row.get("updated_at")),
+    )
+
+
+def _flag_stats(rows: list[dict[str, Any]]) -> FlaggedSymptomsStats:
+    statuses = Counter(_flag_text(row.get("status")).upper() for row in rows)
+    clusters: Counter[str] = Counter()
+    for row in rows:
+        label = (
+            _flag_text(row.get("confirmed_disease_name")).strip()
+            or _flag_text(row.get("ai_disease_guess")).strip()
+            or _flag_text(row.get("flag_reason")).strip()
+            or "Chưa phân loại"
+        )
+        clusters[label] += 1
+    return FlaggedSymptomsStats(
+        total=len(rows),
+        pending_doctor=statuses.get("PENDING_DOCTOR", 0),
+        doctor_confirmed=statuses.get("DOCTOR_CONFIRMED", 0),
+        trained=statuses.get("TRAINED", 0),
+        top_clusters=[
+            FlaggedSymptomCluster(label=label, count=count)
+            for label, count in sorted(clusters.items(), key=lambda item: -item[1])[:5]
+        ],
+    )
+
+
+def _flag_report_values(row: dict[str, Any], index: int) -> list[str]:
+    age_group = _normalise_age_group(row.get("age_group")) or "tat_ca"
+    age_cell = f"{AGE_GROUP_LABELS[age_group]} [{age_group}]"
+    transcription = _flag_text(row.get("transcription"))
+    standard = _flag_text(row.get("medical_symptom_standard")).strip() or transcription
+    disease = (
+        _flag_text(row.get("confirmed_disease_name")).strip()
+        or _flag_text(row.get("ai_disease_guess")).strip()
+        or "Chưa xác định"
+    )
+    icd = (
+        _flag_text(row.get("confirmed_icd10_code")).strip()
+        or _flag_text(row.get("ai_icd10_code")).strip()
+    )
+    disease_cell = f"{disease} ({icd})" if icd else disease
+    return [
+        str(index),
+        age_cell,
+        transcription,
+        standard,
+        disease_cell,
+        _flag_text(row.get("ai_priority_level")),
+        _flag_text(row.get("red_flags")),
+        _flag_text(row.get("reception_action")),
+    ]
+
+
+def _flag_export_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        dict(zip(FLAG_REPORT_COLUMNS, _flag_report_values(row, index)))
+        for index, row in enumerate(rows, 1)
+    ]
+
+
+def _flag_md_cell(value: object) -> str:
+    return _flag_text(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _flag_report_markdown(rows: list[dict[str, Any]]) -> str:
+    records: list[tuple[int, list[str]]] = []
+    for index, row in enumerate(rows, 1):
+        try:
+            department = int(row.get("ai_department_id") or 1)
+        except (TypeError, ValueError):
+            department = 1
+        records.append((department if department in VALID_DEPARTMENT_IDS else 1,
+                        _flag_report_values(row, index)))
+
+    lines = [FLAG_REPORT_SECTION_START, ""]
+    for department in VALID_DEPARTMENT_IDS:
+        department_rows = [values for dept, values in records if dept == department]
+        if not department_rows:
+            continue
+        lines.append(f"## KHOA {department}")
+        lines.append("")
+        lines.append("| " + " | ".join(FLAG_REPORT_COLUMNS) + " |")
+        lines.append("|" + "|".join(["---"] * len(FLAG_REPORT_COLUMNS)) + "|")
+        for values in department_rows:
+            lines.append("| " + " | ".join(_flag_md_cell(value) for value in values) + " |")
+        lines.append("")
+    lines.append(FLAG_REPORT_SECTION_END)
+    return "\n".join(lines)
+
+
+def _merge_flag_report(path: Path, section: str) -> str:
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if FLAG_REPORT_SECTION_START in existing and FLAG_REPORT_SECTION_END in existing:
+        before, rest = existing.split(FLAG_REPORT_SECTION_START, 1)
+        _, after = rest.split(FLAG_REPORT_SECTION_END, 1)
+        return f"{before.rstrip()}\n\n{section.strip()}\n{after.lstrip()}"
+    return f"{existing.rstrip()}\n\n{section.strip()}\n"
+
+
+def _write_flag_reports(section: str) -> None:
+    for path in (FLAG_REPORT_RAW_PATH, FLAG_REPORT_PARSED_PATH):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_merge_flag_report(path, section), encoding="utf-8")
+
 
 def _infrastructure_health(settings) -> dict[str, dict[str, Any]]:
     """Probe ai_gateway / pgvector / embedding_engine without ever raising."""
@@ -2886,6 +3223,209 @@ async def delete_knowledge_doc(doc_id: str):
     message = f"Purged {deleted} chunks for document '{doc_id}'"
     logger.info(message)
     return KnowledgeDocDeleteResponse(success=True, message=message)
+
+
+@app.get("/api/v1/admin/flagged-symptoms", response_model=FlaggedSymptomsResponse)
+async def list_flagged_symptoms():
+    settings = get_settings()
+    rows = await asyncio.to_thread(list_unmatched_logs, settings)
+    return FlaggedSymptomsResponse(
+        items=[_flag_item(row) for row in rows],
+        stats=_flag_stats(rows),
+    )
+
+
+@app.get("/api/v1/admin/flagged-symptoms/export")
+async def export_flagged_symptoms(format: Literal["csv", "md", "json"] = "csv"):
+    settings = get_settings()
+    rows = await asyncio.to_thread(list_unmatched_logs, settings)
+
+    if format == "csv":
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=list(FLAG_REPORT_COLUMNS))
+        writer.writeheader()
+        writer.writerows(_flag_export_rows(rows))
+        content = buffer.getvalue().encode("utf-8-sig")
+        media_type = "text/csv; charset=utf-8"
+        filename = "du_lieu_trieu_chung_ngoai.csv"
+    elif format == "md":
+        content = _flag_report_markdown(rows).encode("utf-8")
+        media_type = "text/markdown; charset=utf-8"
+        filename = "du_lieu_trieu_chung_ngoai.md"
+    else:
+        content = json.dumps(
+            _flag_export_rows(rows), ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        media_type = "application/json; charset=utf-8"
+        filename = "du_lieu_trieu_chung_ngoai.json"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/v1/admin/flagged-symptoms/train-rag", response_model=FlaggedTrainResponse)
+async def train_flagged_symptoms(payload: FlaggedTrainRequest):
+    settings = get_settings()
+    rows = await asyncio.to_thread(list_unmatched_logs, settings)
+    requested = set(payload.flag_ids)
+    if requested:
+        selected = [row for row in rows if _flag_text(row.get("flag_id")) in requested]
+    else:
+        selected = [
+            row for row in rows if _flag_text(row.get("status")).upper() == "DOCTOR_CONFIRMED"
+        ]
+    if not selected:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Không có ca nào được chọn để huấn luyện lại RAG.",
+        )
+
+    section = _flag_report_markdown(selected)
+    await asyncio.to_thread(_write_flag_reports, section)
+    selected_ids = [_flag_text(row.get("flag_id")) for row in selected]
+
+    def _ingest() -> int:
+        from app.ingestion.pipeline import ingest_markdown_file, purge_document
+
+        purge_document(FLAG_REPORT_DOC_ID, settings)
+        result = ingest_markdown_file(
+            FLAG_REPORT_PARSED_PATH,
+            FLAG_REPORT_DOC_ID,
+            "Tổng hợp tiếp đón",
+            "tiep_don",
+            settings,
+        )
+        for flag_id in selected_ids:
+            update_unmatched_log(flag_id, {"status": "TRAINED"}, settings)
+        return result.total_chunks
+
+    try:
+        chunks = await asyncio.to_thread(_ingest)
+    except Exception as exc:
+        logger.exception("Không huấn luyện được dữ liệu ngoài tập: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Không nạp được dữ liệu vào pgvector: {_db_error_detail(exc, settings)}",
+        ) from exc
+
+    return FlaggedTrainResponse(
+        message=f"Đã huấn luyện {len(selected_ids)} ca ngoài tập dữ liệu.",
+        trained_count=len(selected_ids),
+        chunks=chunks,
+    )
+
+
+@app.patch(
+    "/api/v1/admin/flagged-symptoms/by-ticket/{ticket_number}/confirm",
+    response_model=FlaggedSymptomConfirmResponse,
+)
+async def confirm_flagged_symptom_by_ticket(
+    ticket_number: str, payload: FlaggedSymptomConfirmRequest
+):
+    settings = get_settings()
+    rows = await asyncio.to_thread(list_unmatched_logs, settings)
+    matches = [
+        row for row in rows if _flag_text(row.get("ticket_number")) == ticket_number
+    ]
+    if not matches:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Không tìm thấy ca nào gắn với ticket {ticket_number!r}.",
+        )
+
+    changes = {
+        "confirmed_icd10_code": payload.confirmed_icd10_code,
+        "confirmed_disease_name": payload.confirmed_disease_name,
+        "confirmed_by_doctor": payload.confirmed_by_doctor or "Bác sĩ tiếp nhận",
+        "medical_symptom_standard": payload.medical_symptom_standard,
+        "red_flags": payload.red_flags,
+        "reception_action": payload.reception_action,
+    }
+
+    def _confirm() -> list[dict[str, Any]]:
+        updated: list[dict[str, Any]] = []
+        for row in matches:
+            status = (
+                "TRAINED"
+                if _flag_text(row.get("status")).upper() == "TRAINED"
+                else "DOCTOR_CONFIRMED"
+            )
+            result = update_unmatched_log(
+                _flag_text(row.get("flag_id")),
+                {**changes, "status": status},
+                settings,
+            )
+            if result:
+                updated.append(result)
+        return updated
+
+    updated_rows = await asyncio.to_thread(_confirm)
+    if not updated_rows:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Không cập nhật được ca đã khám; kiểm tra PostgreSQL hoặc tệp dự phòng.",
+        )
+    return FlaggedSymptomConfirmResponse(
+        message=f"Đã xác nhận {len(updated_rows)} ca theo ticket {ticket_number}.",
+        items=[_flag_item(row) for row in updated_rows],
+    )
+
+
+@app.patch("/api/v1/admin/flagged-symptoms/{flag_id}", response_model=FlaggedSymptomMutationResponse)
+async def update_flagged_symptom(flag_id: str, payload: FlaggedSymptomUpdate):
+    settings = get_settings()
+    changes = {
+        key: value
+        for key, value in payload.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+    if "age_group" in changes:
+        age_group = _normalise_age_group(changes["age_group"])
+        if not age_group:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Nhóm tuổi không hợp lệ: {changes['age_group']!r}.",
+            )
+        changes["age_group"] = age_group
+    if "status" in changes and changes["status"] not in FLAG_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Trạng thái không hợp lệ: {changes['status']!r}.",
+        )
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Không có trường nào để cập nhật.",
+        )
+
+    updated = await asyncio.to_thread(update_unmatched_log, flag_id, changes, settings)
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Không tìm thấy ca {flag_id!r}.",
+        )
+    return FlaggedSymptomMutationResponse(
+        message=f"Đã cập nhật ca {flag_id}.",
+        item=_flag_item(updated),
+    )
+
+
+@app.delete(
+    "/api/v1/admin/flagged-symptoms/{flag_id}",
+    response_model=FlaggedSymptomDeleteResponse,
+)
+async def delete_flagged_symptom(flag_id: str):
+    settings = get_settings()
+    deleted = await asyncio.to_thread(delete_unmatched_log, flag_id, settings)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Không tìm thấy ca {flag_id!r}.",
+        )
+    return FlaggedSymptomDeleteResponse(message=f"Đã xoá ca {flag_id}.")
 
 
 if __name__ == "__main__":
