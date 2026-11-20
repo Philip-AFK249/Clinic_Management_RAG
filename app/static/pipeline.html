@@ -190,12 +190,36 @@
     return b;
   }
 
+  const EXT_BADGES = {
+    ".pdf": ["PDF", "bg-rose-100 text-rose-700"],
+    ".docx": ["DOCX", "bg-sky-100 text-sky-700"],
+    ".md": ["MD", "bg-indigo-100 text-indigo-700"],
+    ".markdown": ["MD", "bg-indigo-100 text-indigo-700"],
+    ".txt": ["TXT", "bg-slate-100 text-slate-700"],
+    ".csv": ["CSV", "bg-emerald-100 text-emerald-700"],
+    ".tsv": ["TSV", "bg-teal-100 text-teal-700"],
+    ".xlsx": ["XLSX", "bg-green-100 text-green-700"],
+    ".xls": ["XLS", "bg-lime-100 text-lime-700"],
+    ".json": ["JSON", "bg-amber-100 text-amber-700"],
+    ".html": ["HTML", "bg-orange-100 text-orange-700"],
+    ".htm": ["HTML", "bg-orange-100 text-orange-700"],
+  };
+  const DIRECT_EXTS = new Set([
+    ".md", ".markdown", ".txt", ".csv", ".tsv",
+    ".xlsx", ".xls", ".json", ".html", ".htm",
+  ]);
+
+  function extBadge(ext) {
+    const spec = EXT_BADGES[(ext || "").toLowerCase()] || ["FILE", "bg-slate-100 text-slate-700"];
+    return badge(spec[0], spec[1]);
+  }
+
   function renderFiles() {
     el.fileList.innerHTML = "";
     if (!files.length) {
       const empty = document.createElement("div");
       empty.className = "px-5 py-10 text-center text-sm text-slate-400";
-      empty.textContent = "Không tìm thấy tài liệu .pdf / .docx trong data/raw_docs/.";
+      empty.textContent = "Không tìm thấy tài liệu hỗ trợ (.pdf, .docx, .md, .csv, .xlsx, .txt, .json, .html...) trong data/raw_docs/.";
       el.fileList.appendChild(empty);
       return;
     }
@@ -213,8 +237,7 @@
       name.textContent = f.filename;                       // textContent: filenames are untrusted
       const meta = document.createElement("div");
       meta.className = "mt-1 flex items-center gap-2";
-      meta.appendChild(badge(f.ext === ".pdf" ? "PDF" : "DOCX",
-                             f.ext === ".pdf" ? "bg-rose-100 text-rose-700" : "bg-sky-100 text-sky-700"));
+      meta.appendChild(extBadge(f.ext));
       const size = document.createElement("span");
       size.className = "text-xs text-slate-400";
       size.textContent = f.size_kb + " KB";
@@ -244,19 +267,22 @@
     title.textContent = f.filename;
     const sub = document.createElement("div");
     sub.className = "mt-1 text-xs text-slate-500 flex items-center gap-2";
-    sub.appendChild(badge(f.ext === ".pdf" ? "PDF" : "DOCX",
-                          f.ext === ".pdf" ? "bg-rose-100 text-rose-700" : "bg-sky-100 text-sky-700"));
+    sub.appendChild(extBadge(f.ext));
     const t = document.createElement("span");
     t.textContent = f.size_kb + " KB · doc_id: " + f.filename.replace(/\.[^.]+$/, "");
     sub.appendChild(t);
     if (f.has_parsed_md) sub.appendChild(badge("đã có markdown", "bg-emerald-100 text-emerald-700"));
     el.selectedBox.appendChild(title); el.selectedBox.appendChild(sub);
 
-    // Evidence: LlamaParse reconstructs .docx and can invent content; Docling extracts.
-    if (f.ext === ".docx" && document.querySelector('input[name="parser"][value="llama"]').checked) {
+    const ext = (f.ext || "").toLowerCase();
+    if (DIRECT_EXTS.has(ext)) {
+      const label = EXT_BADGES[ext] ? EXT_BADGES[ext][0] : ext.replace(".", "").toUpperCase();
+      setParserHint("File " + label + " được chuyển trực tiếp thành Markdown có cấu trúc " +
+                    "(bảng/phần rõ ràng), không dùng OCR hay parser Cloud — lựa chọn Docling/LlamaParse sẽ bị bỏ qua.");
+    } else if (ext === ".docx" && document.querySelector('input[name="parser"][value="llama"]').checked) {
       setParserHint("File .docx đang dùng LlamaParse. Cơ chế Cloud có thể tái dựng nội dung " +
                     "(ảnh chụp cấu trúc, không chỉ trích xuất) — Docling an toàn hơn cho .docx.");
-    } else if (f.ext === ".docx") {
+    } else if (ext === ".docx") {
       setParserHint("Docling được chọn sẵn cho .docx: trích xuất cấu trúc xác định, bảng giữ nguyên.");
     } else {
       setParserHint("");

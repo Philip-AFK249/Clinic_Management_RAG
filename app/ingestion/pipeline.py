@@ -14,8 +14,11 @@ from app.database.schema import run_migrations
 from app.ingestion.embedder import embed_texts
 from app.ingestion.entity_extractor import ExtractedEntities, extract_entities
 from app.ingestion.splitter import age_group_markers, chunk_markdown
+from app.parsers.multi_format_parser import SUPPORTED_EXTENSIONS as DIRECT_MARKDOWN_EXTENSIONS
 
 logger = get_logger(__name__)
+
+RAW_DOC_EXTENSIONS = (".pdf", ".docx") + DIRECT_MARKDOWN_EXTENSIONS
 
 INSERT_SQL = """
     INSERT INTO clinic_knowledge_nodes
@@ -170,7 +173,7 @@ def ingest_directory(
     parsed_dir: Path = PARSED_MARKDOWN_DIR,
     settings: Optional[Settings] = None,
 ) -> list[IngestResult]:
-    """Ingest every Markdown file in ``parsed_dir`` using the matching PDF stem.
+    """Ingest every Markdown file in ``parsed_dir`` using its matching source stem.
 
     Specialty and target audience are inferred from the file stem so the three
     clinical departments stay separated in the vector store and reception staff
@@ -180,7 +183,12 @@ def ingest_directory(
     results = []
     for md_path in sorted(parsed_dir.glob("*.md")):
         source = next(
-            (f for f in raw_docs_dir.glob("*.pdf") if f.stem == md_path.stem),
+            (
+                f for f in raw_docs_dir.iterdir()
+                if f.is_file()
+                and f.stem == md_path.stem
+                and f.suffix.lower() in RAW_DOC_EXTENSIONS
+            ),
             None,
         )
         specialty, audience = classify_document(md_path.stem)

@@ -68,7 +68,16 @@ INDEX_HTML = PROJECT_ROOT / "index.html"
 PIPELINE_HTML = PROJECT_ROOT / "app" / "static" / "pipeline.html"
 
 # Document types the pipeline console is allowed to ingest.
-RAW_DOC_EXTENSIONS = (".pdf", ".docx")
+RAW_DOC_EXTENSIONS = (
+    ".pdf", ".docx", ".md", ".markdown", ".txt", ".csv", ".tsv",
+    ".xlsx", ".xls", ".json", ".html", ".htm",
+)
+
+# Formats converted straight to Markdown without Docling/LlamaParse or OCR.
+DIRECT_MARKDOWN_EXTENSIONS = (
+    ".md", ".markdown", ".txt", ".csv", ".tsv",
+    ".xlsx", ".xls", ".json", ".html", ".htm",
+)
 
 # Hard ceiling for a single document uploaded through the pipeline console.
 PIPELINE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
@@ -332,7 +341,7 @@ class PipelineRunRequest(BaseModel):
     """Ask the ingestion pipeline to process exactly one file from raw_docs."""
 
     filename: str = Field(min_length=1, description="Tên file trong data/raw_docs/")
-    parser_type: Literal["llama", "docling"] = "docling"
+    parser_type: Literal["llama", "docling", "auto"] = "docling"
     force_reparse: bool = False
     clean_doc_first: bool = True
     target_audience_override: Literal["auto", "tiep_don", "bac_si"] = "auto"
@@ -1651,10 +1660,14 @@ def _resolve_raw_file(filename: str) -> Path:
 
 def _parse_to_markdown(source: Path, parser_type: str) -> tuple[Path, str]:
     """Parse ``source`` into data/parsed_markdown/; returns (md_path, parser_used)."""
-    # Heavy imports stay inside the worker thread: pulling in sentence-transformers
-    # and docling at module scope would add ~30s to API startup.
     target_dir = PARSED_MARKDOWN_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    if source.suffix.lower() in DIRECT_MARKDOWN_EXTENSIONS:
+        from app.parsers.multi_format_parser import MultiFormatParser
+
+        MultiFormatParser(output_dir=target_dir).parse(source)
+        return target_dir / f"{source.stem}.md", "structured_text"
 
     if parser_type == "llama":
         from app.parsers.llamaparse_parser import LlamaParseParser
@@ -1693,6 +1706,8 @@ def _run_single_pipeline(payload: PipelineRunRequest) -> PipelineRunResponse:
         source = _resolve_raw_file(payload.filename)
         doc_id = source.stem
         markdown_path = PARSED_MARKDOWN_DIR / f"{doc_id}.md"
+        if source.suffix.lower() in DIRECT_MARKDOWN_EXTENSIONS:
+            parser_used = "structured_text"
         logger.info("=== Pipeline run: %s ===", source.name)
         logger.info("Source: %s (%.1f KB)", source, _file_size_kb(source))
 
