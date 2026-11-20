@@ -202,6 +202,7 @@ Quy tắc bắt buộc:
 9. ƯU TIÊN P1 GHI ĐÈ LÀM RÕ: nếu có dấu hiệu đe dọa tính mạng (đau ngực dữ dội/kéo dài, méo miệng/yếu nửa người/nói đớ, khó thở nặng, sốc phản vệ, nôn hoặc đi cầu ra máu), luôn đặt needs_clarification=false và priority_level="P1" ngay, KHÔNG bắt bệnh nhân chờ trả lời.
 10. LƯỢT TINH CHỈNH (khi prompt có [CÂU TRẢ LỜI LÀM RÕ]): nếu round_index < 4 và còn một chi tiết phân biệt thực sự quan trọng, được phép đặt needs_clarification=true để hỏi tiếp một câu MỚI; ngược lại hãy tổng hợp lời kể gốc, lịch sử hỏi đáp, các câu đã chọn và ngữ cảnh lọc theo nhóm tuổi để trả về chẩn đoán cuối cùng.
 11. [NHÓM TUỔI ĐÃ XÁC NHẬN], [TIỀN SỬ], [LỊCH SỬ HỎI ĐÁP LÀM RÕ] và [CÂU TRẢ LỜI LÀM RÕ] là thông tin đã xác nhận, được phép dùng để suy luận.
+12b. ƯU TIÊN TRIỆU CHỨNG CẤP TÍNH MỚI: khi bệnh nhân nhắc cả bệnh mạn tính nhẹ (viêm mũi dị ứng, mề đay nhẹ) VÀ triệu chứng mới cấp tính/ngoài chuyên khoa (mờ mắt, đốm đen trước mắt...), icd10_code, disease_guess, flag_reason PHẢI phản ánh tình trạng mới cấp tính/ngoài chuyên khoa (ví dụ H43.9/H35.3 - hội chẩn Mắt), không phải bệnh mạn tính nền.
 12. PHÁT HIỆN TRIỆU CHỨNG NGOÀI TẬP DỮ LIỆU:
     - Đặt is_out_of_dataset=true và flag_reason="OUT_OF_SPECIALTY" khi lời kể rõ ràng thuộc chuyên khoa ngoài 3 khoa hiện có (Nha khoa, Mắt, Sản phụ khoa, Chỉnh hình, Tâm thần, Nhi khoa chuyên sâu...).
     - Đặt is_out_of_dataset=true và flag_reason="NEW_SYMPTOM_PATTERN" khi lời kể không được [NGỮ CẢNH TRIỆU CHỨNG] bao phủ rõ ràng dù vẫn có thể gán gần đúng vào một trong 3 khoa.
@@ -3168,7 +3169,7 @@ def _flag_report_values(row: dict[str, Any], index: int) -> list[str]:
     age_group = _normalise_age_group(row.get("age_group")) or "tat_ca"
     age_cell = f"{AGE_GROUP_LABELS[age_group]} [{age_group}]"
     transcription = _flag_text(row.get("transcription"))
-    standard = _flag_text(row.get("medical_symptom_standard")).strip() or transcription
+    standard = _flag_text(row.get("medical_symptom_standard")).strip() or _normalise_voice_typos(transcription)
     disease = (
         _flag_text(row.get("confirmed_disease_name")).strip()
         or _flag_text(row.get("ai_disease_guess")).strip()
@@ -3217,7 +3218,8 @@ def _flag_report_markdown(rows: list[dict[str, Any]]) -> str:
         department_rows = [values for dept, values in records if dept == department]
         if not department_rows:
             continue
-        lines.append(f"## KHOA {department}")
+        dept_name = _DEPARTMENT_NAMES[department]
+        lines.append(f"## KHOA {department}: {dept_name} (departmentId = {department})")
         lines.append("")
         lines.append("| " + " | ".join(FLAG_REPORT_COLUMNS) + " |")
         lines.append("|" + "|".join(["---"] * len(FLAG_REPORT_COLUMNS)) + "|")

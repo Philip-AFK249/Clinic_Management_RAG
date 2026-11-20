@@ -49,6 +49,7 @@ SPECIALTY_KEYWORDS: dict[str, tuple[str, ...]] = {
 # Documents aimed at reception / triage rather than at clinicians.
 AUDIENCE_TRIAGE_KEYWORDS: tuple[str, ...] = (
     "triage", "tiep_don", "sang_loc", "trieu_chung",
+    "hoc_tang_cuong", "du_lieu_hoc_tang_cuong",
 )
 
 
@@ -111,6 +112,7 @@ def ingest_markdown_file(
         max_chars=settings.CHUNK_MAX_CHARS,
         overlap=settings.CHUNK_OVERLAP,
     )
+    chunks = [str(chunk or "").replace("\x00", "") for chunk in chunks]
     total = len(chunks)
     if total == 0:
         logger.warning("No usable content in %s - skipping", markdown_path.name)
@@ -129,6 +131,7 @@ def ingest_markdown_file(
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
             for idx, (content, embedding) in enumerate(zip(chunks, embeddings), 1):
+                content = (content or "").replace("\x00", "")
                 entities: ExtractedEntities = extract_entities(content)
                 entities_count += len(entities.icd10_codes) + len(entities.medications)
                 age_group = extract_age_group(content)

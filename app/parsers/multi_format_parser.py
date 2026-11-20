@@ -27,12 +27,18 @@ _IGNORED_TAGS = {"script", "style", "noscript", "iframe"}
 
 
 def _decode(raw: bytes) -> str:
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16").replace("\x00", "")
+        except UnicodeDecodeError:
+            pass
     for encoding in _TEXT_ENCODINGS:
         try:
-            return raw.decode(encoding)
+            text = raw.decode(encoding)
+            return text.replace("\x00", "")
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+    return raw.decode("utf-8", errors="replace").replace("\x00", "")
 
 
 def _normalise_newlines(text: str) -> str:
@@ -291,7 +297,16 @@ class MultiFormatParser(BaseParser):
         return body + "\n"
 
     def _parse_delimited(self, file_path: Path) -> str:
-        text = _normalise_newlines(self._read_text(file_path))
+        raw = file_path.read_bytes()
+        if raw[:4] == b"PK\\x03\\x04":
+            try:
+                return self._parse_xlsx(file_path)
+            except Exception as exc:
+                raise ValueError(
+                    "File có định dạng Excel (.xlsx) nhưng mang đuôi .csv/.tsv; "
+                    "vui lòng tải lên dưới dạng .xlsx."
+                ) from exc
+        text = _normalise_newlines(_decode(raw))
         sample = text[:8192]
         try:
             delimiter = csv.Sniffer().sniff(sample, delimiters=",\t;").delimiter
