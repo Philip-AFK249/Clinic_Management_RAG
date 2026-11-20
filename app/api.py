@@ -45,6 +45,13 @@ from app.parsers.bhyt_vlm import (
     optimize_image,
     validate_bhyt,
 )
+from app.parsers.invoice_vlm import (
+    INVOICE_MAX_DIMENSION,
+    INVOICE_MAX_IMAGE_BYTES,
+    InvoiceOcrData,
+    extract_invoice_from_bytes,
+    validate_invoice,
+)
 from app.services import ambient
 from app.services.ambient import (
     ClinicalDraft,
@@ -259,6 +266,17 @@ app.mount(
 class BhytOcrResponse(BaseModel):
     success: bool = True
     data: BhytData
+    warnings: list[str] = Field(default_factory=list)
+    model: str
+    latency_ms: float
+    image_preview: str
+    image_size_kb: float
+    raw_text: str = ""
+
+
+class InvoiceOcrResponse(BaseModel):
+    success: bool = True
+    data: InvoiceOcrData
     warnings: list[str] = Field(default_factory=list)
     model: str
     latency_ms: float
@@ -1090,6 +1108,65 @@ async def _run_ocr(file: UploadFile) -> BhytOcrResponse:
     )
 
 
+async def _run_invoice_ocr(
+    file: UploadFile,
+    invoice_type: Literal[
+        "SUPPLIER_DRUG", "PATIENT_MEDICAL", "RECEPTION_RECEIPT"
+    ],
+) -> InvoiceOcrResponse:
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Vui lòng tải lên tệp ảnh hóa đơn hợp lệ (.jpg, .jpeg, .png, .heic, .webp)",
+        )
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp ảnh rỗng."
+        )
+
+    start = time.perf_counter()
+    settings = get_settings()
+    vlm_model = _runtime_model("vlm_model", settings.VLM_MODEL_ID)
+    try:
+        # Invoice tables need a higher resolution budget than a BHYT card so
+        # batch numbers, expiry dates and unit prices survive compression.
+        optimized = await asyncio.to_thread(
+            optimize_image,
+            image_bytes,
+            max_dimension=INVOICE_MAX_DIMENSION,
+            max_bytes=INVOICE_MAX_IMAGE_BYTES,
+        )
+        data, raw_text, _ = await asyncio.to_thread(
+            extract_invoice_from_bytes, image_bytes, invoice_type, optimized, vlm_model
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except Exception as exc:  # Groq auth/ratelimit/network failures
+        logger.exception("Lỗi khi bóc tách hóa đơn bằng VLM: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Không thể gọi dịch vụ Groq AI: {exc}",
+        ) from exc
+
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    logger.info("Hoàn tất bóc tách hóa đơn sau %s ms", elapsed_ms)
+
+    return InvoiceOcrResponse(
+        data=data,
+        warnings=validate_invoice(data),
+        model=vlm_model,
+        latency_ms=elapsed_ms,
+        image_preview="data:image/jpeg;base64,"
+        + base64.b64encode(optimized).decode("utf-8"),
+        image_size_kb=round(len(optimized) / 1024, 1),
+        raw_text=raw_text,
+    )
+
+
 @app.post("/api/v1/ocr/bhyt", response_model=BhytOcrResponse)
 async def process_bhyt_upload(file: UploadFile = File(...)):
     """Extract structured fields from an uploaded BHYT card via the Groq VLM."""
@@ -1104,6 +1181,20 @@ async def chat_alias(file: UploadFile = File(...)):
     """Backwards-compatible alias for clients built against /api/v1/chat."""
     try:
         return await _run_ocr(file)
+    finally:
+        await file.close()
+
+
+@app.post("/api/v1/ocr/invoice", response_model=InvoiceOcrResponse)
+async def process_invoice_upload(
+    file: UploadFile = File(...),
+    invoice_type: Literal[
+        "SUPPLIER_DRUG", "PATIENT_MEDICAL", "RECEPTION_RECEIPT"
+    ] = Form("SUPPLIER_DRUG"),
+):
+    """Extract a supplier drug invoice, patient medical bill or reception receipt."""
+    try:
+        return await _run_invoice_ocr(file, invoice_type)
     finally:
         await file.close()
 
