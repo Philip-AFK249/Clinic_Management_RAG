@@ -191,12 +191,14 @@ Quy tắc bắt buộc:
     - Nếu hai triệu chứng cùng mức ưu tiên, chọn triệu chứng nguy hiểm/gây tàn phế hơn làm khoa chính.
     - TRƯỜNG HỢP 3 CHUYÊN KHOA (bệnh nhân kể lan man): ví dụ khó thở gắng sức/hồi hộp/tim đập nhanh kèm tiểu buốt/nước tiểu đục (Khoa 1) + sốt/viêm họng/khàn tiếng (Khoa 2) + nổi mẩn đỏ/ngứa ngáy (Khoa 3). Bắt buộc: department_id = 1 (chuyên khoa nguy cơ cao nhất), priority_level = "P2" nếu KHÔNG có dấu hiệu P1; secondary_department_id = 2 (chuyên khoa khẩn cấp kế tiếp; nếu không có cụm hô hấp/TMH mà chỉ có da liễu thì chọn 3).
     - multi_specialty_note PHẢI liệt kê TẤT CẢ các cụm cơ quan đã phát hiện (kể cả cụm phụ) VÀ thứ tự hội chẩn. Không được bỏ sót cụm nào chỉ vì đang hỏi làm rõ.
-8. LÀM RÕ THÍCH ỨNG 1-4 LƯỢT (Claude-style progressive narrowing):
-   - KHÔNG ép số lượt hỏi. Nếu lời kể ban đầu hoặc sau 1-2 câu trả lời đã làm rõ kiểu triệu chứng, mức nguy cơ và nhóm tuổi, hãy đặt needs_clarification=false và trả kết quả cuối ngay.
-   - Chỉ đặt needs_clarification=true khi round_index <= 4, KHÔNG có dấu hiệu P1 và còn bị thiếu thông tin lâm sàng quan trọng, cụ thể: (a) chưa có [NHÓM TUỔI ĐÃ XÁC NHẬN] trong khi tuổi làm đổi mức nguy cơ hoặc chọn đúng dòng trong [NGỮ CẢNH TRIỆU CHỨNG]; (b) cần chi tiết phân biệt giữa các bệnh đang được gợi ý trong ngữ cảnh (tính chất đau, khởi phát/thời gian, sốt, phát ban, khó thở, tiền sử liên quan) hoặc cần làm rõ triệu chứng lạ ngoài tập dữ liệu.
-   - Mỗi lượt chỉ hỏi MỘT câu clarifying_question ngắn gọn, đồng cảm bằng tiếng Việt, kèm 2-4 clarification_options cụ thể, dễ chạm, được thiết kế riêng từ [NGỮ CẢNH TRIỆU CHỨNG] và [LỊCH SỬ HỎI ĐÁP LÀM RÕ]. TUYỆT ĐỐI không lặp lại câu hỏi đã có trong lịch sử.
-   - Mỗi option phải có dạng {"id": "opt_...", "label": "...", "category": "age_group" | "medical_history" | "symptom_detail", "age_group_value": "tre_em" | "nguoi_truong_thanh" | "nguoi_cao_tuoi" | "tat_ca" | null}; label dùng tiếng đời thường, không dùng thuật ngữ y khoa khô khan.
-   - Khi round_index >= 4, luôn needs_clarification=false và chốt kết quả, dù thông tin vẫn chưa đầy đủ.
+8. LÀM RÕ THÍCH ỨNG 1-4 LƯỢT (Claude-style multi-question card):
+    - Phân tích lời kể và [NGỮ CẢNH TRIỆU CHỨNG].
+    - Case A — Rõ ràng/tập trung hoặc cấp cứu P1: needs_clarification=false, clarifying_questions=[] và trả kết quả cuối ngay (kể cả đau ngực dữ dội, đột quỵ, khó thở nặng, sốc phản vệ, xuất huyết tiêu hóa).
+    - Case B — Mơ hồ nhẹ/ngắn (1-2 câu hỏi): needs_clarification=true, clarifying_questions có 1-2 câu hỏi nhắm mục tiêu.
+    - Case C — Lan man/nhiều cơ quan (3-4 câu hỏi): needs_clarification=true, clarifying_questions có 3-4 câu hỏi để làm rõ cơ quan chính, mức độ nguy cơ, tuổi/tiền sử.
+    - Mỗi câu hỏi: {"id": "q_...", "question": "...", "options": ["...", "..."], "allow_custom": true}; options là mảng chuỗi 2-4 phần tử ngắn, cụ thể, khác biệt, viết riêng cho lời kể bệnh nhân.
+    - Khi needs_clarification=true: disease_guess="", icd10_code="", recommended_shift="", advice="" (frontend chỉ hiện card câu hỏi).
+    - Khi round_index >= 4, luôn needs_clarification=false và chốt kết quả.
 9. ƯU TIÊN P1 GHI ĐÈ LÀM RÕ: nếu có dấu hiệu đe dọa tính mạng (đau ngực dữ dội/kéo dài, méo miệng/yếu nửa người/nói đớ, khó thở nặng, sốc phản vệ, nôn hoặc đi cầu ra máu), luôn đặt needs_clarification=false và priority_level="P1" ngay, KHÔNG bắt bệnh nhân chờ trả lời.
 10. LƯỢT TINH CHỈNH (khi prompt có [CÂU TRẢ LỜI LÀM RÕ]): nếu round_index < 4 và còn một chi tiết phân biệt thực sự quan trọng, được phép đặt needs_clarification=true để hỏi tiếp một câu MỚI; ngược lại hãy tổng hợp lời kể gốc, lịch sử hỏi đáp, các câu đã chọn và ngữ cảnh lọc theo nhóm tuổi để trả về chẩn đoán cuối cùng.
 11. [NHÓM TUỔI ĐÃ XÁC NHẬN], [TIỀN SỬ], [LỊCH SỬ HỎI ĐÁP LÀM RÕ] và [CÂU TRẢ LỜI LÀM RÕ] là thông tin đã xác nhận, được phép dùng để suy luận.
@@ -210,8 +212,8 @@ Quy tắc bắt buộc:
     - Không được trả về chuỗi rỗng/null cho các trường trên (ngoại trừ secondary_department_id/secondary_department_name=null và multi_specialty_note="" khi chỉ có đúng một chuyên khoa). Hãy dùng phán đoán lâm sàng tốt nhất từ lời kể hiện có, KHÔNG chờ câu trả lời để điền.
 
 Định dạng JSON bắt buộc:
-{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
-Khi needs_clarification=true, clarification_options phải có 2-4 phần tử đúng dạng {"id": "opt_...", "label": "...", "category": "...", "age_group_value": ...}. 9 trường phán đoán lâm sàng ở trên vẫn BẮT BUỘC có giá trị, không được để trống.
+{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "clarifying_questions": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
+Khi needs_clarification=true: disease_guess="", icd10_code="", clarifying_questions có 1-4 phần tử {"id": "q_...", "question": "...", "options": ["...", "..."], "allow_custom": true}; clarifying_question và clarification_options có thể để rỗng (hệ thống tự đồng bộ từ clarifying_questions[0]).
 
 Ví dụ đầu ra khi đa chuyên khoa:
 
@@ -802,89 +804,6 @@ def _extract_clinical_search_query(raw_text: str) -> str:
     )
 
 
-#: (department_id, acuity rank, display label, folded-text pattern). Higher
-#: acuity wins the primary department; the runner-up in a different department
-#: becomes the secondary consult. Used as the deterministic backstop whenever
-#: the LLM omits the preliminary assessment while asking for clarification.
-_ORGAN_CLUSTER_PATTERNS: tuple[tuple[int, int, str, re.Pattern[str]], ...] = (
-    (
-        1, 4,
-        "Tim mạch / Nội khoa: khó thở gắng sức, hồi hộp, tim đập nhanh, đau tức ngực",
-        re.compile(
-            r"\b(?:leo cau thang|hoi hop|tim dap nhanh|danh trong nguc|tuc nguc"
-            r"|dau nguc|kho tho|tho khong ra hoi)\b"
-        ),
-    ),
-    (
-        1, 3,
-        "Tiết niệu: tiểu buốt, tiểu rắt, nước tiểu đục, đau hông lưng",
-        re.compile(
-            r"\b(?:tieu buot|tieu rat|nuoc tieu duc|dau hong lung|dau lung"
-            r"|cam thay but)\b"
-        ),
-    ),
-    (
-        2, 2,
-        "Hô hấp / Tai Mũi Họng: sốt, viêm họng, khàn tiếng, khô họng, ho khan",
-        re.compile(
-            r"\b(?:vien hong|sot|khan tieng|mat tieng|kho hong|rat hong"
-            r"|ho khan|dau hong|kho khe)\b"
-        ),
-    ),
-    (
-        3, 1,
-        "Da liễu: nổi mẩn đỏ, ngứa ngáy, phát ban",
-        re.compile(
-            r"\b(?:noi man do|ngua ngay|phat ban|man ngua|me day|mun nuoc"
-            r"|bong nuoc|dat san|ngua)\b"
-        ),
-    ),
-)
-
-_CLUSTER_DISEASE_FALLBACK = {
-    4: "Hội chứng đau ngực / Rối loạn nhịp nghi ngờ",
-    3: "Nhiễm đường tiết niệu nghi ngờ",
-    2: "Viêm họng / Viêm thanh quản nghi ngờ",
-    1: "Phát ban ngứa / Viêm da dị ứng nghi ngờ",
-}
-_CLUSTER_ICD10_FALLBACK = {4: "R07.9", 3: "N39.0", 2: "J02.9", 1: "R21"}
-
-
-def _detect_organ_clusters(raw_text: Optional[str]) -> list[tuple[int, int, str]]:
-    """List detected organ clusters, highest acuity first."""
-    folded = _fold_vietnamese_for_match(_normalise_voice_typos(raw_text or ""))
-    clusters: list[tuple[int, int, str]] = []
-    seen: set[tuple[int, str]] = set()
-    for department_id, acuity, label, pattern in _ORGAN_CLUSTER_PATTERNS:
-        if not pattern.search(folded):
-            continue
-        key = (department_id, label)
-        if key in seen:
-            continue
-        seen.add(key)
-        clusters.append((department_id, acuity, label))
-    return sorted(clusters, key=lambda item: item[1], reverse=True)
-
-
-def _build_multi_specialty_note(clusters: list[tuple[int, int, str]]) -> str:
-    """Explicitly name every cluster and the consult sequence, dropping none."""
-    labels = " ; ".join(
-        f"{index}. {label}"
-        for index, (_, _, label) in enumerate(clusters, 1)
-    )
-    sequence: list[int] = []
-    for department_id, _, _ in clusters:
-        if department_id not in sequence:
-            sequence.append(department_id)
-    names = [
-        f"Khoa {department_id} ({_DEPARTMENT_NAMES[department_id]})"
-        for department_id in sequence
-    ]
-    return (
-        f"Đã phát hiện {len(clusters)} cụm triệu chứng: {labels}. "
-        f"Thứ tự xử trí/hội chẩn đề xuất: {' -> '.join(names)}."
-    )
-
 
 def _retrieve_triage_context(
     transcription: str, settings, age_group: Optional[str] = None
@@ -904,7 +823,7 @@ def _retrieve_triage_context(
 
             results = retrieve_context(
                 search_query,
-                top_k=5,
+                top_k=6,
                 target_audience="tiep_don",
                 age_group=age_group,
                 settings=settings,
@@ -949,69 +868,6 @@ def _normalise_age_group(value: object) -> Optional[str]:
     return key if key in TRIAGE_AGE_GROUPS else None
 
 
-def _fallback_clarification_options(age_group: Optional[str]) -> list[dict]:
-    """Concrete chips used when the model flags ambiguity without usable options."""
-    options: list[dict] = []
-    if not age_group:
-        options.extend(
-            [
-                {
-                    "id": "age_tre_em",
-                    "label": "Dưới 16 tuổi (Trẻ em)",
-                    "category": "age_group",
-                    "age_group_value": "tre_em",
-                },
-                {
-                    "id": "age_nguoi_truong_thanh",
-                    "label": "Từ 16–59 tuổi (Người trưởng thành)",
-                    "category": "age_group",
-                    "age_group_value": "nguoi_truong_thanh",
-                },
-                {
-                    "id": "age_nguoi_cao_tuoi",
-                    "label": "Từ 60 tuổi trở lên (Người cao tuổi)",
-                    "category": "age_group",
-                    "age_group_value": "nguoi_cao_tuoi",
-                },
-                {
-                    "id": "history_chronic",
-                    "label": "Có tiền sử tăng huyết áp / tim mạch / tiểu đường",
-                    "category": "medical_history",
-                    "age_group_value": None,
-                },
-            ]
-        )
-    else:
-        options.extend(
-            [
-                {
-                    "id": "history_chronic",
-                    "label": "Có tiền sử tăng huyết áp / tim mạch / tiểu đường",
-                    "category": "medical_history",
-                    "age_group_value": None,
-                },
-                {
-                    "id": "history_none",
-                    "label": "Không có bệnh mạn tính nào đã biết",
-                    "category": "medical_history",
-                    "age_group_value": None,
-                },
-                {
-                    "id": "detail_chest",
-                    "label": "Đau tức nặng vùng ngực trái khi đi lại",
-                    "category": "symptom_detail",
-                    "age_group_value": None,
-                },
-                {
-                    "id": "detail_fatigue",
-                    "label": "Chỉ mệt mỏi, ăn uống kém vài ngày nay",
-                    "category": "symptom_detail",
-                    "age_group_value": None,
-                },
-            ]
-        )
-    return options[:4]
-
 
 def _sanitise_clarification_options(raw: object, age_group: Optional[str]) -> list[dict]:
     """Keep only well-formed chips; pad short lists so the patient always has taps."""
@@ -1045,13 +901,6 @@ def _sanitise_clarification_options(raw: object, age_group: Optional[str]) -> li
             if len(options) == 4:
                 break
 
-    if len(options) < 2:
-        for fallback in _fallback_clarification_options(age_group):
-            if len(options) >= 4:
-                break
-            if fallback["id"] not in seen:
-                options.append(fallback)
-                seen.add(fallback["id"])
     return options
 
 
@@ -1090,7 +939,6 @@ def _sanitise_triage_payload(
     the LLM asks for clarification but forgets to populate it.
     """
     warnings: list[str] = []
-    clusters = _detect_organ_clusters(raw_text)
 
     def _text(key: str, limit: int = 500) -> str:
         value = payload.get(key)
@@ -1103,12 +951,10 @@ def _sanitise_triage_payload(
     except (TypeError, ValueError):
         department_id = 0
     if department_id not in VALID_DEPARTMENT_IDS:
-        fallback_department = clusters[0][0] if clusters else 1
         warnings.append(
-            f"department_id không hợp lệ ({payload.get('department_id')!r}); "
-            f"mặc định về khoa {fallback_department}."
+            f"department_id không hợp lệ ({payload.get('department_id')!r}); mặc định về khoa 1."
         )
-        department_id = fallback_department
+        department_id = 1
 
     priority = _text("priority_level", 8).upper().replace(" ", "")
     priority_was_missing = priority not in VALID_PRIORITIES
@@ -1172,63 +1018,65 @@ def _sanitise_triage_payload(
 
     clarifying_question = _text("clarifying_question", 240)
     clarification_options: list[dict] = []
+    # Parse model-driven clarifying questions (1..4).
+    clarifying_questions: list[dict] = []
+    raw_cqs = payload.get("clarifying_questions")
+    if isinstance(raw_cqs, list):
+        for idx, entry in enumerate(raw_cqs, 1):
+            if not isinstance(entry, dict):
+                continue
+            q = " ".join(str(entry.get("question") or "").split())[:300]
+            if not q:
+                continue
+            opts_raw = entry.get("options")
+            opts: list[str] = []
+            if isinstance(opts_raw, list):
+                for o in opts_raw:
+                    s = " ".join(str(o).split())[:120]
+                    if s:
+                        opts.append(s)
+            if len(opts) < 2:
+                continue
+            opts = opts[:4]
+            ident = " ".join(str(entry.get("id") or f"q_{idx}").split())[:60] or f"q_{idx}"
+            allow_custom = entry.get("allow_custom")
+            if not isinstance(allow_custom, bool):
+                allow_custom = True
+            clarifying_questions.append(
+                {"id": ident, "question": q, "options": opts, "allow_custom": allow_custom}
+            )
+            if len(clarifying_questions) == 4:
+                break
+
     if needs_clarification:
         clarification_options = _sanitise_clarification_options(
             payload.get("clarification_options"), detected_age_group
         )
+        if clarifying_questions:
+            first = clarifying_questions[0]
+            if not clarifying_question:
+                clarifying_question = first["question"]
+            if not clarification_options:
+                clarification_options = [
+                    {"id": f"opt_{i}", "label": o, "category": "symptom_detail", "age_group_value": None}
+                    for i, o in enumerate(first["options"], 1)
+                ]
         if not clarifying_question:
             clarifying_question = (
                 "Để chúng tôi phân luồng đúng, bạn vui lòng chọn thêm thông tin bên dưới nhé."
             )
 
-    # A clarification round must never blank the preliminary triage banner.
-    # The prompt asks the LLM to fill these fields; this is the deterministic
-    # backstop for omissions, malformed JSON and 3-specialty rambling cases.
     disease_guess = _text("disease_guess", 300)
     chief_complaint_summary = _text("chief_complaint_summary", 400)
-    assessment_missing = not disease_guess or disease_guess == "Chưa xác định"
-    if clusters:
-        primary_department, primary_acuity, _ = clusters[0]
-        if needs_clarification and assessment_missing:
-            department_id = primary_department
-            department_name = _DEPARTMENT_NAMES[department_id]
-        if not disease_guess or disease_guess == "Chưa xác định":
-            disease_guess = " / ".join(
-                _CLUSTER_DISEASE_FALLBACK[acuity] for _, acuity, _ in clusters
-            )[:300]
-        if not chief_complaint_summary:
-            chief_complaint_summary = "; ".join(
-                label.split(": ", 1)[-1] for _, _, label in clusters
-            )[:400]
-        if not icd10:
-            icd10 = _CLUSTER_ICD10_FALLBACK.get(primary_acuity, "")
-        if priority_was_missing:
-            priority = "P2" if primary_acuity >= 2 else "P3"
-        if secondary_department_id is None:
-            secondary_department_id = next(
-                (
-                    department
-                    for department, _, _ in clusters[1:]
-                    if department != primary_department
-                ),
-                None,
-            )
-            secondary_department_name = (
-                _DEPARTMENT_NAMES[secondary_department_id]
-                if secondary_department_id is not None
-                else None
-            )
-        distinct_departments = list(dict.fromkeys(dept for dept, _, _ in clusters))
-        if len(distinct_departments) >= 2 and (needs_clarification or not multi_specialty_note):
-            deterministic_note = _build_multi_specialty_note(clusters)
-            multi_specialty_note = (
-                f"{multi_specialty_note} {deterministic_note}".strip()
-                if multi_specialty_note
-                else deterministic_note
-            )[:500]
-    if not chief_complaint_summary and raw_text:
-        chief_complaint_summary = _normalise_voice_typos(raw_text)[:400]
-    disease_guess = disease_guess or "Chưa xác định"
+
+    if needs_clarification:
+        disease_guess = ""
+        icd10 = ""
+    else:
+        clarifying_questions = []
+
+    if not needs_clarification and not disease_guess:
+        disease_guess = "Chưa xác định"
 
     raw_out = payload.get("is_out_of_dataset")
     is_out_of_dataset = raw_out is True or (
@@ -1241,12 +1089,6 @@ def _sanitise_triage_payload(
     explicit_reason = flag_reason
     if is_out_of_dataset and not flag_reason:
         flag_reason = "NEW_SYMPTOM_PATTERN"
-    if not needs_clarification and (
-        best_score < OOD_SCORE_THRESHOLD or (not icd10 and not is_out_of_dataset)
-    ):
-        is_out_of_dataset = True
-        if not explicit_reason:
-            flag_reason = "LOW_SIMILARITY_MATCH"
     if not is_out_of_dataset:
         flag_reason = ""
 
@@ -1264,6 +1106,7 @@ def _sanitise_triage_payload(
             "needs_clarification": needs_clarification,
             "clarifying_question": clarifying_question,
             "clarification_options": clarification_options,
+            "clarifying_questions": clarifying_questions,
             "detected_age_group": detected_age_group,
             "is_out_of_dataset": is_out_of_dataset,
             "flag_reason": flag_reason,
@@ -1342,25 +1185,18 @@ def _extract_triage_facts(
     user_prompt = "\n\n".join(prompt_parts)
 
     llm_model = _runtime_model("llm_model", settings.LLM_MODEL_ID)
-    raw = get_groq_client().complete(
-        VOICE_TRIAGE_SYSTEM_PROMPT,
-        user_prompt,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        model=llm_model,
-    )
     logger.info("Triage LLM request using model '%s'", llm_model)
-
-    text = (raw or "").strip()
-    if text.startswith("```"):  # strip an accidental markdown fence
-        text = text.split("```")[1]
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning("LLM returned non-JSON triage output: %s", text[:200])
-        warnings = [f"Không đọc được JSON từ mô hình ({exc.msg}); dùng giá trị mặc định."]
+        payload = ambient.complete_json(
+            VOICE_TRIAGE_SYSTEM_PROMPT,
+            user_prompt,
+            model=llm_model,
+            settings=settings,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        logger.warning("LLM returned non-JSON triage output: %s", str(exc)[:200])
+        warnings = [f"Không đọc được JSON từ mô hình ({exc}); dùng giá trị mặc định."]
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
@@ -1381,7 +1217,8 @@ def _extract_triage_facts(
         facts["needs_clarification"] = False
         facts["clarifying_question"] = ""
         facts["clarification_options"] = []
-    return facts, fact_warnings
+        facts["clarifying_questions"] = []
+        return facts, fact_warnings
 
 
 #: Prepended to the advice whenever the clinic has already closed (17:00) and
@@ -1629,6 +1466,15 @@ class ClarificationOption(BaseModel):
     ] = None
 
 
+class ClarifyingQuestionItem(BaseModel):
+    """One Claude-style multi-question clarifying card item."""
+
+    id: str
+    question: str
+    options: list[str] = Field(min_length=2, max_length=4)
+    allow_custom: bool = True
+
+
 class RefineTriageRequest(BaseModel):
     """Answers selected by the patient in one adaptive clarification round."""
 
@@ -1640,6 +1486,7 @@ class RefineTriageRequest(BaseModel):
     target_date: Optional[str] = None
     clarification_history: list[dict[str, str]] = Field(default_factory=list)
     round_index: int = Field(default=1, ge=1, le=5)
+    qa_pairs: list[dict[str, str]] = Field(default_factory=list)
 
 
 class TextTriageRequest(BaseModel):
@@ -1685,6 +1532,7 @@ class VoiceScheduleTriageResponse(BaseModel):
     needs_clarification: bool = False
     clarifying_question: str = ""
     clarification_options: list[ClarificationOption] = Field(default_factory=list)
+    clarifying_questions: list[ClarifyingQuestionItem] = Field(default_factory=list)
     detected_age_group: Optional[str] = None
     is_out_of_dataset: bool = False
     flag_reason: str = ""
@@ -1824,10 +1672,20 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
         selected.append(payload.extra_note)
     history_turns = _clarification_turns(payload.clarification_history)
 
+    qa_pairs = [qa for qa in (payload.qa_pairs or []) if isinstance(qa, dict)]
+    qa_lines = []
+    for qa in qa_pairs:
+        q = " ".join(str(qa.get("question") or "").split())[:300]
+        a = " ".join(str(qa.get("answer") or "").split())[:500]
+        if q or a:
+            qa_lines.append(f"Q: {q or '(không rõ)'} -> A: {a or 'Bỏ qua'}")
+
     if not age_group:
         age_sources = [*selected, payload.extra_note or ""]
         for question, answer in history_turns:
             age_sources.extend([question, answer])
+        for qa in qa_pairs:
+            age_sources.append(str(qa.get("answer") or ""))
         for source in age_sources:
             lowered = source.lower()
             age_group = next((group for group in TRIAGE_AGE_GROUPS if group in lowered), None)
@@ -1837,9 +1695,12 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
     rag_parts: list[str] = [transcription]
     rag_parts.extend(answer for _, answer in history_turns)
     rag_parts.extend(selected)
+    rag_parts.extend(f"{qa.get('question','')} {qa.get('answer','')}" for qa in qa_pairs)
     rag_query = " ".join(
         dict.fromkeys(part.strip() for part in rag_parts if part and part.strip())
     )[:4000]
+    if not rag_query.strip():
+        rag_query = transcription
 
     context, sources, warnings, best_score = _retrieve_triage_context(
         rag_query, settings, age_group=age_group
@@ -1854,7 +1715,7 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
         is_refinement=True,
         best_score=best_score,
         clarification_history=payload.clarification_history,
-        round_index=payload.round_index,
+        round_index=MAX_CLARIFICATION_ROUNDS,
     )
     warnings.extend(fact_warnings)
 
