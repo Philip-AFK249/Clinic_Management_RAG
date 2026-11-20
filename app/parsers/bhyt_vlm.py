@@ -32,6 +32,9 @@ MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 
 # Number of characters on a Vietnamese BHYT card number (2 letters + 13 digits)
 INSURANCE_CODE_LENGTH = 15
+_VALID_INSURANCE_CODE_RE = re.compile(
+    rf"[A-Za-z0-9]{{{INSURANCE_CODE_LENGTH}}}\Z"
+)
 
 BHYT_SYSTEM_PROMPT = """Bạn là chuyên gia OCR bóc tách thông tin thẻ Bảo hiểm Y tế (BHYT) Việt Nam.
 
@@ -385,13 +388,21 @@ def normalise_bhyt_payload(raw: Mapping[str, object]) -> BhytData:
     data.insuranceCode = data.ma_so_bhyt
     data.dateOfBirth = to_iso_date(data.ngay_sinh)
     data.gender = data.gioi_tinh
-    data.initialHospitalCode = data.noi_kham_chua_benh_ban_dau
+    # The React booking form and the Spring Boot services store one display
+    # string: the facility code plus its name ("79-014 (BV Đa Khoa Sài Gòn)").
+    # Fall back to the bare code when the name was illegible on the card.
+    data.initialHospitalCode = data.noi_kcb_ban_dau_full or data.ma_noi_dkkcb_ban_dau
     data.validFrom = to_iso_date(data.gia_tri_su_dung_tu)
     data.validUntil = to_iso_date(data.gia_tri_su_dung_den)
     # An unknown expiry is not evidence of expiry; only con_han=False implies it.
     data.isExpired = not (data.con_han if data.con_han is not None else True)
+    # A card only counts as OCR-verified when both identity anchors were read:
+    # a well-formed 15-character code AND a non-empty full name.
     data.isOcrVerified = bool(
-        data.ma_so_bhyt and len(data.ma_so_bhyt) == INSURANCE_CODE_LENGTH
+        data.ma_so_bhyt
+        and _VALID_INSURANCE_CODE_RE.fullmatch(data.ma_so_bhyt)
+        and data.ho_ten
+        and data.ho_ten.strip()
     )
 
     return data
@@ -477,8 +488,12 @@ def validate_bhyt(data: BhytData) -> list[str]:
         warnings.append(
             f"ma_so_bhyt: Mã thẻ có {len(code)}/{INSURANCE_CODE_LENGTH} ký tự - cần kiểm tra lại."
         )
+    elif _VALID_INSURANCE_CODE_RE.fullmatch(code) is None:
+        warnings.append(
+            "ma_so_bhyt: Mã thẻ chứa ký tự không hợp lệ - chỉ cho phép chữ và số."
+        )
 
-    if not data.ho_ten:
+    if not (data.ho_ten or "").strip():
         warnings.append("ho_ten: Chưa đọc được họ tên - vui lòng nhập tay.")
 
     if not data.ngay_sinh:
@@ -486,12 +501,46 @@ def validate_bhyt(data: BhytData) -> list[str]:
     elif _parse_iso_date(data.ngay_sinh) is None:
         warnings.append(f"ngay_sinh: Định dạng '{data.ngay_sinh}' không đúng DD/MM/YYYY.")
 
-    if not data.gioi_tinh:
+    if not (data.gioi_tinh or "").strip():
         warnings.append("gioi_tinh: Chưa đọc được giới tính - vui lòng chọn tay.")
 
+    # The initial healthcare facility must be human-checked whenever either
+    # half of it is missing; a card is not safe to book against without it.
+    if not data.ma_noi_dkkcb_ban_dau and not data.noi_kham_chua_benh_ban_dau:
+        warnings.append(
+            "noi_kham_chua_benh_ban_dau: Chưa đọc được nơi khám chữa bệnh ban đầu - "
+            "vui lòng kiểm tra và nhập tay."
+        )
+    elif not data.ma_noi_dkkcb_ban_dau:
+        warnings.append(
+            "ma_noi_dkkcb_ban_dau: Chưa đọc được mã nơi khám chữa bệnh ban đầu - "
+            "vui lòng kiểm tra và nhập tay."
+        )
+    elif not data.noi_kham_chua_benh_ban_dau:
+        warnings.append(
+            "noi_kham_chua_benh_ban_dau: Chưa đọc được tên nơi khám chữa bệnh ban đầu - "
+            "vui lòng kiểm tra và nhập tay."
+        )
+
+    if not data.gia_tri_su_dung_tu:
+        warnings.append(
+            "gia_tri_su_dung_tu: Chưa đọc được ngày bắt đầu hiệu lực - vui lòng kiểm tra."
+        )
+    elif _parse_iso_date(data.gia_tri_su_dung_tu) is None:
+        warnings.append(
+            f"gia_tri_su_dung_tu: Định dạng '{data.gia_tri_su_dung_tu}' không đúng DD/MM/YYYY."
+        )
+
     if not data.gia_tri_su_dung_den:
-        warnings.append("gia_tri_su_dung_den: Không đọc được ngày hết hạn - không xác định được còn hạn.")
-    elif data.con_han is False:
+        warnings.append(
+            "gia_tri_su_dung_den: Không đọc được ngày hết hạn - không xác định được còn hạn."
+        )
+    elif _parse_iso_date(data.gia_tri_su_dung_den) is None:
+        warnings.append(
+            f"gia_tri_su_dung_den: Định dạng '{data.gia_tri_su_dung_den}' không đúng DD/MM/YYYY."
+        )
+
+    if data.con_han is False or data.isExpired is True:
         warnings.append("gia_tri_su_dung_den: Thẻ đã HẾT HẠN - vui lòng liên hệ cơ quan BHXH.")
 
     return warnings
