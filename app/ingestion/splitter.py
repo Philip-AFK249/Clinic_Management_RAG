@@ -387,6 +387,16 @@ def chunk_markdown_text(text: str, max_chars: int = 1200, overlap: int = 150) ->
     return [c for c in _pack_blocks(_split_blocks(text), max_chars, overlap) if c.strip()]
 
 
+_AGE_GROUP_RE = re.compile(
+    r"(?<![a-z0-9_])(tre_em|nguoi_truong_thanh|nguoi_cao_tuoi|tat_ca)(?![a-z0-9_])"
+)
+
+
+def age_group_markers(chunk: str) -> List[str]:
+    """Canonical age-group tokens found in a chunk, including table rows."""
+    return _AGE_GROUP_RE.findall(chunk)
+
+
 def table_row_count(chunk: str) -> int:
     """Number of Markdown table rows in ``chunk`` (diagnostics helper)."""
     return sum(1 for line in chunk.splitlines() if _TABLE_ROW_RE.match(line))

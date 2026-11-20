@@ -31,7 +31,14 @@ class HybridResult:
         return self.result.specialty
 
 
-def _fts_results(query: str, top_k: int, specialty: Optional[str]) -> List[tuple]:
+def _fts_results(
+    query: str,
+    top_k: int,
+    specialty: Optional[str],
+    age_group: Optional[str] = None,
+    target_audience: Optional[str] = None,
+    settings: Settings | None = None,
+) -> List[tuple]:
     sql = """
         SELECT id, doc_id, specialty, content, ts_rank_cd(
             to_tsvector('simple', content),
@@ -40,13 +47,22 @@ def _fts_results(query: str, top_k: int, specialty: Optional[str]) -> List[tuple
         FROM clinic_knowledge_nodes
     """
     params = [query]
+    where = []
     if specialty and specialty != "all":
-        sql += " WHERE specialty = %s"
+        where.append("specialty = %s")
         params.append(specialty)
+    if target_audience and target_audience != "all":
+        where.append("target_audience = %s")
+        params.append(target_audience)
+    if age_group and age_group not in {"all", "tat_ca"}:
+        where.append("(age_group = %s OR age_group = 'tat_ca')")
+        params.append(age_group)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY rank DESC NULLS LAST LIMIT %s;"
     params.append(top_k)
 
-    with get_connection(get_settings()) as conn:
+    with get_connection(settings or get_settings()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -63,6 +79,7 @@ def hybrid_search(
     c: float = 0.5,
     specialty: Optional[str] = None,
     target_audience: Optional[str] = None,
+    age_group: Optional[str] = None,
     settings: Settings | None = None,
 ) -> List[HybridResult]:
     """Run dense + full-text search and fuse results via reciprocal rank fusion."""
@@ -72,9 +89,17 @@ def hybrid_search(
         top_k=top_k * 2,
         specialty=specialty,
         target_audience=target_audience,
+        age_group=age_group,
         settings=settings,
     )
-    fts_results = _fts_results(query, top_k * 2, specialty)
+    fts_results = _fts_results(
+        query,
+        top_k * 2,
+        specialty,
+        age_group=age_group,
+        target_audience=target_audience,
+        settings=settings,
+    )
 
     dense_id_map = {r.id: (i, r) for i, r in enumerate(dense_results, 1)}
     fts_id_map = {r[0]: (i, r) for i, r in enumerate(fts_results, 1)}

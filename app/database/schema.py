@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     doc_id TEXT NOT NULL,
     specialty TEXT NOT NULL,
     target_audience TEXT NOT NULL DEFAULT 'bac_si',
+    age_group TEXT NOT NULL DEFAULT 'tat_ca',
     content TEXT NOT NULL,
     dense_embedding vector(1024) NOT NULL,
     metadata JSONB,
@@ -40,9 +41,20 @@ CREATE INDEX IF NOT EXISTS idx_clinic_nodes_specialty
 ON {TABLE_NAME} (specialty);
 """
 
+ADD_AGE_GROUP_SQL = f"""
+ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS age_group TEXT NOT NULL DEFAULT 'tat_ca';
+"""
+
+CREATE_INDEX_ON_AGE_GROUP_SQL = f"""
+CREATE INDEX IF NOT EXISTS idx_clinic_nodes_age_group
+ON {TABLE_NAME} (age_group);
+"""
+
 # UNIQUE: a chunk's entity markers (used by optional dedupe)
 _STATEMENTS: list[str] = [
     CREATE_TABLE_SQL,
+    ADD_AGE_GROUP_SQL,
+    CREATE_INDEX_ON_AGE_GROUP_SQL,
     CREATE_INDEX_ON_SPECIALTY_SQL,
     CREATE_HNSW_INDEX_SQL,
     CREATE_GIN_CONTENT_INDEX_SQL,

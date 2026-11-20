@@ -82,6 +82,20 @@ VOICE_ALLOWED_EXTENSIONS = (".wav", ".webm", ".m4a", ".mp3", ".ogg", ".flac")
 VOICE_MAX_BYTES = 25 * 1024 * 1024  # Groq's per-file STT ceiling
 VALID_DEPARTMENT_IDS = (1, 2, 3)
 VALID_PRIORITIES = ("P1", "P2", "P3")
+TRIAGE_AGE_GROUPS = ("tre_em", "nguoi_truong_thanh", "nguoi_cao_tuoi", "tat_ca")
+AGE_GROUP_LABELS = {
+    "tre_em": "Trẻ em (< 16 tuổi)",
+    "nguoi_truong_thanh": "Người trưởng thành (16–59 tuổi)",
+    "nguoi_cao_tuoi": "Người cao tuổi (≥ 60 tuổi)",
+    "tat_ca": "Mọi lứa tuổi",
+}
+_P1_RED_FLAG_RE = re.compile(
+    r"(tức ngực|đau thắt ngực|đau[^.]{0,20}ngực[^.]{0,30}(dữ dội|nặng|liên tục|kéo dài|không giảm)"
+    r"|méo miệng|liệt nửa người|yếu nửa người|nói đớ|thất ngôn|đột quỵ"
+    r"|khó thở (nặng|dữ dội|nghẹt)|ngộp thở|không thở được|sốc phản vệ"
+    r"|(nôn|đi cầu|đại tiện|ho) ra máu|phân đen|chảy máu ồ ạt|hôn mê|lơ mơ|co giật|ngất xỉu)",
+    re.IGNORECASE,
+)
 
 # Privacy rule for the ambient consultation: audio is NEVER written to disk.
 # Starlette spools every multipart file part above 1 MB into a SpooledTemporaryFile
@@ -135,10 +149,18 @@ Quy tắc bắt buộc:
    - secondary_department_id = khoa phụ (khoa còn lại) và secondary_department_name đúng tên khoa phụ đó.
    - Nếu triệu chứng chỉ nằm ở MỘT chuyên khoa: secondary_department_id = null, secondary_department_name = null, multi_specialty_note = "".
    - Nếu hai triệu chứng cùng mức ưu tiên, chọn triệu chứng nguy hiểm/gây tàn phế hơn làm khoa chính.
-   - multi_specialty_note: 1 câu tiếng Việt nêu hướng xử trí (khoa nào xử trí trước, khoa nào hội chẩn sau).
+    - multi_specialty_note: 1 câu tiếng Việt nêu hướng xử trí (khoa nào xử trí trước, khoa nào hội chẩn sau).
+8. LÀM RÕ KHI LỜI KỂ MƠ HỒ (chỉ áp dụng ở lượt đầu, khi chưa có [CÂU TRẢ LỜI LÀM RÕ]):
+   - Nếu bệnh nhân nói lang mang, mô tả mờ, kể nhiều triệu chứng không rõ cái nào là chính, hoặc thiếu độ tuổi / tiền sử để phân biệt nguy cơ thấp và cao (ví dụ người lớn tuổi chỉ nói "mệt, tức ngực" nhưng không rõ tuổi và không nói tiền sử tim mạch), hãy đặt needs_clarification=true.
+   - Khi cần làm rõ, chỉ viết MỘT câu clarifying_question ngắn gọn, đồng cảm bằng tiếng Việt và đưa 3-4 clarification_options cụ thể, dễ chạm: xác nhận nhóm tuổi (nếu chưa có [NHÓM TUỔI]), một mục tiền sử liên quan, và 1-2 mục phân biệt triệu chứng bằng ngôn ngữ đời thường, không dùng thuật ngữ y khoa.
+   - Mỗi option có id duy nhất, label ngắn gọn bằng tiếng Việt, category là "age_group" | "medical_history" | "symptom_detail"; option độ tuổi phải kèm age_group_value là "tre_em" | "nguoi_truong_thanh" | "nguoi_cao_tuoi" | "tat_ca".
+   - Không hỏi lại nếu [NHÓM TUỔI], [TIỀN SỬ] đã có và lời kể đã đủ rõ để phân luồng.
+9. ƯU TIÊN P1 GHI ĐÈ LÀM RÕ: nếu có dấu hiệu đe dọa tính mạng (đau ngực dữ dội/kéo dài, méo miệng/yếu nửa người/nói đớ, khó thở nặng, sốc phản vệ, nôn hoặc đi cầu ra máu), luôn đặt needs_clarification=false và priority_level="P1" ngay, KHÔNG bắt bệnh nhân chờ trả lời.
+10. LƯỢT TINH CHỈNH (khi prompt có [CÂU TRẢ LỜI LÀM RÕ]): luôn đặt needs_clarification=false; tổng hợp lời kể gốc, các câu đã chọn và ngữ cảnh lọc theo nhóm tuổi để trả về chẩn đoán cuối cùng.
+11. [NHÓM TUỔI], [TIỀN SỬ] và [CÂU TRẢ LỜI LÀM RÕ] trong prompt là thông tin đã xác nhận, được phép dùng để suy luận.
 
 Định dạng JSON bắt buộc:
-{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "..."}
+{"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "detected_age_group": null}
 
 Ví dụ đầu ra khi đa chuyên khoa:
 {"disease_guess": "Hội chứng vành cấp nghi ngờ / Kèm Viêm da dị ứng", "icd10_code": "I21", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P1", "chief_complaint_summary": "Đau tức ngực trái lan vai kèm ngứa rát ngoài da", "secondary_department_id": 3, "secondary_department_name": "Khoa Da liễu", "multi_specialty_note": "Cần ưu tiên xử trí tim mạch khẩn cấp; sau khi ổn định đề xuất hội chẩn chuyên khoa Da liễu."}"""
@@ -612,26 +634,186 @@ async def _retrieve_knowledge_safely(
         return "", [], [f"Không truy xuất được phác đồ Bộ Y tế ({detail})."]
 
 
-def _retrieve_triage_context(transcription: str, settings) -> tuple[str, list[str], list[str]]:
-    """Stage 1b: Fast clinical triage context (Bypasses local 2.2GB bge-m3 download/CPU inference)."""
-    context = (
-        "B\u1ea2NG PH\u00c2N LU\u1ed2NG CHUY\u00caN KHOA PH\u00d2NG KH\u00c1M:\n"
-        "- Khoa 1: N\u1ed9i T\u1ed5ng qu\u00e1t & Tim m\u1ea1ch (departmentId = 1). C\u00e1c b\u1ec7nh: \u0110au th\u1eaft ng\u1ef1c (I21), \u0110\u1ed9t qu\u1ef5 (I63), "
-        "T\u0103ng huy\u1ebft \u00e1p k\u1ecbch ph\u00e1t (I10), Suy tim (I50), R\u1ed1i lo\u1ea1n nh\u1ecbp tim (I49), Tr\u00e0o ng\u01b0\u1ee3c d\u1ea1 d\u00e0y (K21), "
-        "\u0110\u00e1i th\u00e1o \u0111\u01b0\u1eddng (E11), C\u01a1n g\u00fat c\u1ea5p (M10), B\u1ec7nh th\u1eadn m\u1ea1n (N18).\n"
-        "- Khoa 2: H\u00f4 h\u1ea5p & D\u1ecb \u1ee9ng - Mi\u1ec5n d\u1ecbch l\u00e2m s\u00e0ng / Tai M\u0169i H\u1ecdng (departmentId = 2). C\u00e1c b\u1ec7nh: S\u1ed1c ph\u1ea3n v\u1ec7 (T78.2), "
-        "Hen ph\u1ebf qu\u1ea3n c\u1ea5p (J45), \u0110\u1ee3t c\u1ea5p COPD (J44.0), Vi\u00eam ph\u1ed5i (J18), \u00c1p xe amidan (J36), Vi\u00eam tai gi\u1eefa (H66), "
-        "Vi\u00eam h\u1ecdng c\u1ea5p (J02), Vi\u00eam m\u0169i xoang (J01), Vi\u00eam m\u0169i d\u1ecb \u1ee9ng (J30), Vi\u00eam ph\u1ebf qu\u1ea3n (J20).\n"
-        "- Khoa 3: Da li\u1ec5u (departmentId = 3). C\u00e1c b\u1ec7nh: Stevens-Johnson (L51.2), \u0110\u1ecf da to\u00e0n th\u00e2n (L53.9), "
-        "Zona th\u1ea7n kinh (B02), \u00c1p xe da / Nh\u1ecdt (L02), Ch\u1ed1c l\u1edf (L01), Vi\u00eam da ti\u1ebfp x\u00fac (L23), V\u1ea3y n\u1ebfn (L40.0), "
-        "Gh\u1ebb (B86), N\u1ea5m da (B35), Tr\u1ee9ng c\u00e1 (L70.0)."
-    )
-    sources = ["Tri th\u1ee9c l\u00e2m s\u00e0ng chu\u1ea9n B\u1ed9 Y t\u1ebf (Fast-Triage)"]
+_FALLBACK_TRIAGE_CONTEXT = (
+    "BẢNG PHÂN LUỒNG CHUYÊN KHOA PHÒNG KHÁM:\n"
+    "- Khoa 1: Nội Tổng quát & Tim mạch (departmentId = 1). Các bệnh: Đau thắt ngực (I21), Đột quỵ (I63), "
+    "Tăng huyết áp kịch phát (I10), Suy tim (I50), Rối loạn nhịp tim (I49), Trào ngược dạ dày (K21), "
+    "Đái tháo đường (E11), Cơn gút cấp (M10), Bệnh thận mạn (N18).\n"
+    "- Khoa 2: Hô hấp & Dị ứng - Miễn dịch lâm sàng / Tai Mũi Họng (departmentId = 2). Các bệnh: Sốc phản vệ (T78.2), "
+    "Hen phế quản cấp (J45), Đợt cấp COPD (J44.0), Viêm phổi (J18), Áp xe amidan (J36), Viêm tai giữa (H66), "
+    "Viêm họng cấp (J02), Viêm mũi xoang (J01), Viêm mũi dị ứng (J30), Viêm phế quản (J20).\n"
+    "- Khoa 3: Da liễu (departmentId = 3). Các bệnh: Stevens-Johnson (L51.2), Đỏ da toàn thân (L53.9), "
+    "Zona thần kinh (B02), Áp xe da / Nhọt (L02), Chốc lở (L01), Viêm da tiếp xúc (L23), Vảy nến (L40.0), "
+    "Ghẻ (B86), Nấm da (B35), Trứng cá (L70.0)."
+)
+
+
+def _retrieve_triage_context(
+    transcription: str, settings, age_group: Optional[str] = None
+) -> tuple[str, list[str], list[str]]:
+    """Stage 1b: age-filtered RAG chunks, or the built-in department summary.
+
+    The fallback is used only when pgvector is unreachable, retrieval throws, or
+    no row matched - triage must still work on an offline/clinic-local cluster.
+    """
     warnings: list[str] = []
-    return (context, sources, warnings)
+    if ambient.pgvector_reachable(settings):
+        try:
+            from app.rag.retriever import retrieve_context
+
+            results = retrieve_context(
+                transcription,
+                top_k=5,
+                target_audience="tiep_don",
+                age_group=age_group,
+                settings=settings,
+            )
+            if results:
+                context = "\n\n---\n\n".join(result.content for result in results)
+                sources: list[str] = []
+                for result in results:
+                    label = (
+                        f"{result.doc_id} ({result.specialty})"
+                        if result.specialty
+                        else str(result.doc_id)
+                    )
+                    if label not in sources:
+                        sources.append(label)
+                logger.info(
+                    "Triage RAG: %d chunk(s), age_group=%s",
+                    len(results),
+                    age_group or "all",
+                )
+                return context, sources, warnings
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}".strip().splitlines()[0][:200]
+            logger.warning("Triage RAG retrieval failed: %s", detail)
+            warnings.append(f"Không truy xuất được triệu chứng theo nhóm tuổi ({detail}).")
+
+    return (
+        _FALLBACK_TRIAGE_CONTEXT,
+        ["Tri thức lâm sàng chuẩn Bộ Y tế (Fast-Triage)"],
+        warnings,
+    )
 
 
-def _sanitise_triage_payload(payload: dict) -> tuple[dict, list[str]]:
+def _normalise_age_group(value: object) -> Optional[str]:
+    """Fold a supplied age stratum onto one of the four canonical keys."""
+    if not isinstance(value, str):
+        return None
+    key = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return key if key in TRIAGE_AGE_GROUPS else None
+
+
+def _fallback_clarification_options(age_group: Optional[str]) -> list[dict]:
+    """Concrete chips used when the model flags ambiguity without usable options."""
+    options: list[dict] = []
+    if not age_group:
+        options.extend(
+            [
+                {
+                    "id": "age_tre_em",
+                    "label": "Dưới 16 tuổi (Trẻ em)",
+                    "category": "age_group",
+                    "age_group_value": "tre_em",
+                },
+                {
+                    "id": "age_nguoi_truong_thanh",
+                    "label": "Từ 16–59 tuổi (Người trưởng thành)",
+                    "category": "age_group",
+                    "age_group_value": "nguoi_truong_thanh",
+                },
+                {
+                    "id": "age_nguoi_cao_tuoi",
+                    "label": "Từ 60 tuổi trở lên (Người cao tuổi)",
+                    "category": "age_group",
+                    "age_group_value": "nguoi_cao_tuoi",
+                },
+                {
+                    "id": "history_chronic",
+                    "label": "Có tiền sử tăng huyết áp / tim mạch / tiểu đường",
+                    "category": "medical_history",
+                    "age_group_value": None,
+                },
+            ]
+        )
+    else:
+        options.extend(
+            [
+                {
+                    "id": "history_chronic",
+                    "label": "Có tiền sử tăng huyết áp / tim mạch / tiểu đường",
+                    "category": "medical_history",
+                    "age_group_value": None,
+                },
+                {
+                    "id": "history_none",
+                    "label": "Không có bệnh mạn tính nào đã biết",
+                    "category": "medical_history",
+                    "age_group_value": None,
+                },
+                {
+                    "id": "detail_chest",
+                    "label": "Đau tức nặng vùng ngực trái khi đi lại",
+                    "category": "symptom_detail",
+                    "age_group_value": None,
+                },
+                {
+                    "id": "detail_fatigue",
+                    "label": "Chỉ mệt mỏi, ăn uống kém vài ngày nay",
+                    "category": "symptom_detail",
+                    "age_group_value": None,
+                },
+            ]
+        )
+    return options[:4]
+
+
+def _sanitise_clarification_options(raw: object, age_group: Optional[str]) -> list[dict]:
+    """Keep only well-formed chips; pad short lists so the patient always has taps."""
+    options: list[dict] = []
+    seen: set[str] = set()
+    categories = {"age_group", "medical_history", "symptom_detail"}
+    if isinstance(raw, list):
+        for idx, entry in enumerate(raw, 1):
+            if not isinstance(entry, dict):
+                continue
+            label = " ".join(str(entry.get("label") or "").split())[:120]
+            category = str(entry.get("category") or "").strip()
+            if not label or category not in categories:
+                continue
+            ident = " ".join(str(entry.get("id") or f"opt_{idx}").split())[:60] or f"opt_{idx}"
+            if ident in seen:
+                continue
+            seen.add(ident)
+            options.append(
+                {
+                    "id": ident,
+                    "label": label,
+                    "category": category,
+                    "age_group_value": (
+                        _normalise_age_group(entry.get("age_group_value"))
+                        if category == "age_group"
+                        else None
+                    ),
+                }
+            )
+            if len(options) == 4:
+                break
+
+    if len(options) < 3:
+        for fallback in _fallback_clarification_options(age_group):
+            if len(options) >= 4:
+                break
+            if fallback["id"] not in seen:
+                options.append(fallback)
+                seen.add(fallback["id"])
+    return options
+
+
+def _sanitise_triage_payload(
+    payload: dict, is_refinement: bool = False, age_group: Optional[str] = None
+) -> tuple[dict, list[str]]:
     """Validate the LLM's JSON against the clinical contract before using it.
 
     The LLM is untrusted: an out-of-range department, an unknown priority or a
@@ -702,6 +884,25 @@ def _sanitise_triage_payload(payload: dict) -> tuple[dict, list[str]]:
     )
     multi_specialty_note = _text("multi_specialty_note", 500)
 
+    detected_age_group = _normalise_age_group(payload.get("detected_age_group")) or age_group
+    raw_needs = payload.get("needs_clarification")
+    needs_clarification = raw_needs is True or (
+        isinstance(raw_needs, str) and raw_needs.strip().lower() in {"true", "1", "yes"}
+    )
+    if priority == "P1" or is_refinement:
+        needs_clarification = False
+
+    clarifying_question = _text("clarifying_question", 240)
+    clarification_options: list[dict] = []
+    if needs_clarification:
+        clarification_options = _sanitise_clarification_options(
+            payload.get("clarification_options"), detected_age_group
+        )
+        if not clarifying_question:
+            clarifying_question = (
+                "Để chúng tôi phân luồng đúng, bạn vui lòng chọn thêm thông tin bên dưới nhé."
+            )
+
     return (
         {
             "disease_guess": _text("disease_guess", 300) or "Chưa xác định",
@@ -713,19 +914,52 @@ def _sanitise_triage_payload(payload: dict) -> tuple[dict, list[str]]:
             "secondary_department_id": secondary_department_id,
             "secondary_department_name": secondary_department_name,
             "multi_specialty_note": multi_specialty_note,
+            "needs_clarification": needs_clarification,
+            "clarifying_question": clarifying_question,
+            "clarification_options": clarification_options,
+            "detected_age_group": detected_age_group,
         },
         warnings,
     )
 
 
-def _extract_triage_facts(transcription: str, context: str, settings) -> tuple[dict, list[str]]:
+def _has_p1_red_flag(text: str) -> bool:
+    """Conservative keyword guard so a red flag is never delayed by clarification."""
+    return bool(_P1_RED_FLAG_RE.search(text or ""))
+
+
+def _extract_triage_facts(
+    transcription: str,
+    context: str,
+    settings,
+    age_group: Optional[str] = None,
+    patient_history: Optional[str] = None,
+    selected_clarifications: Optional[list[str]] = None,
+    is_refinement: bool = False,
+) -> tuple[dict, list[str]]:
     """Stage 1c: force the LLM into a single JSON object and validate it."""
     from app.rag.generator import get_groq_client
 
-    user_prompt = (
-        f"[NGỮ CẠNH TRIỆU CHỨNG]\n{context}\n\n"
-        f"[LỜI KỂ BỆNH NHÂN]\n{transcription}"
-    )
+    prompt_parts = [
+        f"[NGỮ CẠNH TRIỆU CHỨNG]\n{context}",
+        f"[LỜI KỂ BỆNH NHÂN]\n{transcription}",
+    ]
+    if age_group:
+        prompt_parts.append(f"[NHÓM TUỔI ĐÃ XÁC NHẬN]\n{AGE_GROUP_LABELS.get(age_group, age_group)}")
+    if patient_history:
+        prompt_parts.append(f"[TIỀN SỬ BỆNH NHÂN]\n{patient_history.strip()[:500]}")
+    if is_refinement:
+        answers = [item for item in (selected_clarifications or []) if item]
+        prompt_parts.append(
+            "[CÂU TRẢ LỜI LÀM RÕ]\n"
+            + ("\n".join(f"- {answer[:300]}" for answer in answers) or "- (không có)")
+            + "\nĐây là lượt tinh chỉnh: hãy chốt kết quả cuối cùng, needs_clarification=false."
+        )
+    else:
+        prompt_parts.append(
+            "[CHẾ ĐỘ]\nLượt đầu: áp dụng quy tắc làm rõ và ghi đè P1 trong system prompt."
+        )
+    user_prompt = "\n\n".join(prompt_parts)
     llm_model = _runtime_model("llm_model", settings.LLM_MODEL_ID)
     raw = get_groq_client().complete(
         VOICE_TRIAGE_SYSTEM_PROMPT,
@@ -749,7 +983,20 @@ def _extract_triage_facts(transcription: str, context: str, settings) -> tuple[d
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
-    return _sanitise_triage_payload(payload)
+
+    facts, fact_warnings = _sanitise_triage_payload(
+        payload,
+        is_refinement=is_refinement,
+        age_group=age_group,
+    )
+    if not is_refinement and _has_p1_red_flag(f"{transcription} {patient_history or ''}"):
+        if facts["priority_level"] != "P1":
+            fact_warnings.append("Phát hiện dấu hiệu đe dọa tính mạng; đã ghi đè mức ưu tiên P1.")
+        facts["priority_level"] = "P1"
+        facts["needs_clarification"] = False
+        facts["clarifying_question"] = ""
+        facts["clarification_options"] = []
+    return facts, fact_warnings
 
 
 #: Prepended to the advice whenever the clinic has already closed (17:00) and
@@ -918,24 +1165,126 @@ def _build_base_advice(
 
 
 def _run_voice_triage(
-    audio: bytes, filename: str, target_date: Optional[str]
+    audio: bytes,
+    filename: str,
+    target_date: Optional[str],
+    age_group: Optional[str] = None,
+    patient_history: Optional[str] = None,
 ) -> VoiceScheduleTriageResponse:
     """Blocking two-stage body, executed off the event loop."""
     started = time.perf_counter()
     settings = get_settings()
+    age_group = _normalise_age_group(age_group)
 
     transcription = _transcribe_voice(audio, filename, settings)
     logger.info("STT (%d chars): %s", len(transcription), transcription[:120])
 
-    context, sources, warnings = _retrieve_triage_context(transcription, settings)
-    facts, fact_warnings = _extract_triage_facts(transcription, context, settings)
+    context, sources, warnings = _retrieve_triage_context(
+        transcription, settings, age_group=age_group
+    )
+    facts, fact_warnings = _extract_triage_facts(
+        transcription,
+        context,
+        settings,
+        age_group=age_group,
+        patient_history=patient_history,
+    )
     warnings.extend(fact_warnings)
 
-    # Stage 2: deterministic. The inferred department id is the only input.
-    # query_department_schedule degrades instead of raising, so this call always
-    # returns and the client always gets HTTP 200. The target date is passed
-    # straight through so normalise_target_date can apply the post-17:00
-    # rollover to tomorrow; its normalized value comes back in the payload.
+    if facts.get("needs_clarification"):
+        logger.info(
+            "Triage clarification: age_group=%s question=%s",
+            age_group or "all",
+            facts.get("clarifying_question", "")[:120],
+        )
+        return VoiceScheduleTriageResponse(
+            success=True,
+            transcription=transcription,
+            recommended_shift="",
+            advice="",
+            schedule={},
+            schedule_connected=True,
+            target_date=target_date or "",
+            rag_sources=sources,
+            warnings=warnings,
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            **facts,
+        )
+
+    return _complete_triage_with_schedule(
+        facts, transcription, target_date, sources, warnings, started, settings
+    )
+
+
+class ClarificationOption(BaseModel):
+    """One tappable chip offered when the spoken symptoms are ambiguous."""
+
+    id: str
+    label: str
+    category: Literal["age_group", "medical_history", "symptom_detail"]
+    age_group_value: Optional[
+        Literal["tre_em", "nguoi_truong_thanh", "nguoi_cao_tuoi", "tat_ca"]
+    ] = None
+
+
+class RefineTriageRequest(BaseModel):
+    """Answers selected by the patient after the first clarification round."""
+
+    transcription: str
+    selected_options: list[str] = Field(default_factory=list)
+    extra_note: Optional[str] = ""
+    age_group: Optional[str] = None
+    patient_history: Optional[str] = None
+    target_date: Optional[str] = None
+
+
+class VoiceScheduleTriageResponse(BaseModel):
+
+    success: bool = True
+    transcription: str
+    disease_guess: str
+    icd10_code: str
+    department_id: int
+    department_name: str
+    priority_level: str
+    chief_complaint_summary: str
+    secondary_department_id: Optional[int] = Field(
+        default=None,
+        description="Khoa phụ cần khám kèm nếu có triệu chứng đa cơ quan",
+    )
+    secondary_department_name: Optional[str] = Field(default=None)
+    multi_specialty_note: Optional[str] = Field(default="")
+    recommended_shift: str
+    advice: str
+    schedule: dict[str, Optional[SessionSchedule]] = Field(
+        default_factory=dict,
+        description="morning/afternoon are null when the schedule service is unreachable",
+    )
+    schedule_connected: bool = Field(
+        default=True,
+        description="False = Stage 2 degraded; clinical triage is still valid",
+    )
+    schedule_error: str = ""
+    target_date: str = ""
+    rag_sources: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    latency_ms: float = 0.0
+    needs_clarification: bool = False
+    clarifying_question: str = ""
+    clarification_options: list[ClarificationOption] = Field(default_factory=list)
+    detected_age_group: Optional[str] = None
+
+
+def _complete_triage_with_schedule(
+    facts: dict,
+    transcription: str,
+    target_date: Optional[str],
+    sources: list[str],
+    warnings: list[str],
+    started: float,
+    settings,
+) -> VoiceScheduleTriageResponse:
+    """Stage 2: deterministic schedule lookup shared by first pass and refinement."""
     schedule_payload = query_department_schedule(
         facts["department_id"], target_date, settings
     )
@@ -951,9 +1300,6 @@ def _run_voice_triage(
             if data:
                 schedule[label] = SessionSchedule(**data)
     else:
-        # Service reachable but the roster is empty (shift deleted/replaced),
-        # or the service itself is down: expose no shift availability but keep
-        # the clinical triage answer at HTTP 200.
         schedule["morning"] = None
         schedule["afternoon"] = None
         if not connected:
@@ -962,7 +1308,6 @@ def _run_voice_triage(
                 warnings.append(f"Chi tiết lỗi lịch trực: {schedule_payload['detail']}")
 
     if _schedule_rolled_to_tomorrow(schedule_payload):
-        # schedule_payload["target_date"] already carries the next-day date.
         warnings.append(ROLLOVER_WARNING)
 
     advice = _build_advice(
@@ -1004,37 +1349,42 @@ def _run_voice_triage(
     )
 
 
-class VoiceScheduleTriageResponse(BaseModel):
+def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResponse:
+    """Re-run triage with the patient's chip answers; never asks again."""
+    started = time.perf_counter()
+    settings = get_settings()
+    age_group = _normalise_age_group(payload.age_group)
+    transcription = " ".join(payload.transcription.split())[:2000]
 
-    success: bool = True
-    transcription: str
-    disease_guess: str
-    icd10_code: str
-    department_id: int
-    department_name: str
-    priority_level: str
-    chief_complaint_summary: str
-    secondary_department_id: Optional[int] = Field(
-        default=None,
-        description="Khoa phụ cần khám kèm nếu có triệu chứng đa cơ quan",
+    selected = [item for item in payload.selected_options if item]
+    if payload.extra_note:
+        selected.append(payload.extra_note)
+    if not age_group:
+        joined = " ".join(selected).lower()
+        age_group = next((group for group in TRIAGE_AGE_GROUPS if group in joined), None)
+
+    context, sources, warnings = _retrieve_triage_context(
+        transcription, settings, age_group=age_group
     )
-    secondary_department_name: Optional[str] = Field(default=None)
-    multi_specialty_note: Optional[str] = Field(default="")
-    recommended_shift: str
-    advice: str
-    schedule: dict[str, Optional[SessionSchedule]] = Field(
-        default_factory=dict,
-        description="morning/afternoon are null when the schedule service is unreachable",
+    facts, fact_warnings = _extract_triage_facts(
+        transcription,
+        context,
+        settings,
+        age_group=age_group,
+        patient_history=payload.patient_history,
+        selected_clarifications=selected,
+        is_refinement=True,
     )
-    schedule_connected: bool = Field(
-        default=True,
-        description="False = Stage 2 degraded; clinical triage is still valid",
+    warnings.extend(fact_warnings)
+    return _complete_triage_with_schedule(
+        facts,
+        transcription,
+        payload.target_date,
+        sources,
+        warnings,
+        started,
+        settings,
     )
-    schedule_error: str = ""
-    target_date: str = ""
-    rag_sources: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    latency_ms: float = 0.0
 
 
 @app.get("/", include_in_schema=False)
@@ -1557,8 +1907,15 @@ async def voice_schedule_triage(
     target_date: Optional[str] = Form(
         None, description="Ngày cần xếp khám (YYYY-MM-DD). Mặc định: hôm nay Asia/Ho_Chi_Minh."
     ),
+    age_group: Optional[str] = Form(
+        None,
+        description="Nhóm tuổi đã biết: tre_em | nguoi_truong_thanh | nguoi_cao_tuoi | tat_ca.",
+    ),
+    patient_history: Optional[str] = Form(
+        None, description="Tiền sử bệnh đã biết (tăng huyết áp, tim mạch, tiểu đường...)."
+    ),
 ):
-    """Two-stage voice triage: Whisper + RAG + LLM, then a real roster query."""
+    """Two-stage voice triage: Whisper + age-filtered RAG + LLM, then roster query."""
     try:
         filename = (file.filename or "").strip()
         extension = Path(filename).suffix.lower()
@@ -1610,7 +1967,7 @@ async def voice_schedule_triage(
 
         # 5. Thực thi luồng xử lý Voice Triage & Tra cứu lịch trực
         return await asyncio.to_thread(
-            _run_voice_triage, audio, filename, target_date
+            _run_voice_triage, audio, filename, target_date, age_group, patient_history
         )
 
     except HTTPException:
@@ -1630,6 +1987,31 @@ async def voice_schedule_triage(
         ) from exc
     finally:
         await file.close()
+
+
+@app.post("/api/v1/triage/refine", response_model=VoiceScheduleTriageResponse)
+async def refine_triage(payload: RefineTriageRequest):
+    """Second turn: fold the patient's clarification chips into a final triage."""
+    try:
+        if not payload.transcription.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Thiếu nội dung lời kể ban đầu cần làm rõ.",
+            )
+        return await asyncio.to_thread(_run_refined_triage, payload)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        logger.warning("Refine triage validation error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except Exception as exc:
+        logger.exception("Lỗi hệ thống khi xử lý refine_triage: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi xử lý làm rõ triệu chứng: {str(exc)}",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

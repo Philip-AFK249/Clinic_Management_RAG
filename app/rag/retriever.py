@@ -29,11 +29,13 @@ def retrieve_context(
     top_k: int = 3,
     specialty: Optional[str] = None,
     target_audience: Optional[str] = None,
+    age_group: Optional[str] = None,
     settings: Settings | None = None,
 ) -> List[SearchResult]:
     """Search the most relevant chunks by cosine distance.
 
-    ``specialty`` and ``target_audience`` act as optional metadata filters.
+    ``specialty``, ``target_audience`` and ``age_group`` act as optional metadata
+    filters. An age filter keeps matching rows plus rows marked ``tat_ca``.
     """
     settings = settings or get_settings()
     query_vector = embed_text(query, settings)
@@ -45,6 +47,9 @@ def retrieve_context(
     if target_audience and target_audience != "all":
         where.append("target_audience = %s")
         params.append(target_audience)
+    if age_group and age_group not in {"all", "tat_ca"}:
+        where.append("(age_group = %s OR age_group = 'tat_ca')")
+        params.append(age_group)
 
     sql = """
         SELECT id, doc_id, specialty, content, (dense_embedding <=> %s::vector) AS distance

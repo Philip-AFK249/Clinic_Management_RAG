@@ -13,19 +13,21 @@ from app.database.connection import get_connection
 from app.database.schema import run_migrations
 from app.ingestion.embedder import embed_texts
 from app.ingestion.entity_extractor import ExtractedEntities, extract_entities
-from app.ingestion.splitter import chunk_markdown
+from app.ingestion.splitter import age_group_markers, chunk_markdown
 
 logger = get_logger(__name__)
 
 INSERT_SQL = """
     INSERT INTO clinic_knowledge_nodes
-        (doc_id, specialty, target_audience, content, dense_embedding, metadata)
-    VALUES (%s, %s, %s, %s, %s, %s::jsonb);
+        (doc_id, specialty, target_audience, age_group, content, dense_embedding, metadata)
+    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb);
 """
 
 # Department routing for the three clinical departments plus the catch-all.
 DEFAULT_SPECIALTY = "chung"
 DEFAULT_AUDIENCE = "bac_si"
+DEFAULT_AGE_GROUP = "tat_ca"
+VALID_AGE_GROUPS = ("tre_em", "nguoi_truong_thanh", "nguoi_cao_tuoi", "tat_ca")
 
 # Order matters: the first matching department wins, so more specific keyword
 # sets are listed before broader ones.
@@ -45,6 +47,14 @@ SPECIALTY_KEYWORDS: dict[str, tuple[str, ...]] = {
 AUDIENCE_TRIAGE_KEYWORDS: tuple[str, ...] = (
     "triage", "tiep_don", "sang_loc", "trieu_chung",
 )
+
+
+def extract_age_group(content: str) -> str:
+    """Read the age stratum marked on a chunk; mixed/unmarked rows stay universal."""
+    markers = set(age_group_markers(content or ""))
+    if len(markers) == 1:
+        return markers.pop()
+    return DEFAULT_AGE_GROUP
 
 
 @dataclass
@@ -118,16 +128,26 @@ def ingest_markdown_file(
             for idx, (content, embedding) in enumerate(zip(chunks, embeddings), 1):
                 entities: ExtractedEntities = extract_entities(content)
                 entities_count += len(entities.icd10_codes) + len(entities.medications)
+                age_group = extract_age_group(content)
                 metadata = {
                     "entities": entities.as_dict,
                     "chunk_index": idx - 1,
                     "specialty": specialty,
                     "target_audience": target_audience,
+                    "age_group": age_group,
                     "source_file": markdown_path.name,
                 }
                 cur.execute(
                     INSERT_SQL,
-                    (doc_id, specialty, target_audience, content, embedding, Jsonb(metadata)),
+                    (
+                        doc_id,
+                        specialty,
+                        target_audience,
+                        age_group,
+                        content,
+                        embedding,
+                        Jsonb(metadata),
+                    ),
                 )
                 if idx % 25 == 0 or idx == total:
                     pct = idx / total * 100
