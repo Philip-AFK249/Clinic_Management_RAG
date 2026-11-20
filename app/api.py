@@ -1136,6 +1136,7 @@ def _extract_triage_facts(
     """Stage 1c: force the LLM into a single JSON object and validate it."""
     from app.rag.generator import get_groq_client
 
+    warnings: list[str] = []
     history_turns = _clarification_turns(clarification_history)
     answers = [item for item in (selected_clarifications or []) if item]
     has_p1 = _has_p1_red_flag(
@@ -1186,6 +1187,7 @@ def _extract_triage_facts(
 
     llm_model = _runtime_model("llm_model", settings.LLM_MODEL_ID)
     logger.info("Triage LLM request using model '%s'", llm_model)
+    llm_failed_warning: Optional[str] = None
     try:
         payload = ambient.complete_json(
             VOICE_TRIAGE_SYSTEM_PROMPT,
@@ -1196,7 +1198,7 @@ def _extract_triage_facts(
         )
     except Exception as exc:
         logger.warning("LLM returned non-JSON triage output: %s", str(exc)[:200])
-        warnings = [f"Không đọc được JSON từ mô hình ({exc}); dùng giá trị mặc định."]
+        llm_failed_warning = f"Không đọc được JSON từ mô hình ({exc}); dùng giá trị mặc định."
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
@@ -1210,6 +1212,8 @@ def _extract_triage_facts(
         force_final=has_p1,
         raw_text=transcription,
     )
+    if llm_failed_warning:
+        fact_warnings = [llm_failed_warning] + list(fact_warnings or [])
     if has_p1:
         if facts["priority_level"] != "P1":
             fact_warnings.append("Phát hiện dấu hiệu đe dọa tính mạng; đã ghi đè mức ưu tiên P1.")
@@ -1219,6 +1223,8 @@ def _extract_triage_facts(
         facts["clarification_options"] = []
         facts["clarifying_questions"] = []
         return facts, fact_warnings
+
+    return facts, fact_warnings
 
 
 #: Prepended to the advice whenever the clinic has already closed (17:00) and
