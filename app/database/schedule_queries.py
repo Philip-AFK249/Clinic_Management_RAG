@@ -90,7 +90,55 @@ booked AS (
     FROM slot_assignments sa
     WHERE sa.appointment_date = %(target_date)s
       AND sa.department_id = %(department_id)s
-      AND COALESCE(sa.status, 'BOOKED') = 'BOOKED'
+      AND (
+          COALESCE(sa.status, 'BOOKED') = 'BOOKED'
+          OR (sa.status = 'TEMPORARY' AND (sa.expires_at IS NULL OR sa.expires_at > NOW()))
+      )
+    GROUP BY sa.doctor_id, 2
+)
+SELECT
+    duty.session,
+    duty.doctor_id,
+    duty.full_name,
+    duty.title,
+    duty.room_number,
+    duty.max_per_slot * %(slots_per_session)s AS total_capacity,
+    COALESCE(booked.booked_count, 0) AS booked_count
+FROM duty
+LEFT JOIN booked
+       ON booked.doctor_id = duty.doctor_id
+      AND booked.session = duty.session
+ORDER BY
+    CASE duty.session WHEN 'MORNING' THEN 0 ELSE 1 END,
+    duty.full_name;
+"""
+
+_SCHEDULE_SQL_LEGACY = """
+WITH duty AS (
+    SELECT
+        s.doctor_id,
+        s.session,
+        COALESCE(s.max_patients_per_slot, %(default_max_per_slot)s) AS max_per_slot,
+        d.full_name,
+        COALESCE(d.title, '') AS title,
+        COALESCE(d.room_number, '') AS room_number
+    FROM doctor_shifts s
+    JOIN doctors d ON d.id = s.doctor_id
+    WHERE s.department_id = %(department_id)s
+      AND s.shift_date = %(target_date)s
+      AND s.duty_type = 'OUTPATIENT'
+      AND COALESCE(d.active, TRUE) = TRUE
+),
+booked AS (
+    SELECT
+        sa.doctor_id,
+        CASE WHEN sa.slot_start_time < TIME '12:00' THEN 'MORNING' ELSE 'AFTERNOON' END
+            AS session,
+        COUNT(*) AS booked_count
+    FROM slot_assignments sa
+    WHERE sa.appointment_date = %(target_date)s
+      AND sa.department_id = %(department_id)s
+      AND COALESCE(sa.status, 'BOOKED') IN ('BOOKED', 'TEMPORARY')
     GROUP BY sa.doctor_id, 2
 )
 SELECT
@@ -313,6 +361,21 @@ def query_department_schedule(
         return unavailable_schedule(department_id, day, reason=reason)
 
 
+
+def _is_missing_expires_at_column(exc: BaseException) -> bool:
+    """Detect an ``expires_at``-less ``slot_assignments`` schema."""
+    try:
+        import psycopg
+
+        if isinstance(exc, psycopg.errors.UndefinedColumn):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # SQLite (used by the test harness) and other drivers.
+    msg = str(exc).lower()
+    return "no such column" in msg and "expires_at" in msg
+
+
 def _load_schedule(
     department_id: int, day: date_cls, settings: Settings
 ) -> Dict[str, Any]:
@@ -322,15 +385,21 @@ def _load_schedule(
             department_name = _fetch_department_name(
                 cur, department_id, FALLBACK_DEPARTMENTS[department_id]
             )
-            cur.execute(
-                _SCHEDULE_SQL,
-                {
-                    "department_id": department_id,
-                    "target_date": day,
-                    "slots_per_session": SLOTS_PER_SESSION,
-                    "default_max_per_slot": DEFAULT_MAX_PATIENTS_PER_SLOT,
-                },
-            )
+            params = {
+                "department_id": department_id,
+                "target_date": day,
+                "slots_per_session": SLOTS_PER_SESSION,
+                "default_max_per_slot": DEFAULT_MAX_PATIENTS_PER_SLOT,
+            }
+            try:
+                cur.execute(_SCHEDULE_SQL, params)
+            except Exception as exc:  # noqa: BLE001 - backward compat for old schema
+                if not _is_missing_expires_at_column(exc):
+                    raise
+                logger.warning(
+                    "slot_assignments.expires_at missing; falling back to legacy count"
+                )
+                cur.execute(_SCHEDULE_SQL_LEGACY, params)
             rows = cur.fetchall()
 
     # Aggregate per session: session capacity is the sum over its duty doctors.

@@ -45,7 +45,9 @@ _TIME_LITERAL_RE = re.compile(r"\bTIME\s+'([^']+)'", re.IGNORECASE)
 def _sqlite_sql(sql: str) -> str:
     """Translate the small PostgreSQL-specific surface used by _SCHEDULE_SQL."""
     sql = _PLACEHOLDER_RE.sub(r":\1", sql)
-    return _TIME_LITERAL_RE.sub(r"'\1'", sql)
+    sql = _TIME_LITERAL_RE.sub(r"'\1'", sql)
+    sql = re.sub(r"\bNOW\s*\(\s*\)", "datetime('now')", sql, flags=re.IGNORECASE)
+    return sql
 
 
 def _sqlite_params(params: dict | None) -> dict:
@@ -138,7 +140,8 @@ class _ScheduleHarness:
                 department_id INTEGER,
                 appointment_date TEXT,
                 slot_start_time TEXT,
-                status TEXT DEFAULT 'BOOKED'
+                status TEXT DEFAULT 'BOOKED',
+                expires_at TEXT
             );
             """
         )
@@ -206,11 +209,14 @@ class _ScheduleHarness:
         slot_start_time: str,
         status: str = "BOOKED",
         appointment_date: date = TARGET_DATE,
+        expires_at=None,
     ) -> None:
+        if isinstance(expires_at, datetime):
+            expires_at = expires_at.isoformat(sep=" ")
         self.connection.execute(
             "INSERT INTO slot_assignments "
             "(ticket_number, doctor_id, department_id, appointment_date, "
-            "slot_start_time, status) VALUES (?, ?, ?, ?, ?, ?)",
+            "slot_start_time, status, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 f"T{doctor_id}-{appointment_date.isoformat()}-{slot_start_time}",
                 doctor_id,
@@ -218,6 +224,7 @@ class _ScheduleHarness:
                 appointment_date.isoformat(),
                 slot_start_time,
                 status,
+                expires_at,
             ),
         )
 
@@ -365,6 +372,68 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
         self.assertTrue(result["morning_elapsed"])
         self.assertTrue(result["afternoon"]["is_full"])
         self.assertEqual(result["recommended_shift"], "NEXT_DAY")
+
+
+
+class TemporaryHoldCapacityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.db = _ScheduleHarness()
+        self.db.add_department(1, "Khoa Nội Tổng quát & Tim mạch")
+        self.db.add_doctor(1, "BS. Nguyễn Văn A", department_id=1)
+        patcher = patch.object(sq, "_connect", new=self.db.connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.db.close)
+
+    def test_temporary_and_booked_count_toward_capacity(self) -> None:
+        self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
+        self.db.add_assignment(
+            doctor_id=1, department_id=1, slot_start_time="08:00:00", status="BOOKED"
+        )
+        self.db.add_assignment(
+            doctor_id=1,
+            department_id=1,
+            slot_start_time="08:30:00",
+            status="TEMPORARY",
+            expires_at="2099-12-31 23:59:59",
+        )
+        # Ignored rows.
+        self.db.add_assignment(
+            doctor_id=1,
+            department_id=1,
+            slot_start_time="09:00:00",
+            status="TEMPORARY",
+            expires_at="2000-01-01 00:00:00",
+        )
+        self.db.add_assignment(
+            doctor_id=1, department_id=1, slot_start_time="09:30:00", status="CANCELLED"
+        )
+        self.db.add_assignment(
+            doctor_id=1,
+            department_id=1,
+            slot_start_time="10:00:00",
+            status="TEMPORARY",
+            expires_at=None,
+        )
+
+        result = sq.query_department_schedule(1, TARGET_DATE_STR)
+        doctor = result["morning"]["doctors"][0]
+        self.assertEqual(doctor["booked_count"], 3)
+        self.assertFalse(result["morning"]["is_full"])
+
+    def test_session_becomes_full_with_holds(self) -> None:
+        self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
+        for i in range(16):
+            self.db.add_assignment(
+                doctor_id=1,
+                department_id=1,
+                slot_start_time="08:00:00",
+                status="TEMPORARY",
+                expires_at="2099-12-31 23:59:59",
+            )
+        result = sq.query_department_schedule(1, TARGET_DATE_STR)
+        self.assertTrue(result["morning"]["is_full"])
+
 
 
 if __name__ == "__main__":
