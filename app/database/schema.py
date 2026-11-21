@@ -33,13 +33,14 @@ CREATE TABLE IF NOT EXISTS unmatched_symptom_logs (
     id SERIAL PRIMARY KEY,
     flag_id TEXT UNIQUE NOT NULL,
     transcription TEXT NOT NULL,
+    normalized_transcription TEXT NOT NULL DEFAULT '',
     age_group TEXT NOT NULL DEFAULT 'tat_ca',
     ai_disease_guess TEXT,
     ai_icd10_code TEXT,
     ai_department_id INTEGER,
     ai_department_name TEXT,
     ai_priority_level TEXT,
-    flag_reason TEXT NOT NULL DEFAULT 'LOW_CONFIDENCE_MATCH',
+    flag_reason TEXT NOT NULL DEFAULT 'LOW_SIMILARITY_MATCH',
     similarity_score DOUBLE PRECISION,
     ticket_number TEXT,
     patient_name TEXT,
@@ -63,6 +64,11 @@ ON unmatched_symptom_logs (status, created_at DESC);
 CREATE_UNMATCHED_LOGS_TICKET_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_unmatched_logs_ticket
 ON unmatched_symptom_logs (ticket_number);
+"""
+
+ADD_UNMATCHED_LOG_NORMALIZED_TRANSCRIPTION_SQL = """
+ALTER TABLE unmatched_symptom_logs
+ADD COLUMN IF NOT EXISTS normalized_transcription TEXT NOT NULL DEFAULT '';
 """
 
 CREATE_HNSW_INDEX_SQL = f"""
@@ -96,6 +102,7 @@ UNMATCHED_LOG_COLUMNS = (
     "id",
     "flag_id",
     "transcription",
+    "normalized_transcription",
     "age_group",
     "ai_disease_guess",
     "ai_icd10_code",
@@ -119,6 +126,7 @@ UNMATCHED_LOG_COLUMNS = (
 
 UNMATCHED_LOG_WRITABLE_COLUMNS = (
     "transcription",
+    "normalized_transcription",
     "age_group",
     "ai_disease_guess",
     "ai_icd10_code",
@@ -149,6 +157,7 @@ _STATEMENTS: list[str] = [
     CREATE_UNMATCHED_LOGS_SQL,
     CREATE_UNMATCHED_LOGS_STATUS_INDEX_SQL,
     CREATE_UNMATCHED_LOGS_TICKET_INDEX_SQL,
+    ADD_UNMATCHED_LOG_NORMALIZED_TRANSCRIPTION_SQL,
     ADD_AGE_GROUP_SQL,
     CREATE_INDEX_ON_AGE_GROUP_SQL,
     CREATE_INDEX_ON_SPECIALTY_SQL,
@@ -185,6 +194,7 @@ def _ensure_unmatched_table(settings: Settings) -> None:
                 CREATE_UNMATCHED_LOGS_SQL,
                 CREATE_UNMATCHED_LOGS_STATUS_INDEX_SQL,
                 CREATE_UNMATCHED_LOGS_TICKET_INDEX_SQL,
+                ADD_UNMATCHED_LOG_NORMALIZED_TRANSCRIPTION_SQL,
             ],
         )
         _UNMATCHED_TABLE_READY = True
@@ -281,8 +291,9 @@ def insert_unmatched_log(
     payload = {column: values.get(column) for column in columns}
     payload["flag_id"] = values.get("flag_id") or new_flag_id(settings)
     payload["transcription"] = str(payload.get("transcription") or "")
+    payload["normalized_transcription"] = str(payload.get("normalized_transcription") or "")
     payload["age_group"] = payload.get("age_group") or "tat_ca"
-    payload["flag_reason"] = payload.get("flag_reason") or "LOW_CONFIDENCE_MATCH"
+    payload["flag_reason"] = payload.get("flag_reason") or "LOW_SIMILARITY_MATCH"
     payload["status"] = payload.get("status") or "PENDING_DOCTOR"
 
     try:

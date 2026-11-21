@@ -165,6 +165,9 @@ VOICE_STT_PROMPT = (
     "mề đay, tê bàn chân, tiêu chảy, nôn ói, "
     "tiểu buốt, tiểu rắt, nước tiểu đục, đau hông lưng, leo cầu thang, hồi hộp, "
     "tim đập nhanh, thở không ra hơi, khàn tiếng, mất tiếng, khô họng, rát họng, "
+    "tim đập thình thịch, ớn lạnh, chóng mặt, đau họng, nuốt đau, sâu cắn, "
+    "côn trùng đốt, nổi mẩn đỏ, ngứa liên tục, nhìn mờ, đốm đen trước mắt, mờ mắt, "
+    "đau răng, đau bụng dưới, trật khớp, cổ họng, đánh trống ngực, "
     "ho khan, nổi mẩn đỏ, ngứa ngáy."
 )
 
@@ -208,9 +211,11 @@ Quy tắc bắt buộc:
     - Đặt is_out_of_dataset=true và flag_reason="NEW_SYMPTOM_PATTERN" khi lời kể không được [NGỮ CẢNH TRIỆU CHỨNG] bao phủ rõ ràng dù vẫn có thể gán gần đúng vào một trong 3 khoa.
     - Ví dụ: "nhìn mờ và thấy đốm đen trước mắt" → is_out_of_dataset=true, flag_reason="OUT_OF_SPECIALTY", icd10_code="H35.3" hoặc "H43.9", disease_guess="Đục dịch kính / Tổn thương võng mạc nghi ngờ (Chuyên khoa Mắt)", department_id vẫn là 1/2/3 gần nhất.
     - Nếu triệu chứng đã có trong ngữ cảnh và nằm đúng chuyên khoa 1/2/3, đặt is_out_of_dataset=false và flag_reason="".
-13. KHÔNG BAO GIỜ TRẢ VỀ GỢI Ý TRỐNG, kể cả khi needs_clarification=true:
-    - Dù đang hỏi làm rõ, BẮT BUỘC điền có nghĩa các trường: disease_guess, icd10_code, department_id, department_name, priority_level, chief_complaint_summary, secondary_department_id, secondary_department_name, multi_specialty_note. Đây là "preliminary triage banner" được hiển thị NGAY cho bệnh nhân trong lúc chờ trả lời 1-4 câu hỏi.
-    - Không được trả về chuỗi rỗng/null cho các trường trên (ngoại trừ secondary_department_id/secondary_department_name=null và multi_specialty_note="" khi chỉ có đúng một chuyên khoa). Hãy dùng phán đoán lâm sàng tốt nhất từ lời kể hiện có, KHÔNG chờ câu trả lời để điền.
+    - KHÔNG bịa mô tả ICD-10 sai WHO: L27.0 KHÔNG phải "viêm da do côn trùng đốt". Với viêm da tiếp xúc do côn trùng/sâu/caterpillar dùng L23.8, L24.8 hoặc T63.4; hồi hộp/đánh trống ngực dùng R00.2; viêm họng cấp dùng J02.9. Khi không chắc, chọn mã WHO gần nhất và ghi disease_guess mô tả đúng mã đó.
+13. BANNER SƠ BỘ KHI LÀM RÕ (không mâu thuẫn với Quy tắc 8):
+    - Khi needs_clarification=true: disease_guess="" và icd10_code="" đúng như Quy tắc 8, NHƯNG vẫn BẮT BUỘC điền có nghĩa: department_id, department_name, priority_level, chief_complaint_summary, secondary_department_id, secondary_department_name, multi_specialty_note. Đây là "preliminary triage banner" hiển thị NGAY cho bệnh nhân trong lúc chờ trả lời 1-4 câu hỏi.
+    - Khi needs_clarification=false: BẮT BUỘC điền disease_guess và icd10_code có nghĩa (theo Quy tắc 1 và 12).
+    - Không được trả về chuỗi rỗng/null cho department_id, department_name, priority_level, chief_complaint_summary (ngoại trừ secondary_department_id/secondary_department_name=null và multi_specialty_note="" khi chỉ có đúng một chuyên khoa). Hãy dùng phán đoán lâm sàng tốt nhất từ lời kể hiện có, KHÔNG chờ câu trả lời để điền.
 
 Định dạng JSON bắt buộc:
 {"disease_guess": "...", "icd10_code": "...", "department_id": 1, "department_name": "...", "priority_level": "P1", "chief_complaint_summary": "...", "secondary_department_id": 3, "secondary_department_name": "...", "multi_specialty_note": "...", "needs_clarification": false, "clarifying_question": "", "clarification_options": [], "clarifying_questions": [], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}
@@ -222,7 +227,7 @@ Ví dụ đầu ra khi đa chuyên khoa:
 
 Ví dụ khi cần làm rõ nhưng vẫn có preliminary banner (3 chuyên khoa):
 
-{"disease_guess": "Khó thở gắng sức/Nhiễm đường tiết niệu nghi ngờ / Kèm viêm họng và viêm da dị ứng", "icd10_code": "R07.9", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P2", "chief_complaint_summary": "Khó thở khi leo cầu thang, hồi hộp tim đập nhanh, tiểu buốt nước tiểu đục, kèm khàn tiếng và nổi mẩn ngứa", "secondary_department_id": 2, "secondary_department_name": "Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng", "multi_specialty_note": "Các cụm triệu chứng: (1) Tim mạch/Tiết niệu: khó thở gắng sức, hồi hộp, tiểu buốt, nước tiểu đục; (2) Hô hấp/TMH: sốt, khàn tiếng, khô họng; (3) Da liễu: nổi mẩn đỏ, ngứa ngáy. Thứ tự xử trí: Khoa 1 trước, sau đó hội chẩn Khoa 2, cuối cùng Khoa 3.", "needs_clarification": true, "clarifying_question": "Bạn bao nhiêu tuổi và khó thở xuất hiện từ lúc nào ạ?", "clarification_options": [{"id": "opt_age_adult", "label": "Tôi 16-59 tuổi", "category": "age_group", "age_group_value": "nguoi_truong_thanh"}, {"id": "opt_age_senior", "label": "Tôi từ 60 tuổi trở lên", "category": "age_group", "age_group_value": "nguoi_cao_tuoi"}], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}"""
+{"disease_guess": "", "icd10_code": "", "department_id": 1, "department_name": "Khoa Nội Tổng quát & Tim mạch", "priority_level": "P2", "chief_complaint_summary": "Khó thở khi leo cầu thang, hồi hộp tim đập nhanh, tiểu buốt nước tiểu đục, kèm khàn tiếng và nổi mẩn ngứa", "secondary_department_id": 2, "secondary_department_name": "Khoa Hô hấp & Dị ứng - Miễn dịch lâm sàng", "multi_specialty_note": "Các cụm triệu chứng: (1) Tim mạch/Tiết niệu: khó thở gắng sức, hồi hộp, tiểu buốt, nước tiểu đục; (2) Hô hấp/TMH: sốt, khàn tiếng, khô họng; (3) Da liễu: nổi mẩn đỏ, ngứa ngáy. Thứ tự xử trí: Khoa 1 trước, sau đó hội chẩn Khoa 2, cuối cùng Khoa 3.", "needs_clarification": true, "clarifying_question": "Bạn bao nhiêu tuổi và khó thở xuất hiện từ lúc nào ạ?", "clarification_options": [{"id": "opt_age_adult", "label": "Tôi 16-59 tuổi", "category": "age_group", "age_group_value": "nguoi_truong_thanh"}, {"id": "opt_age_senior", "label": "Tôi từ 60 tuổi trở lên", "category": "age_group", "age_group_value": "nguoi_cao_tuoi"}], "detected_age_group": null, "is_out_of_dataset": false, "flag_reason": ""}"""
 
 # ---------------------------------------------------------------------------
 # Runtime model configuration (admin dashboard - hot swappable, no restart)
@@ -492,8 +497,11 @@ _WHISPER_HALLUCINATION_PATTERNS = (
     re.compile(r"subscribe", re.IGNORECASE),
     re.compile(r"ghi[eề]n m[iì] g[oõ]", re.IGNORECASE),
     re.compile(r"la\s*la\s*school", re.IGNORECASE),
-    re.compile(r"h[eẹ]n g[ặa]p l[ạa]i", re.IGNORECASE),
-    re.compile(r"c[ảa]m\s*[ơo]n\s*b[ạa]n", re.IGNORECASE),
+    # Anchored: a patient may legitimately say "cảm ơn bạn" mid-sentence before
+    # describing symptoms. Only a transcript that *starts* with the stock
+    # outro is a hallucination.
+    re.compile(r"^\W*h[eẹ]n g[ặa]p l[ạa]i", re.IGNORECASE),
+    re.compile(r"^\W*c[ảa]m\s*[ơo]n\s*b[ạa]n", re.IGNORECASE),
     re.compile(r"^\W*$"),
 )
 
@@ -523,6 +531,23 @@ def _looks_like_whisper_hallucination(text: str) -> bool:
         hint in lowered for hint in _CLINICAL_HINTS
     ):
         return True
+
+    # Degenerate repetition loops ("lực lực lực lực", "ừ ừ ừ ừ ừ") are Whisper
+    # decoding artefacts, not clinical narratives. A real description can repeat
+    # a word ("đau đau") but never dominates the whole transcript.
+    for match in _REPEATED_SYLLABLE_RE.finditer(stripped):
+        if _fold_vietnamese_for_match(match.group(1)) in _VOICE_FILLER_SYLLABLES:
+            return True
+    tokens = re.findall(r"[^\W\d_]+", lowered, re.UNICODE)
+    if len(tokens) >= 6:
+        top_token, top_count = Counter(tokens).most_common(1)[0]
+        if top_count >= 4 and top_count / len(tokens) >= 0.5:
+            return True
+        if (
+            top_count >= 3
+            and _fold_vietnamese_for_match(top_token) in _VOICE_FILLER_SYLLABLES
+        ):
+            return True
     return False
 
 
@@ -727,7 +752,48 @@ _VOICE_TYPO_CORRECTIONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"\btieu\s+but\b", "tiểu buốt"),
         (r"\bchữ\s+chứng\b", "triệu chứng"),
         (r"\bchu\s+chung\b", "triệu chứng"),
+        (r"\btiền\s+đập\s+thành\s+thịt\b", "tim đập thình thịch"),
+        (r"\btien\s+dap\s+thanh\s+thit\b", "tim đập thình thịch"),
+        (r"\btiền\s+đập\s+thình\s+thịch\b", "tim đập thình thịch"),
+        (r"\btien\s+dap\s+thinh\s+thich\b", "tim đập thình thịch"),
+        (r"\btim\s+đập\s+thành\s+thịt\b", "tim đập thình thịch"),
+        (r"\btim\s+đập\s+thình\s+thịt\b", "tim đập thình thịch"),
+        (r"\bchóng\s+ván\b", "chóng mặt"),
+        (r"\bchong\s+van\b", "chóng mặt"),
+        (r"\bđiên\s+tục\b", "liên tục"),
+        (r"\bdien\s+tuc\b", "liên tục"),
+        (r"\bsâu\s+bắn\b", "sâu cắn"),
+        (r"\bsau\s+ban\b", "sâu cắn"),
+        (r"\bcủ\s+tay\b", "cổ họng"),
+        (r"\bcu\s+tay\b", "cổ họng"),
+        (r"\bđau\s+củ\s+họng\b", "đau cổ họng"),
+        (r"\bđau\s+cửa\s+họng\b", "đau cổ họng"),
+        (r"\bdau\s+cua\s+hong\b", "đau cổ họng"),
+        (r"\bcửa\s+họng\b", "cổ họng"),
+        (r"\bcua\s+hong\b", "cổ họng"),
+        (r"\bơn\s+lạnh\b", "ớn lạnh"),
+        (r"\bon\s+lanh\b", "ớn lạnh"),
+        (r"\bnhin\s+mo\b", "nhìn mờ"),
+        (r"\bdom\s+den\s+truoc\s+mat\b", "đốm đen trước mắt"),
+        (r"\btrat\s+khop\b", "trật khớp"),
+        (r"\bdau\s+bung\s+duoi\b", "đau bụng dưới"),
+        (r"\bdau\s+rang\b", "đau răng"),
+        (r"\bkho\s+tho\b", "khó thở"),
+        (r"\bnổi\s+mẩn\s+đỏ\s+ngứa\s+liên\s+tục\b", "nổi mẩn đỏ, ngứa liên tục"),
+        (r"\bnoi\s+man\s+do\s+ngua\s+lien\s+tuc\b", "nổi mẩn đỏ, ngứa liên tục"),
     )
+)
+
+#: Whisper sometimes loops on one filler syllable ("lực lực lực lực"). Collapse
+#: three or more repeats to one token, and drop the token entirely when it is a
+#: known non-clinical filler.
+_REPEATED_SYLLABLE_RE = re.compile(
+    r"\b([^\W\d_]+)(?:\s+\1\b){2,}", re.IGNORECASE
+)
+_VOICE_FILLER_SYLLABLES = frozenset(
+    {
+        "luc", "a", "u", "o", "um", "thi", "la", "roi", "nhi", "ha", "uhm",
+    }
 )
 
 _CLINICAL_QUERY_KEYWORDS = (
@@ -765,12 +831,20 @@ _CLINICAL_SIGNAL_RE = re.compile(
 )
 
 
+def _collapse_repeated_syllables(match: re.Match[str]) -> str:
+    token = match.group(1)
+    if _fold_vietnamese_for_match(token) in _VOICE_FILLER_SYLLABLES:
+        return ""
+    return token
+
+
 def _normalise_voice_typos(text: str) -> str:
     """Apply the known Whisper homophone fixes without dropping any clause."""
     normalised = " ".join((text or "").split())
+    normalised = _REPEATED_SYLLABLE_RE.sub(_collapse_repeated_syllables, normalised)
     for pattern, replacement in _VOICE_TYPO_CORRECTIONS:
         normalised = pattern.sub(replacement, normalised)
-    return normalised
+    return " ".join(normalised.split())
 
 
 def _extract_clinical_search_query(raw_text: str) -> str:
@@ -802,6 +876,36 @@ def _extract_clinical_search_query(raw_text: str) -> str:
     return (
         query[:_CLINICAL_QUERY_MAX_CHARS].strip(" ,;")
         or text[:_CLINICAL_QUERY_MAX_CHARS]
+    )
+
+
+def _clean_clinical_transcript(raw_text: str) -> str:
+    """Lightweight, deterministic cleaner for Whisper's Vietnamese STT slips.
+
+    Rule-based on purpose: it sits on the triage request path and must not add
+    a network round-trip. It folds filler loops, fixes the known clinical
+    homophones and tidies punctuation. The *raw* STT string is still preserved
+    in ``unmatched_symptom_logs.transcription`` for audit; this cleaned version
+    feeds ``medical_symptom_standard``, the admin panel and pgvector ingestion.
+    """
+    text = _normalise_voice_typos(raw_text or "")
+    if not text:
+        return ""
+    # A correction can expose another known pattern ("cửa họng" -> "cổ họng").
+    text = _normalise_voice_typos(text)
+    text = re.sub(r"\s+([,.;!?])", r"\1", text)
+    text = re.sub(r",\s*,+", ",", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" ,;.!?")
+    return text[:4000]
+
+
+def _clinical_symptom_summary(raw_text: str) -> str:
+    """Canonical text stored in ``medical_symptom_standard`` and embedded in RAG."""
+    cleaned = _clean_clinical_transcript(raw_text)
+    return (
+        _extract_clinical_search_query(cleaned)
+        or cleaned
+        or "Chưa mô tả rõ triệu chứng"
     )
 
 
@@ -923,6 +1027,163 @@ def _clarification_turns(
     return turns
 
 
+_GREETING_ONLY_RE = re.compile(
+    r"^(?:xin\s+chào|chào(?:\s+(?:bạn|bác|anh|chị|em))?|hello|hi|hey|alo|"
+    r"cảm\s+ơn|tạm\s+biệt|ok|ừ|vâng|dạ)[\s.!?,]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting_or_empty(text: Optional[str]) -> bool:
+    """True for a bare greeting/silence, which must not be flagged as OOD."""
+    if text is None:
+        return False
+    value = " ".join(text.split())
+    if not value:
+        return True
+    return bool(_GREETING_ONLY_RE.match(value))
+
+
+#: Fallback WHO codes for OOD narratives where the LLM omitted the code. Every
+#: pattern runs against tone-folded, cleaned Vietnamese, so STT slips such as
+#: "tiền đập thành thịt" still resolve to the correct code/description pair.
+_ICD10_FALLBACK_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(
+            r"\b(?:tim\s+dap\s+thinh\s+thich|hoi\s+hop|danh\s+trong\s+nguc|"
+            r"tim\s+dap\s+nhanh|tim\s+dap)\b"
+        ),
+        "R00.2",
+        "Hồi hộp/đánh trống ngực",
+    ),
+    (
+        re.compile(
+            r"\b(?:sau\s+can|con\s+trung\s+dot|cat\s+trung|noi\s+man\s+do|"
+            r"ngua\s+lien\s+tuc|man\s+ngua|phat\s+ban)\b"
+        ),
+        "L23.8",
+        "Viêm da tiếp xúc dị ứng do côn trùng/sâu",
+    ),
+    (
+        re.compile(r"\b(?:dau\s+hong|nuot\s+dau|khan\s+tieng|rat\s+hong)\b"),
+        "J02.9",
+        "Viêm họng cấp",
+    ),
+    (
+        re.compile(r"\b(?:nhin\s+mo|dom\s+den\s+truoc\s+mat|mo\s+mat)\b"),
+        "H35.3",
+        "Tổn thương võng mạc nghi ngờ",
+    ),
+    (
+        re.compile(r"\b(?:dau\s+bung\s+duoi|tieu\s+buot|nuoc\s+tieu\s+duc)\b"),
+        "N39.0",
+        "Nhiễm đường tiết niệu nghi ngờ",
+    ),
+    (
+        re.compile(r"\b(?:dau\s+rang)\b"),
+        "K08.8",
+        "Đau răng không xác định",
+    ),
+    (
+        re.compile(r"\b(?:trat\s+khop)\b"),
+        "M24.2",
+        "Rối loạn khớp/trật khớp nghi ngờ",
+    ),
+)
+_ICD10_FALLBACK_LABELS = {code: label for _pattern, code, label in _ICD10_FALLBACK_RULES}
+
+#: L27.0 is "dermatitis due to medicinal products" in WHO ICD-10 - never an
+#: insect/caterpillar bite. The LLM has repeatedly mislabelled it in this clinic.
+_WRONG_ICD10_REPLACEMENTS = {"L27.0": "L23.8"}
+
+#: Folded clinical signal groups used to enforce the 3-department triage rule
+#: even when the LLM forgets the secondary department on a rambling narrative.
+_DEPARTMENT_SIGNAL_PATTERNS: dict[int, re.Pattern[str]] = {
+    1: re.compile(
+        r"\b(?:dau\s+nguc|tuc\s+nguc|hoi\s+hop|tim\s+dap|huyet\s+ap|"
+        r"tieu\s+buot|nuoc\s+tieu\s+duc|dau\s+bung\s+duoi)\b"
+    ),
+    2: re.compile(
+        r"\b(?:dau\s+hong|dau\s+co\s+hong|nuot\s+dau|khan\s+tieng|ho|kho\s+tho|so\s+mu|"
+        r"vien\s+xoang|hen\s+suyen|sot)\b"
+    ),
+    3: re.compile(
+        r"\b(?:noi\s+man|man\s+do|ngua|sau\s+can|con\s+trung\s+dot|"
+        r"mun\s+nuoc|phat\s+ban|zona|vay\s+nen)\b"
+    ),
+}
+_DEPARTMENT_RISK_RANK = {1: 3, 2: 2, 3: 1}
+
+
+def _correct_icd10(
+    icd10: str, raw_text: str, warnings: list[str]
+) -> tuple[str, str, bool]:
+    """Return ``(code, canonical_label, was_corrected)`` for a final verdict.
+
+    A known-wrong WHO code is replaced and its fabricated description discarded,
+    rather than keeping an LLM-made-up label next to a corrected code.
+    """
+    folded = _fold_vietnamese_for_match(_clean_clinical_transcript(raw_text))
+    if icd10 in _WRONG_ICD10_REPLACEMENTS:
+        replacement = _WRONG_ICD10_REPLACEMENTS[icd10]
+        warnings.append(
+            f"Mã ICD-10 {icd10} không đúng mô tả WHO; đã đổi sang {replacement}."
+        )
+        return replacement, _ICD10_FALLBACK_LABELS.get(replacement, ""), True
+    if icd10:
+        return icd10, "", False
+    for pattern, code, label in _ICD10_FALLBACK_RULES:
+        if pattern.search(folded):
+            warnings.append(f"Mô hình không trả mã ICD-10; dùng mã WHO gần nhất {code}.")
+            return code, label, True
+    return "", "", False
+
+
+def _detect_secondary_department(
+    department_id: int, raw_text: str, warnings: list[str]
+) -> tuple[int, Optional[int], str]:
+    """Reconcile multi-organ narratives with the primary/secondary routing rule."""
+    folded = _fold_vietnamese_for_match(_clean_clinical_transcript(raw_text))
+    hits = [
+        dept for dept, pattern in _DEPARTMENT_SIGNAL_PATTERNS.items()
+        if pattern.search(folded)
+    ]
+    if len(hits) < 2:
+        return department_id, None, ""
+
+    # Conservative override: only promote Khoa 1 when the model parked a
+    # cardiac/cluster case in Dermatology, or put chest pain behind ENT/Resp.
+    # Everything else keeps the model's clinically chosen primary department.
+    best = department_id
+    if 1 in hits and department_id == 3:
+        best = 1
+    elif (
+        1 in hits
+        and department_id == 2
+        and re.search(r"\b(?:dau\s+nguc|tuc\s+nguc)\b", folded)
+    ):
+        best = 1
+    if best != department_id:
+        warnings.append(
+            f"Đa chuyên khoa: chuyển khoa chính từ {department_id} sang {best} "
+            "theo mức độ nguy cơ ( tim mạch > hô hấp/TMH > da liễu)."
+        )
+        department_id = best
+    secondary = next((dept for dept in hits if dept != department_id), None)
+    if secondary is None:
+        return department_id, None, ""
+
+    groups = ", ".join(
+        f"Khoa {dept} ({_DEPARTMENT_NAMES[dept]})" for dept in hits
+    )
+    note = (
+        f"Các cụm triệu chứng đa chuyên khoa phát hiện: {groups}. "
+        f"Thứ tự xử trí: {_DEPARTMENT_NAMES[department_id]} trước, "
+        f"sau đó hội chẩn {_DEPARTMENT_NAMES[secondary]}."
+    )
+    return department_id, secondary, note
+
+
 def _sanitise_triage_payload(
     payload: dict,
     is_refinement: bool = False,
@@ -1017,6 +1278,25 @@ def _sanitise_triage_payload(
     ):
         needs_clarification = False
 
+    # Both final verdicts and the preliminary banner shown during clarification
+    # must keep every detected specialty. The LLM proposes; this backstop
+    # enforces the clinic's routing rule even on a rambling transcript.
+    if raw_text:
+        (
+            department_id,
+            detected_secondary,
+            detected_note,
+        ) = _detect_secondary_department(department_id, raw_text, warnings)
+        department_name = _DEPARTMENT_NAMES[department_id]
+        if detected_secondary is not None:
+            if secondary_department_id is None:
+                secondary_department_id = detected_secondary
+            secondary_department_name = _DEPARTMENT_NAMES[secondary_department_id]
+            if not multi_specialty_note:
+                multi_specialty_note = detected_note
+        elif secondary_department_id is not None:
+            secondary_department_name = _DEPARTMENT_NAMES[secondary_department_id]
+
     clarifying_question = _text("clarifying_question", 240)
     clarification_options: list[dict] = []
     # Parse model-driven clarifying questions (1..4).
@@ -1075,9 +1355,17 @@ def _sanitise_triage_payload(
         icd10 = ""
     else:
         clarifying_questions = []
-
-    if not needs_clarification and not disease_guess:
-        disease_guess = "Chưa xác định"
+        # Rule 13: a final verdict must always carry a meaningful prediction,
+        # and the description must agree with the WHO code actually stored.
+        icd10, canonical_label, code_corrected = _correct_icd10(
+            icd10, raw_text or "", warnings
+        )
+        if canonical_label and (code_corrected or not disease_guess or disease_guess == "Chưa xác định"):
+            disease_guess = canonical_label
+        elif not disease_guess:
+            disease_guess = "Chưa xác định"
+        if not chief_complaint_summary:
+            chief_complaint_summary = _clean_clinical_transcript(raw_text or "")[:400] or "Chưa mô tả rõ triệu chứng"
 
     raw_out = payload.get("is_out_of_dataset")
     is_out_of_dataset = raw_out is True or (
@@ -1087,11 +1375,24 @@ def _sanitise_triage_payload(
     valid_flag_reasons = {"OUT_OF_SPECIALTY", "NEW_SYMPTOM_PATTERN", "LOW_SIMILARITY_MATCH"}
     if flag_reason not in valid_flag_reasons:
         flag_reason = ""
-    explicit_reason = flag_reason
     if is_out_of_dataset and not flag_reason:
         flag_reason = "NEW_SYMPTOM_PATTERN"
     if not is_out_of_dataset:
         flag_reason = ""
+
+    # Enforce the similarity floor: a real retrieval hit below OOD_SCORE_THRESHOLD
+    # means the narrative is not covered by the current knowledge base, so it
+    # must reach Active Learning instead of being silently accepted. best_score
+    # is 0.0 when pgvector was unreachable or nothing matched, and a greeting is
+    # not a symptom, so neither is flagged here.
+    if (
+        0.0 < float(best_score) < OOD_SCORE_THRESHOLD
+        and not _is_greeting_or_empty(raw_text)
+    ):
+        is_out_of_dataset = True
+        # The deterministic retrieval signal wins over a free-form LLM reason:
+        # Active Learning clusters these cases by the measured similarity floor.
+        flag_reason = "LOW_SIMILARITY_MATCH"
 
     return (
         {
@@ -1424,9 +1725,13 @@ def _run_triage_from_transcription(
             age_group or "all",
             facts.get("clarifying_question", "")[:120],
         )
+        # Even a clarification banner can be out-of-dataset; create/update the
+        # session's one flag now so every later refine round edits that row.
+        _log_out_of_dataset_facts(facts, transcription, settings)
         return VoiceScheduleTriageResponse(
             success=True,
             transcription=transcription,
+            normalized_transcription=_clean_clinical_transcript(transcription),
             recommended_shift="",
             advice="",
             schedule={},
@@ -1494,6 +1799,12 @@ class RefineTriageRequest(BaseModel):
     clarification_history: list[dict[str, str]] = Field(default_factory=list)
     round_index: int = Field(default=1, ge=1, le=5)
     qa_pairs: list[dict[str, str]] = Field(default_factory=list)
+    flag_id: Optional[str] = Field(
+        default=None,
+        description="FLG-... đã cấp ở lượt trước để cập nhật đúng một ca Active Learning.",
+    )
+    is_out_of_dataset: bool = False
+    flag_reason: str = ""
 
 
 class TextTriageRequest(BaseModel):
@@ -1509,6 +1820,7 @@ class VoiceScheduleTriageResponse(BaseModel):
 
     success: bool = True
     transcription: str
+    normalized_transcription: str = ""
     disease_guess: str
     icd10_code: str
     department_id: int
@@ -1547,24 +1859,130 @@ class VoiceScheduleTriageResponse(BaseModel):
     similarity_score: Optional[float] = None
 
 
-def _log_out_of_dataset_facts(facts: dict, transcription: str, settings) -> None:
-    if not facts.get("is_out_of_dataset"):
-        return
+def _is_flag_reusable(row: dict[str, Any]) -> bool:
+    """True only for a fresh, unlinked Active Learning row we may update in place."""
+    if _flag_text(row.get("ticket_number")).strip():
+        return False
+    if _flag_text(row.get("status")).upper() not in ("", "PENDING_DOCTOR"):
+        return False
+    if _flag_text(row.get("confirmed_icd10_code")).strip():
+        return False
+    if _flag_text(row.get("confirmed_disease_name")).strip():
+        return False
+    return True
+
+
+def _find_reusable_flag_id(
+    transcription: str, settings, rows: Optional[list[dict[str, Any]]] = None
+) -> Optional[str]:
+    """Return a pending, unlinked flag with the same transcript, if one exists.
+
+    Clarification rounds re-send the same transcript; without this guard a
+    patient who refines twice would leave duplicate FLG- rows in Active Learning.
+    Both the raw and the STT-cleaned forms are compared because a refine round
+    may carry a corrected transcript. Rows already linked to a ticket, confirmed
+    or trained are never reused.
+    """
+    needle_raw = " ".join((transcription or "").split())[:4000]
+    needle_clean = _clean_clinical_transcript(transcription)[:4000]
+    if not needle_raw and not needle_clean:
+        return None
+    for row in rows if rows is not None else list_unmatched_logs(settings):
+        if not _is_flag_reusable(row):
+            continue
+        stored_raw = " ".join(_flag_text(row.get("transcription")).split())[:4000]
+        stored_clean = _clean_clinical_transcript(stored_raw)[:4000]
+        if (needle_raw and stored_raw == needle_raw) or (
+            needle_clean and stored_clean == needle_clean
+        ):
+            flag_id = _flag_text(row.get("flag_id")).strip()
+            if flag_id:
+                return flag_id
+    return None
+
+
+def _log_out_of_dataset_facts(
+    facts: dict,
+    transcription: str,
+    settings,
+    existing_flag_id: Optional[str] = None,
+) -> None:
+    """Create or update exactly one Active Learning row per triage session.
+
+    ``existing_flag_id`` is the flag the frontend carried over from an earlier
+    round, so the latest clinical assessment is written in place. When no id is
+    supplied but an identical pending transcript already exists, that row is
+    reused as well. Already confirmed/trained rows are never overwritten.
+    """
+    payload = {
+        "transcription": transcription[:4000],
+        # Raw STT stays for audit; this is the de-garbled clinical text shown to
+        # reception/admin and later embedded into the RAG training report.
+        "normalized_transcription": _clean_clinical_transcript(transcription)[:4000],
+        "age_group": facts.get("detected_age_group") or "tat_ca",
+        "ai_disease_guess": facts.get("disease_guess") or "",
+        "ai_icd10_code": facts.get("icd10_code") or "",
+        "ai_department_id": facts.get("department_id"),
+        "ai_department_name": facts.get("department_name") or "",
+        "ai_priority_level": facts.get("priority_level") or "",
+        "flag_reason": facts.get("flag_reason")
+        or ("NEW_SYMPTOM_PATTERN" if facts.get("is_out_of_dataset") else ""),
+        "similarity_score": facts.get("similarity_score"),
+        # Cleaned, de-garbled clinical text: this is what gets embedded later.
+        "medical_symptom_standard": _clinical_symptom_summary(transcription),
+    }
     try:
+        target_id = (existing_flag_id or "").strip() or None
+        rows: list[dict[str, Any]] = []
+        if target_id or facts.get("is_out_of_dataset"):
+            rows = list_unmatched_logs(settings)
+
+        stored_row = next(
+            (
+                row for row in rows
+                if _flag_text(row.get("flag_id")).strip() == target_id
+            ),
+            None,
+        ) if target_id else None
+
+        if stored_row and not _is_flag_reusable(stored_row):
+            # Doctor already confirmed it: keep the row and its clinical data.
+            facts["flag_id"] = target_id
+            return
+
+        if not target_id and facts.get("is_out_of_dataset"):
+            target_id = _find_reusable_flag_id(transcription, settings, rows)
+            stored_row = next(
+                (
+                    row for row in rows
+                    if _flag_text(row.get("flag_id")).strip() == target_id
+                ),
+                None,
+            ) if target_id else None
+
+        if target_id:
+            # A later round with a thinner LLM answer must not erase a valid
+            # prediction already recorded in an earlier round.
+            for key, value in list(payload.items()):
+                if key in (
+                    "transcription",
+                    "normalized_transcription",
+                    "medical_symptom_standard",
+                    "similarity_score",
+                ):
+                    continue
+                if not value and stored_row and stored_row.get(key):
+                    payload[key] = stored_row[key]
+            stored = update_unmatched_log(target_id, payload, settings)
+            if stored:
+                facts["flag_id"] = stored.get("flag_id") or target_id
+                return
+
+        if not facts.get("is_out_of_dataset"):
+            return
+
         stored = insert_unmatched_log(
-            {
-                "flag_id": new_flag_id(settings),
-                "transcription": transcription[:4000],
-                "age_group": facts.get("detected_age_group") or "tat_ca",
-                "ai_disease_guess": facts.get("disease_guess") or "",
-                "ai_icd10_code": facts.get("icd10_code") or "",
-                "ai_department_id": facts.get("department_id"),
-                "ai_department_name": facts.get("department_name") or "",
-                "ai_priority_level": facts.get("priority_level") or "",
-                "flag_reason": facts.get("flag_reason") or "NEW_SYMPTOM_PATTERN",
-                "similarity_score": facts.get("similarity_score"),
-                "status": "PENDING_DOCTOR",
-            },
+            {"flag_id": new_flag_id(settings), **payload, "status": "PENDING_DOCTOR"},
             settings,
         )
         facts["flag_id"] = stored.get("flag_id")
@@ -1580,6 +1998,7 @@ def _complete_triage_with_schedule(
     warnings: list[str],
     started: float,
     settings,
+    existing_flag_id: Optional[str] = None,
 ) -> VoiceScheduleTriageResponse:
     """Stage 2: deterministic schedule lookup shared by first pass and refinement."""
     schedule_payload = query_department_schedule(
@@ -1630,11 +2049,14 @@ def _complete_triage_with_schedule(
         connected,
         latency_ms,
     )
-    _log_out_of_dataset_facts(facts, transcription, settings)
+    _log_out_of_dataset_facts(
+        facts, transcription, settings, existing_flag_id=existing_flag_id
+    )
 
     return VoiceScheduleTriageResponse(
         success=True,
         transcription=transcription,
+        normalized_transcription=_clean_clinical_transcript(transcription),
         recommended_shift=recommended_shift,
         advice=advice,
         schedule=schedule,
@@ -1726,7 +2148,20 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
     )
     warnings.extend(fact_warnings)
 
+    # Keep the Active Learning verdict from the first round even if a later LLM
+    # answer forgets it. Without this a flagged case can silently disappear.
+    if payload.is_out_of_dataset and not facts.get("is_out_of_dataset"):
+        facts["is_out_of_dataset"] = True
+        reason = " ".join(payload.flag_reason.split()).upper().replace(" ", "_")
+        facts["flag_reason"] = (
+            reason
+            if reason in {"OUT_OF_SPECIALTY", "NEW_SYMPTOM_PATTERN", "LOW_SIMILARITY_MATCH"}
+            else "NEW_SYMPTOM_PATTERN"
+        )
+
     if facts.get("needs_clarification"):
+        if payload.flag_id:
+            facts["flag_id"] = payload.flag_id
         logger.info(
             "Triage refinement round %d/%d: age_group=%s question=%s",
             payload.round_index,
@@ -1734,9 +2169,13 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
             age_group or "all",
             facts.get("clarifying_question", "")[:120],
         )
+        _log_out_of_dataset_facts(
+            facts, rag_query, settings, existing_flag_id=payload.flag_id
+        )
         return VoiceScheduleTriageResponse(
             success=True,
             transcription=rag_query,
+            normalized_transcription=_clean_clinical_transcript(rag_query),
             recommended_shift="",
             advice="",
             schedule={},
@@ -1756,6 +2195,7 @@ def _run_refined_triage(payload: RefineTriageRequest) -> VoiceScheduleTriageResp
         warnings,
         started,
         settings,
+        existing_flag_id=payload.flag_id,
     )
 
 
@@ -2984,6 +3424,7 @@ class FlaggedSymptomItem(BaseModel):
     id: Optional[int] = None
     flag_id: str
     transcription: str = ""
+    normalized_transcription: str = ""
     patient_description: str = ""
     age_group: str = "tat_ca"
     age_group_label: str = ""
@@ -3029,7 +3470,11 @@ class FlaggedSymptomUpdate(BaseModel):
     ticket_number: Optional[str] = None
     patient_name: Optional[str] = None
     age_group: Optional[str] = None
+    flag_reason: Optional[str] = None
+    ai_disease_guess: Optional[str] = None
+    ai_icd10_code: Optional[str] = None
     ai_department_id: Optional[int] = None
+    ai_department_name: Optional[str] = None
     ai_priority_level: Optional[str] = None
     confirmed_icd10_code: Optional[str] = None
     confirmed_disease_name: Optional[str] = None
@@ -3046,6 +3491,7 @@ class FlaggedSymptomConfirmRequest(BaseModel):
     medical_symptom_standard: str = ""
     red_flags: str = ""
     reception_action: str = ""
+    flag_id: str = ""
 
 
 class FlaggedTrainRequest(BaseModel):
@@ -3075,6 +3521,7 @@ class FlaggedTrainResponse(BaseModel):
     trained_count: int = 0
     doc_id: str = FLAG_REPORT_DOC_ID
     chunks: int = 0
+    chunks_created: int = 0
 
 
 KNOWLEDGE_DOCS_SQL = """
@@ -3113,11 +3560,16 @@ def _flag_item(row: dict[str, Any]) -> FlaggedSymptomItem:
     except (TypeError, ValueError):
         parsed_score = None
     transcription = _flag_text(row.get("transcription"))
+    normalised = (
+        _flag_text(row.get("normalized_transcription")).strip()
+        or _clean_clinical_transcript(transcription)
+    )
     age_group = _normalise_age_group(row.get("age_group")) or "tat_ca"
     return FlaggedSymptomItem(
         id=parsed_id,
         flag_id=_flag_text(row.get("flag_id")),
         transcription=transcription,
+        normalized_transcription=normalised,
         patient_description=transcription,
         age_group=age_group,
         age_group_label=AGE_GROUP_LABELS.get(age_group, age_group),
@@ -3142,34 +3594,61 @@ def _flag_item(row: dict[str, Any]) -> FlaggedSymptomItem:
     )
 
 
+_CLUSTER_ICD_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _flag_cluster_label(row: dict[str, Any]) -> str:
+    label = (
+        _flag_text(row.get("confirmed_disease_name")).strip()
+        or _flag_text(row.get("ai_disease_guess")).strip()
+        or _flag_text(row.get("flag_reason")).strip()
+        or "Chưa phân loại"
+    )
+    label = " ".join(label.split())
+    label = _CLUSTER_ICD_SUFFIX_RE.sub("", label).strip(" ,;.-")
+    return label or "Chưa phân loại"
+
+
+def _flag_cluster_key(label: str) -> str:
+    folded = _fold_vietnamese_for_match(label)
+    return re.sub(r"[^a-z0-9]+", " ", folded).strip() or "chua phan loai"
+
+
 def _flag_stats(rows: list[dict[str, Any]]) -> FlaggedSymptomsStats:
     statuses = Counter(_flag_text(row.get("status")).upper() for row in rows)
-    clusters: Counter[str] = Counter()
+    clusters: dict[str, Counter[str]] = {}
     for row in rows:
-        label = (
-            _flag_text(row.get("confirmed_disease_name")).strip()
-            or _flag_text(row.get("ai_disease_guess")).strip()
-            or _flag_text(row.get("flag_reason")).strip()
-            or "Chưa phân loại"
-        )
-        clusters[label] += 1
+        label = _flag_cluster_label(row)
+        clusters.setdefault(_flag_cluster_key(label), Counter())[label] += 1
+    ranked = sorted(
+        (
+            (counter.most_common(1)[0][0], sum(counter.values()))
+            for counter in clusters.values()
+        ),
+        key=lambda item: -item[1],
+    )[:5]
     return FlaggedSymptomsStats(
         total=len(rows),
         pending_doctor=statuses.get("PENDING_DOCTOR", 0),
         doctor_confirmed=statuses.get("DOCTOR_CONFIRMED", 0),
         trained=statuses.get("TRAINED", 0),
         top_clusters=[
-            FlaggedSymptomCluster(label=label, count=count)
-            for label, count in sorted(clusters.items(), key=lambda item: -item[1])[:5]
+            FlaggedSymptomCluster(label=label, count=count) for label, count in ranked
         ],
     )
 
 
-def _flag_report_values(row: dict[str, Any], index: int) -> list[str]:
+def _flag_report_values(
+    row: dict[str, Any], index: int, sanitize_raw: bool = False
+) -> list[str]:
     age_group = _normalise_age_group(row.get("age_group")) or "tat_ca"
     age_cell = f"{AGE_GROUP_LABELS[age_group]} [{age_group}]"
-    transcription = _flag_text(row.get("transcription"))
-    standard = _flag_text(row.get("medical_symptom_standard")).strip() or _normalise_voice_typos(transcription)
+    transcription = _flag_text(row.get("transcription")).replace("\x00", "")
+    normalized = _flag_text(row.get("normalized_transcription")).replace("\x00", "")
+    standard = (
+        _flag_text(row.get("medical_symptom_standard")).strip()
+        or _clinical_symptom_summary(normalized or transcription)
+    )
     disease = (
         _flag_text(row.get("confirmed_disease_name")).strip()
         or _flag_text(row.get("ai_disease_guess")).strip()
@@ -3179,11 +3658,15 @@ def _flag_report_values(row: dict[str, Any], index: int) -> list[str]:
         _flag_text(row.get("confirmed_icd10_code")).strip()
         or _flag_text(row.get("ai_icd10_code")).strip()
     )
-    disease_cell = f"{disease} ({icd})" if icd else disease
+    # The LLM often already appends the code ("Hồi hộp (R00.2)"); do not double it.
+    disease_base = re.sub(
+        r"\s*\([A-Z]\d[0-9A-Z.]*\)\s*$", "", disease
+    ).strip() or disease
+    disease_cell = f"{disease_base} ({icd})" if icd else disease_base
     return [
         str(index),
         age_cell,
-        transcription,
+        standard if sanitize_raw else transcription,
         standard,
         disease_cell,
         _flag_text(row.get("ai_priority_level")),
@@ -3200,25 +3683,36 @@ def _flag_export_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def _flag_md_cell(value: object) -> str:
-    return _flag_text(value).replace("|", "\\|").replace("\n", " ")
+    return (
+        _flag_text(value)
+        .replace("\x00", "")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+    )
 
 
-def _flag_report_markdown(rows: list[dict[str, Any]]) -> str:
+def _flag_report_markdown(
+    rows: list[dict[str, Any]], sanitize_raw: bool = False
+) -> str:
     records: list[tuple[int, list[str]]] = []
     for index, row in enumerate(rows, 1):
         try:
             department = int(row.get("ai_department_id") or 1)
         except (TypeError, ValueError):
             department = 1
-        records.append((department if department in VALID_DEPARTMENT_IDS else 1,
-                        _flag_report_values(row, index)))
+        records.append(
+            (
+                department if department in VALID_DEPARTMENT_IDS else 1,
+                _flag_report_values(row, index, sanitize_raw=sanitize_raw),
+            )
+        )
 
     lines = [FLAG_REPORT_SECTION_START, ""]
     for department in VALID_DEPARTMENT_IDS:
         department_rows = [values for dept, values in records if dept == department]
         if not department_rows:
             continue
-        dept_name = _DEPARTMENT_NAMES[department]
+        dept_name = _DEPARTMENT_NAMES[department].removeprefix("Khoa ")
         lines.append(f"## KHOA {department}: {dept_name} (departmentId = {department})")
         lines.append("")
         lines.append("| " + " | ".join(FLAG_REPORT_COLUMNS) + " |")
@@ -3580,7 +4074,28 @@ async def train_flagged_symptoms(payload: FlaggedTrainRequest):
             detail="Không có ca nào được chọn để huấn luyện lại RAG.",
         )
 
-    section = _flag_report_markdown(selected)
+    # Never embed raw garbled STT text. Backfill a clean clinical summary for
+    # every selected record that has none, then persist it before ingestion.
+    def _prepare() -> None:
+        for row in selected:
+            if _flag_text(row.get("medical_symptom_standard")).strip():
+                continue
+            # Prefer the deterministic de-garbled transcript; never embed the
+            # raw Whisper narrative with homophone slips into the RAG corpus.
+            source = (
+                _flag_text(row.get("normalized_transcription")).strip()
+                or _flag_text(row.get("transcription"))
+            )
+            summary = _clinical_symptom_summary(source)
+            row["medical_symptom_standard"] = summary
+            update_unmatched_log(
+                _flag_text(row.get("flag_id")),
+                {"medical_symptom_standard": summary},
+                settings,
+            )
+
+    await asyncio.to_thread(_prepare)
+    section = _flag_report_markdown(selected, sanitize_raw=True)
     await asyncio.to_thread(_write_flag_reports, section)
     selected_ids = [_flag_text(row.get("flag_id")) for row in selected]
 
@@ -3592,8 +4107,8 @@ async def train_flagged_symptoms(payload: FlaggedTrainRequest):
             FLAG_REPORT_PARSED_PATH,
             FLAG_REPORT_DOC_ID,
             "Tổng hợp tiếp đón",
-            "tiep_don",
-            settings,
+            target_audience="tiep_don",
+            settings=settings,
         )
         for flag_id in selected_ids:
             update_unmatched_log(flag_id, {"status": "TRAINED"}, settings)
@@ -3612,6 +4127,7 @@ async def train_flagged_symptoms(payload: FlaggedTrainRequest):
         message=f"Đã huấn luyện {len(selected_ids)} ca ngoài tập dữ liệu.",
         trained_count=len(selected_ids),
         chunks=chunks,
+        chunks_created=chunks,
     )
 
 
@@ -3623,10 +4139,23 @@ async def confirm_flagged_symptom_by_ticket(
     ticket_number: str, payload: FlaggedSymptomConfirmRequest
 ):
     settings = get_settings()
+    ticket_number = ticket_number.strip()
     rows = await asyncio.to_thread(list_unmatched_logs, settings)
     matches = [
-        row for row in rows if _flag_text(row.get("ticket_number")) == ticket_number
+        row
+        for row in rows
+        if _flag_text(row.get("ticket_number")).strip() == ticket_number
     ]
+    matched_by_flag_id = False
+    if not matches and payload.flag_id.strip():
+        # The ticket link may have failed at check-in; the flag id is authoritative
+        # and lets the doctor's confirmation still land on the right record.
+        matches = [
+            row
+            for row in rows
+            if _flag_text(row.get("flag_id")) == payload.flag_id.strip()
+        ]
+        matched_by_flag_id = bool(matches)
     if not matches:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -3650,9 +4179,14 @@ async def confirm_flagged_symptom_by_ticket(
                 if _flag_text(row.get("status")).upper() == "TRAINED"
                 else "DOCTOR_CONFIRMED"
             )
+            row_changes = dict(changes)
+            # Repair a check-in whose flag -> ticket PATCH was lost, so later
+            # lookups and Active Learning reporting see the real ticket.
+            if matched_by_flag_id and not _flag_text(row.get("ticket_number")).strip():
+                row_changes["ticket_number"] = ticket_number
             result = update_unmatched_log(
                 _flag_text(row.get("flag_id")),
-                {**changes, "status": status},
+                {**row_changes, "status": status},
                 settings,
             )
             if result:
@@ -3687,6 +4221,13 @@ async def update_flagged_symptom(flag_id: str, payload: FlaggedSymptomUpdate):
                 detail=f"Nhóm tuổi không hợp lệ: {changes['age_group']!r}.",
             )
         changes["age_group"] = age_group
+    if "flag_reason" in changes:
+        reason = " ".join(_flag_text(changes["flag_reason"]).split()).upper().replace(" ", "_")
+        changes["flag_reason"] = (
+            reason
+            if reason in {"OUT_OF_SPECIALTY", "NEW_SYMPTOM_PATTERN", "LOW_SIMILARITY_MATCH"}
+            else ""
+        )
     if "status" in changes and changes["status"] not in FLAG_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
