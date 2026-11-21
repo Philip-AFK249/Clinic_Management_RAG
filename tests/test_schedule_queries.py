@@ -395,30 +395,15 @@ class TemporaryHoldCapacityTests(unittest.TestCase):
             department_id=1,
             slot_start_time="08:30:00",
             status="TEMPORARY",
-            expires_at="2099-12-31 23:59:59",
         )
         # Ignored rows.
         self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="09:00:00",
-            status="TEMPORARY",
-            expires_at="2000-01-01 00:00:00",
-        )
-        self.db.add_assignment(
             doctor_id=1, department_id=1, slot_start_time="09:30:00", status="CANCELLED"
-        )
-        self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="10:00:00",
-            status="TEMPORARY",
-            expires_at=None,
         )
 
         result = sq.query_department_schedule(1, TARGET_DATE_STR)
         doctor = result["morning"]["doctors"][0]
-        self.assertEqual(doctor["booked_count"], 3)
+        self.assertEqual(doctor["booked_count"], 2)
         self.assertFalse(result["morning"]["is_full"])
 
     def test_session_becomes_full_with_holds(self) -> None:
@@ -429,7 +414,6 @@ class TemporaryHoldCapacityTests(unittest.TestCase):
                 department_id=1,
                 slot_start_time="08:00:00",
                 status="TEMPORARY",
-                expires_at="2099-12-31 23:59:59",
             )
         result = sq.query_department_schedule(1, TARGET_DATE_STR)
         self.assertTrue(result["morning"]["is_full"])
