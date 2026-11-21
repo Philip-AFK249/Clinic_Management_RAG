@@ -625,10 +625,16 @@ def _run_stt(
     if not settings.GROQ_API_KEY:
         raise VoiceAudioDecodeError("Thiếu GROQ_API_KEY trong .env.")
 
+    from groq import APIConnectionError, APIStatusError, NotFoundError
+
     client = Groq(api_key=settings.GROQ_API_KEY)
     models = _stt_model_candidates(_runtime_model(runtime_key, configured_model))
     last_error: Exception | None = None
     for model in models:
+        completion = None
+        serialization_failed = False
+        # Primary attempt: response_format="text". Groq SDK versions may return
+        # either a raw str or a Transcription object; both are handled below.
         try:
             completion = client.audio.transcriptions.create(
                 file=_groq_audio_file(audio, filename),
@@ -641,7 +647,70 @@ def _run_stt(
             last_error = exc
             logger.warning("STT model '%s' rejected %s: %s", model, filename, exc)
             continue
-        text = (completion or "").strip()
+        except NotFoundError as exc:
+            last_error = exc
+            logger.warning("STT model '%s' not found for %s: %s", model, filename, exc)
+            continue
+        except APIConnectionError as exc:
+            last_error = exc
+            logger.warning("STT connection error for '%s' on %s: %s", model, filename, exc)
+            continue
+        except APIStatusError as exc:
+            last_error = exc
+            logger.warning("STT status error for '%s' on %s: %s", model, filename, exc)
+            continue
+        except Exception as exc:  # SDK serialization / unexpected failures
+            last_error = exc
+            serialization_failed = True
+            logger.warning(
+                "STT text format failed for '%s' on %s: %s", model, filename, exc
+            )
+
+        # Fall back to response_format="json" when the text path hit a
+        # serialization issue, then extract the text attribute/key safely.
+        if completion is None and serialization_failed:
+            try:
+                completion = client.audio.transcriptions.create(
+                    file=_groq_audio_file(audio, filename),
+                    model=model,
+                    language="vi",
+                    prompt=prompt,
+                    response_format="json",
+                )
+            except BadRequestError as exc:
+                last_error = exc
+                logger.warning("STT model '%s' rejected %s: %s", model, filename, exc)
+                continue
+            except NotFoundError as exc:
+                last_error = exc
+                logger.warning("STT model '%s' not found for %s: %s", model, filename, exc)
+                continue
+            except APIConnectionError as exc:
+                last_error = exc
+                logger.warning("STT connection error for '%s' on %s: %s", model, filename, exc)
+                continue
+            except APIStatusError as exc:
+                last_error = exc
+                logger.warning("STT status error for '%s' on %s: %s", model, filename, exc)
+                continue
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "STT json format failed for '%s' on %s: %s", model, filename, exc
+                )
+                continue
+
+        if completion is None:
+            continue
+
+        if hasattr(completion, "text"):
+            text = completion.text
+        elif isinstance(completion, dict):
+            text = completion.get("text", "")
+        else:
+            text = str(completion)
+        text = (text or "").strip()
+
         if not text or _looks_like_whisper_hallucination(text):
             logger.warning(
                 "Rejected transcription as hallucination/noise: %r", (text or "")[:120]

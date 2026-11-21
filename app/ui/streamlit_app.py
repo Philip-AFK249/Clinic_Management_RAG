@@ -68,8 +68,8 @@ def _stt_models(configured: str) -> list[str]:
 def _transcribe_audio(audio_value, audio_bytes: bytes | None = None) -> str:
     """Send a fresh BytesIO to Groq using bytes read once by the caller."""
     filename, mime = _audio_container(audio_value)
+    audio_value.seek(0)
     if audio_bytes is None:
-        audio_value.seek(0)
         audio_bytes = audio_value.read()
     if not audio_bytes:
         raise ValueError("Microphone recording was empty; please record again.")
@@ -83,6 +83,8 @@ def _transcribe_audio(audio_value, audio_bytes: bytes | None = None) -> str:
     )
     last_error: Exception | None = None
     for model in _stt_models(settings.LLM_STT_MODEL_ID):
+        response = None
+        serialization_failed = False
         try:
             response = client.client.audio.transcriptions.create(
                 file=(filename, io.BytesIO(audio_bytes), mime),
@@ -91,10 +93,38 @@ def _transcribe_audio(audio_value, audio_bytes: bytes | None = None) -> str:
                 prompt=prompt,
                 response_format="text",
             )
-            return (response or "").strip()
         except Exception as exc:  # noqa: BLE001 - Groq raises several STT errors
             last_error = exc
+            serialization_failed = True
             logger.warning("STT model '%s' failed: %s", model, exc)
+
+        if response is None and serialization_failed:
+            try:
+                response = client.client.audio.transcriptions.create(
+                    file=(filename, io.BytesIO(audio_bytes), mime),
+                    model=model,
+                    language="vi",
+                    prompt=prompt,
+                    response_format="json",
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("STT model '%s' failed: %s", model, exc)
+                continue
+
+        if response is None:
+            continue
+
+        if hasattr(response, "text"):
+            text = response.text
+        elif isinstance(response, dict):
+            text = response.get("text", "")
+        else:
+            text = str(response)
+        text = (text or "").strip()
+        if text:
+            return text
+        last_error = RuntimeError("Empty transcription")
     raise RuntimeError(f"Không nhận diện được giọng nói: {last_error}")
 
 
