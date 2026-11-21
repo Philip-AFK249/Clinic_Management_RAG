@@ -129,6 +129,10 @@ FLAG_REPORT_COLUMNS = (
     "Dấu hiệu đỏ (red_flags) MD",
     "Hướng xử lý tiếp đón MD",
 )
+# The Markdown dataset carries a flag id column so re-ingestion can assert that
+# a log row is never written twice. CSV exports keep the original shape.
+FLAG_REPORT_TABLE_COLUMNS = FLAG_REPORT_COLUMNS + ("Flag ID",)
+_FLAG_ID_RE = re.compile(r"\bFLG-[A-Za-z0-9-]+\b")
 AGE_GROUP_LABELS = {
     "tre_em": "Trẻ em (< 16 tuổi)",
     "nguoi_truong_thanh": "Người trưởng thành (16–59 tuổi)",
@@ -514,14 +518,54 @@ _WHISPER_HALLUCINATION_PATTERNS = (
     re.compile(r"^\W*$"),
 )
 
-#: Anything shorter than this carries no usable clinical content.
+#: Anything shorter than this carries no usable clinical content. Short but
+#: clinically meaningful utterances are rescued by ``_CLINICAL_HINTS`` below.
 _MIN_TRANSCRIPTION_CHARS = 5
 
 #: Terms that make a short transcript worth trusting despite its brevity.
+#: Patients often answer with only 2-4 words ("Tê chân", "Đau rát", "Sốt cao"),
+#: so the hint list must include one-word symptoms and common sensory terms.
 _CLINICAL_HINTS = (
-    "đau", "sốt", "ho", "khó thở", "khó thở", "ngứa", "nổi", "mẩn", "chảy máu",
+    "đau", "sốt", "ho", "khó thở", "ngứa", "nổi", "mẩn", "chảy máu",
+    "tê", "buốt", "nhức", "mờ", "rát", "ngứa", "nổi",
     "sau khi", "nhiều ngày", "buồn nôn", "nôn", "tiêu chảy", "mệt", "chóng mặt",
 )
+
+#: Groq's speech-to-text endpoint needs an explicit media type in the multipart
+#: file tuple. Sending raw ``bytes`` lets the client guess ``application/octet``
+#: and Whisper rejects the upload before it can transcribe anything.
+_AUDIO_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+}
+_STT_MODEL_FALLBACKS = ("whisper-large-v3-turbo", "whisper-large-v3")
+
+
+def _audio_media_type(filename: str) -> str:
+    """Resolve the MIME type Groq expects from a filename extension."""
+    extension = Path(filename or "").suffix.lower()
+    return _AUDIO_MIME_TYPES.get(extension, "audio/webm")
+
+
+def _groq_audio_file(audio: bytes, filename: str) -> tuple[str, io.BytesIO, str]:
+    """Build the exact ``(name, stream, mime)`` tuple Groq STT requires."""
+    name = Path(filename or "recording.webm").name
+    return (name, io.BytesIO(audio), _audio_media_type(name))
+
+
+def _stt_model_candidates(configured: str) -> list[str]:
+    """Honour the configured model, then fall back to the two supported STT IDs."""
+    candidates: list[str] = []
+    if configured and configured.strip():
+        candidates.append(configured.strip())
+    for model in _STT_MODEL_FALLBACKS:
+        if model not in candidates:
+            candidates.append(model)
+    return candidates
 
 _NO_SPEECH_MESSAGE = (
     "Không phát hiện âm thanh triệu chứng rõ ràng. "
@@ -560,45 +604,20 @@ def _looks_like_whisper_hallucination(text: str) -> bool:
     return False
 
 
-def _transcribe_voice(audio: bytes, filename: str, settings) -> str:
-    """Stage 1a: Groq Whisper STT, Vietnamese, with the clinic vocabulary prompt."""
-    from groq import BadRequestError
-    from groq import Groq
+def _run_stt(
+    *,
+    audio: bytes,
+    filename: str,
+    settings,
+    configured_model: str,
+    prompt: str,
+    runtime_key: str,
+) -> str:
+    """Call Groq Whisper with a real file stream, MIME type and model fallback.
 
-    if not settings.GROQ_API_KEY:
-        raise VoiceAudioDecodeError("Thiếu GROQ_API_KEY trong .env.")
-
-    client = Groq(api_key=settings.GROQ_API_KEY)
-    stt_model = _runtime_model("stt_model", settings.LLM_STT_MODEL_ID)
-    logger.info("STT request using model '%s'", stt_model)
-    try:
-        completion = client.audio.transcriptions.create(
-            file=(filename, audio),
-            model=stt_model,
-            language="vi",
-            prompt=VOICE_STT_PROMPT,
-            response_format="text",
-        )
-    except BadRequestError as exc:
-        raise VoiceAudioDecodeError(
-            f"Không giải mã được tệp audio ({filename}): {exc}"
-        ) from exc
-
-    text = (completion or "").strip()
-    if not text or _looks_like_whisper_hallucination(text):
-        logger.warning(
-            "Rejected transcription as hallucination/noise: %r", (text or "")[:120]
-        )
-        raise VoiceAudioDecodeError(_NO_SPEECH_MESSAGE)
-    return text
-
-
-def _transcribe_ambient(audio: bytes, filename: str, settings) -> str:
-    """Ambient Step 1: Groq Whisper on the in-memory buffer, nothing persisted.
-
-    ``audio`` is the raw bytes object handed over by ``UploadFile.read()``; it is
-    passed straight to Groq and the caller drops its reference the moment this
-    returns, so no audio ever reaches ``data/`` or the OS temp directory.
+    A ``BadRequestError`` may mean either "unsupported container" or "model not
+    available". The audio tuple is always rebuilt from the original bytes so a
+    retry with the fallback model never receives a consumed/empty stream.
     """
     from groq import BadRequestError
     from groq import Groq
@@ -607,28 +626,61 @@ def _transcribe_ambient(audio: bytes, filename: str, settings) -> str:
         raise VoiceAudioDecodeError("Thiếu GROQ_API_KEY trong .env.")
 
     client = Groq(api_key=settings.GROQ_API_KEY)
-    logger.info("Ambient STT request using model '%s'", AMBIENT_STT_MODEL)
-    try:
-        completion = client.audio.transcriptions.create(
-            file=(filename, audio),
-            model=AMBIENT_STT_MODEL,
-            language="vi",
-            prompt=AMBIENT_STT_PROMPT,
-            response_format="text",
-        )
-    except BadRequestError as exc:
-        raise VoiceAudioDecodeError(
-            f"Không giải mã được tệp audio ({filename}): {exc}"
-        ) from exc
+    models = _stt_model_candidates(_runtime_model(runtime_key, configured_model))
+    last_error: Exception | None = None
+    for model in models:
+        try:
+            completion = client.audio.transcriptions.create(
+                file=_groq_audio_file(audio, filename),
+                model=model,
+                language="vi",
+                prompt=prompt,
+                response_format="text",
+            )
+        except BadRequestError as exc:
+            last_error = exc
+            logger.warning("STT model '%s' rejected %s: %s", model, filename, exc)
+            continue
+        text = (completion or "").strip()
+        if not text or _looks_like_whisper_hallucination(text):
+            logger.warning(
+                "Rejected transcription as hallucination/noise: %r", (text or "")[:120]
+            )
+            raise VoiceAudioDecodeError(_NO_SPEECH_MESSAGE)
+        return text
+    raise VoiceAudioDecodeError(
+        f"Không giải mã được tệp audio ({filename}): {last_error}"
+    )
 
-    text = (completion or "").strip()
-    if not text or _looks_like_whisper_hallucination(text):
-        logger.warning(
-            "Rejected ambient transcription as hallucination/noise: %r",
-            (text or "")[:120],
-        )
-        raise VoiceAudioDecodeError(_NO_SPEECH_MESSAGE)
-    return text
+
+def _transcribe_voice(audio: bytes, filename: str, settings) -> str:
+    """Stage 1a: Groq Whisper STT, Vietnamese, with the clinic vocabulary prompt."""
+    return _run_stt(
+        audio=audio,
+        filename=filename,
+        settings=settings,
+        configured_model=settings.LLM_STT_MODEL_ID,
+        prompt=VOICE_STT_PROMPT,
+        runtime_key="stt_model",
+    )
+
+
+def _transcribe_ambient(audio: bytes, filename: str, settings) -> str:
+    """Ambient Step 1: Groq Whisper on the in-memory buffer, nothing persisted.
+
+    ``audio`` is the raw bytes object handed over by ``UploadFile.read()``; it is
+    wrapped in a fresh ``BytesIO`` for Groq and the caller drops its reference
+    the moment this returns, so no audio ever reaches ``data/`` or the OS temp
+    directory.
+    """
+    return _run_stt(
+        audio=audio,
+        filename=filename,
+        settings=settings,
+        configured_model=AMBIENT_STT_MODEL,
+        prompt=AMBIENT_STT_PROMPT,
+        runtime_key="stt_model",
+    )
 
 
 def _resolve_ambient_filename(file: UploadFile) -> str:
@@ -4213,6 +4265,7 @@ def _flag_report_values(
         _flag_text(row.get("ai_priority_level")),
         _flag_text(row.get("red_flags")),
         _flag_text(row.get("reception_action")),
+        _flag_text(row.get("flag_id")),
     ]
 
 
@@ -4224,12 +4277,33 @@ def _flag_export_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def _flag_md_cell(value: object) -> str:
+    """Make one Markdown-table cell safe without losing patient wording.
+
+    Raw line breaks would split a row and raw pipes create phantom columns.
+    ``<br>`` keeps the full transcription/standard/red-flag/action text readable
+    both in the admin markdown and after ingestion into pgvector.
+    """
     return (
         _flag_text(value)
         .replace("\x00", "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
         .replace("|", "\\|")
-        .replace("\n", " ")
+        .replace("\n", "<br>")
     )
+
+
+def _flag_ids_in_report_files() -> set[str]:
+    """Read flag ids already present in the raw/parsed Markdown datasets."""
+    ids: set[str] = set()
+    for path in (FLAG_REPORT_RAW_PATH, FLAG_REPORT_PARSED_PATH):
+        if not path.exists():
+            continue
+        try:
+            ids.update(_FLAG_ID_RE.findall(path.read_text(encoding="utf-8")))
+        except OSError as exc:
+            logger.warning("Không đọc được %s để kiểm tra trùng flag_id: %s", path, exc)
+    return ids
 
 
 def _flag_report_markdown(
@@ -4256,8 +4330,8 @@ def _flag_report_markdown(
         dept_name = _DEPARTMENT_NAMES[department].removeprefix("Khoa ")
         lines.append(f"## KHOA {department}: {dept_name} (departmentId = {department})")
         lines.append("")
-        lines.append("| " + " | ".join(FLAG_REPORT_COLUMNS) + " |")
-        lines.append("|" + "|".join(["---"] * len(FLAG_REPORT_COLUMNS)) + "|")
+        lines.append("| " + " | ".join(FLAG_REPORT_TABLE_COLUMNS) + " |")
+        lines.append("|" + "|".join(["---"] * len(FLAG_REPORT_TABLE_COLUMNS)) + "|")
         for values in department_rows:
             lines.append("| " + " | ".join(_flag_md_cell(value) for value in values) + " |")
         lines.append("")
@@ -4636,13 +4710,38 @@ async def train_flagged_symptoms(payload: FlaggedTrainRequest):
             )
 
     await asyncio.to_thread(_prepare)
-    section = _flag_report_markdown(selected, sanitize_raw=True)
-    await asyncio.to_thread(_write_flag_reports, section)
     selected_ids = [_flag_text(row.get("flag_id")) for row in selected]
+
+    # Rebuild the Markdown dataset from every confirmed/trained row so a
+    # partial re-train never erases earlier active-learning examples. Each
+    # flag_id is emitted at most once: the dataset file itself is checked for
+    # duplicates before it is written, and the pgvector doc is clean-replaced
+    # (purge -> ingest) so incremental cycles cannot accumulate stale vectors.
+    existing_ids = _flag_ids_in_report_files()
+    seen_ids: set[str] = set()
+    report_rows: list[dict[str, Any]] = []
+    for row in rows:
+        status = _flag_text(row.get("status")).upper()
+        flag_id = _flag_text(row.get("flag_id"))
+        if not flag_id or flag_id in seen_ids:
+            continue
+        if status not in {"DOCTOR_CONFIRMED", "TRAINED"} and flag_id not in requested:
+            continue
+        if flag_id in existing_ids:
+            # Already present in the file: refresh the canonical row rather
+            # than appending a second copy of the same log.
+            logger.debug("Flag %s đã có trong dataset; ghi lại đúng 1 dòng.", flag_id)
+        seen_ids.add(flag_id)
+        report_rows.append(row)
+
+    section = _flag_report_markdown(report_rows, sanitize_raw=True)
+    await asyncio.to_thread(_write_flag_reports, section)
 
     def _ingest() -> int:
         from app.ingestion.pipeline import ingest_markdown_file, purge_document
 
+        # Atomic clean-replace: no purge -> duplicate embeddings; no ingest ->
+        # an old corpus. Purge must happen BEFORE the new markdown is embedded.
         purge_document(FLAG_REPORT_DOC_ID, settings)
         result = ingest_markdown_file(
             FLAG_REPORT_PARSED_PATH,
@@ -4651,8 +4750,6 @@ async def train_flagged_symptoms(payload: FlaggedTrainRequest):
             target_audience="tiep_don",
             settings=settings,
         )
-        for flag_id in selected_ids:
-            update_unmatched_log(flag_id, {"status": "TRAINED"}, settings)
         return result.total_chunks
 
     try:
@@ -4664,9 +4761,23 @@ async def train_flagged_symptoms(payload: FlaggedTrainRequest):
             detail=f"Không nạp được dữ liệu vào pgvector: {_db_error_detail(exc, settings)}",
         ) from exc
 
+    # Only now, after the vectors are live, advance DOCTOR_CONFIRMED -> TRAINED.
+    # update_unmatched_log handles PostgreSQL and the JSONL fallback internally.
+    trained_ids: list[str] = []
+
+    def _mark_trained() -> None:
+        for flag_id in dict.fromkeys(selected_ids):
+            updated = update_unmatched_log(flag_id, {"status": "TRAINED"}, settings)
+            if updated:
+                trained_ids.append(flag_id)
+            else:
+                logger.warning("Không cập nhật được TRAINED cho ca %s", flag_id)
+
+    await asyncio.to_thread(_mark_trained)
+
     return FlaggedTrainResponse(
-        message=f"Đã huấn luyện {len(selected_ids)} ca ngoài tập dữ liệu.",
-        trained_count=len(selected_ids),
+        message=f"Đã huấn luyện {len(trained_ids)} ca ngoài tập dữ liệu.",
+        trained_count=len(trained_ids),
         chunks=chunks,
         chunks_created=chunks,
     )

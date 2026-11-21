@@ -172,6 +172,18 @@ Run the new migration (`patient_id` column + index) before deploying:
 python -m app.database.schema
 ```
 
+## 8. STT uploads & Active Learning
+
+- Groq STT always receives `(filename, io.BytesIO(audio), mime)`; WebM/WAV/MP3/M4A/OGG
+  uploads from both the React kiosk and Streamlit UI keep their real container type.
+  The configured `stt_model` is tried first, then `whisper-large-v3-turbo` and
+  `whisper-large-v3` as safe fallbacks. Short clinical phrases such as "Tê chân",
+  "Đau rát" and "Sốt cao" are accepted instead of being rejected as Whisper noise.
+- Re-training (`POST /api/v1/admin/flagged-symptoms/train-rag`) writes Markdown rows
+  with escaped pipes and `<br>` line breaks, includes a `Flag ID` column for duplicate
+  checks, then **purges** `du_lieu_hoc_tang_cuong` vectors before re-ingesting them.
+  Statuses advance to `TRAINED` only after ingestion succeeds (PostgreSQL + JSONL).
+
 Offline verification of the whole chain (no DB / Groq required):
 
 ```bash
