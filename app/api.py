@@ -252,7 +252,7 @@ AVAILABLE_MODELS: dict[str, list[str]] = {
 }
 
 _DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
-_DEFAULT_STT_MODEL = "whisper-large-v3"
+_DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
 _DEFAULT_VLM_MODEL = "qwen/qwen3.8-27b"
 
 _runtime_lock = threading.Lock()
@@ -287,17 +287,16 @@ class ModelConfigPayload(BaseModel):
 
 
 def _warm_up_knowledge_embedder() -> None:
-    """Pre-load BAAI/bge-m3 in the background (skipped when pgvector is down).
+    """Pre-load BAAI/bge-m3 in the background (always, even if pgvector is down).
 
     The ambient copilot's Step 4 searches ``clinic_knowledge_nodes`` with bge-m3;
     loading the model inside the first consultation would stall the visit for
-    roughly a minute, so it is paid once at boot instead.
+    roughly a minute, so it is paid once at boot instead. The model is warmed up
+    regardless of pgvector reachability so it is hot in RAM before the first
+    patient speaks.
     """
     settings = get_settings()
     try:
-        if not ambient.pgvector_reachable(settings):
-            logger.info("Embedder warm-up skipped: pgvector is unreachable.")
-            return
         from app.ingestion.embedder import warm_up_embedder
 
         warm_up_embedder(settings)
@@ -926,13 +925,20 @@ def _retrieve_triage_context(
         try:
             from app.rag.retriever import retrieve_context
 
-            results = retrieve_context(
-                search_query,
-                top_k=6,
-                target_audience="tiep_don",
-                age_group=age_group,
-                settings=settings,
-            )
+            import concurrent.futures
+
+            def _do_retrieval():
+                return retrieve_context(
+                    search_query,
+                    top_k=6,
+                    target_audience="tiep_don",
+                    age_group=age_group,
+                    settings=settings,
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_do_retrieval)
+                results = future.result(timeout=2.5)
             if results:
                 best_score = max((result.score for result in results), default=0.0)
                 context = "\n\n---\n\n".join(result.content for result in results)
@@ -951,6 +957,15 @@ def _retrieve_triage_context(
                     age_group or "all",
                 )
                 return context, sources, warnings, float(best_score)
+        except concurrent.futures.TimeoutError:
+            logger.warning("Triage RAG retrieval exceeded 2.5s; falling back to built-in context.")
+            warnings.append("Truy xuất ngữ cảnh quá 2.5 giây; bỏ qua RAG để không làm chậm phân loại.")
+            return (
+                _FALLBACK_TRIAGE_CONTEXT,
+                ["Tri thức lâm sàng chuẩn Bộ Y tế (Fast-Triage)"],
+                warnings,
+                0.0,
+            )
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}".strip().splitlines()[0][:200]
             logger.warning("Triage RAG retrieval failed: %s", detail)
