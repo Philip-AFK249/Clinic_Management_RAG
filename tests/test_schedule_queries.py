@@ -5,9 +5,8 @@ through a tiny psycopg-compatible adapter. That keeps the suite dependency-free
 (no live PostgreSQL or pytest needed) while still exercising the SQL filters,
 the aggregation and the ``recommended_shift`` decision logic.
 
-Only the PostgreSQL ``TIME '...'`` literal, ``NOW() AT TIME ZONE ...`` and
-``%(name)s`` placeholders are translated for SQLite; everything else is the
-production statement.
+Only the PostgreSQL ``TIME '...'`` literal and ``%(name)s`` placeholders are
+translated for SQLite; everything else is the production statement.
 """
 
 from __future__ import annotations
@@ -41,18 +40,12 @@ def _frozen_datetime(frozen_at: datetime):
 
 _PLACEHOLDER_RE = re.compile(r"%\((\w+)\)s")
 _TIME_LITERAL_RE = re.compile(r"\bTIME\s+'([^']+)'", re.IGNORECASE)
-_NOW_CLINIC_RE = re.compile(
-    r"\bNOW\s*\(\s*\)\s+AT\s+TIME\s+ZONE\s+'Asia/Ho_Chi_Minh'", re.IGNORECASE
-)
 
 
 def _sqlite_sql(sql: str) -> str:
     """Translate the small PostgreSQL-specific surface used by _SCHEDULE_SQL."""
     sql = _PLACEHOLDER_RE.sub(r":\1", sql)
-    sql = _TIME_LITERAL_RE.sub(r"'\1'", sql)
-    # SQLite has no AT TIME ZONE; bind the frozen clinic "now" as a plain
-    # 'YYYY-MM-DD HH:MM:SS' string so text comparison with hold_expires_at works.
-    return _NOW_CLINIC_RE.sub(":now_clinic", sql)
+    return _TIME_LITERAL_RE.sub(r"'\1'", sql)
 
 
 def _sqlite_params(params: dict | None) -> dict:
@@ -64,10 +57,6 @@ def _sqlite_params(params: dict | None) -> dict:
             adapted[key] = value.isoformat()
         else:
             adapted[key] = value
-    now_clinic = sq.datetime.now(sq.CLINIC_TIMEZONE).replace(
-        tzinfo=None, microsecond=0
-    )
-    adapted["now_clinic"] = now_clinic.isoformat(sep=" ")
     return adapted
 
 
@@ -149,8 +138,7 @@ class _ScheduleHarness:
                 department_id INTEGER,
                 appointment_date TEXT,
                 slot_start_time TEXT,
-                status TEXT DEFAULT 'BOOKED',
-                hold_expires_at TEXT
+                status TEXT DEFAULT 'BOOKED'
             );
             """
         )
@@ -216,25 +204,20 @@ class _ScheduleHarness:
         doctor_id: int,
         department_id: int,
         slot_start_time: str,
-        status: str = "BOOKED",
+        status: str | None = "BOOKED",
         appointment_date: date = TARGET_DATE,
-        hold_expires_at: datetime | str | None = None,
     ) -> None:
-        if isinstance(hold_expires_at, datetime):
-            hold_expires_at = hold_expires_at.replace(microsecond=0).isoformat(sep=" ")
         self.connection.execute(
             "INSERT INTO slot_assignments "
             "(ticket_number, doctor_id, department_id, appointment_date, "
-            "slot_start_time, status, hold_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "slot_start_time, status) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                f"T{doctor_id}-{appointment_date.isoformat()}-{slot_start_time}"
-                f"-{status}-{hold_expires_at}",
+                f"T{doctor_id}-{appointment_date.isoformat()}-{slot_start_time}-{status}",
                 doctor_id,
                 department_id,
                 appointment_date.isoformat(),
                 slot_start_time,
                 status,
-                hold_expires_at,
             ),
         )
 
@@ -387,7 +370,15 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
         self.assertTrue(result["afternoon"]["is_full"])
         self.assertEqual(result["recommended_shift"], "NEXT_DAY")
 
-    def test_active_hold_reduces_total_available_slots(self) -> None:
+    def test_schedule_sql_counts_only_booked_assignments(self) -> None:
+        """The production query carries no temporary-hold/deposit condition."""
+        sql = sq._SCHEDULE_SQL
+        self.assertIn("COALESCE(sa.status, 'BOOKED') = 'BOOKED'", sql)
+        self.assertNotIn("HOLD", sql)
+        self.assertNotIn("hold_expires_at", sql)
+        self.assertNotIn("NOW()", sql)
+
+    def test_explicit_and_default_booked_assignments_count_toward_capacity(self) -> None:
         self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
         self.db.add_assignment(
             doctor_id=1, department_id=1, slot_start_time="08:00:00"
@@ -396,11 +387,10 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
             doctor_id=1,
             department_id=1,
             slot_start_time="09:00:00",
-            status="HOLD",
-            hold_expires_at=datetime(2099, 1, 5, 11, 0, tzinfo=sq.CLINIC_TIMEZONE),
+            status="BOOKED",
         )
 
-        result = self._load_today_at(10, 0)  # hold is still active at 10:00
+        result = self._load_today_at(10, 0)
 
         doctor = result["morning"]["doctors"][0]
         self.assertEqual(doctor["booked_count"], 2)
@@ -408,16 +398,13 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
         self.assertEqual(result["morning"]["total_available_slots"], 14)
         self.assertFalse(result["morning"]["is_full"])
 
-    def test_active_holds_can_fill_a_session(self) -> None:
+    def test_booked_assignments_can_fill_a_session(self) -> None:
         self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
-        future = datetime(2099, 1, 5, 11, 30, tzinfo=sq.CLINIC_TIMEZONE)
         for index in range(16):
             self.db.add_assignment(
                 doctor_id=1,
                 department_id=1,
                 slot_start_time=f"{7 + index // 4:02d}:{(index % 4) * 15:02d}:00",
-                status="HOLD",
-                hold_expires_at=future,
             )
 
         result = self._load_today_at(10, 0)
@@ -429,55 +416,30 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
         self.assertTrue(session["is_full"])
         self.assertEqual(result["recommended_shift"], "NEXT_DAY")
 
-    def test_expired_hold_and_terminal_statuses_do_not_count(self) -> None:
+    def test_null_status_counts_as_booked_but_terminal_statuses_do_not(self) -> None:
         self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
-        future = datetime(2099, 1, 5, 11, 0, tzinfo=sq.CLINIC_TIMEZONE)
-        past = datetime(2099, 1, 5, 9, 0, tzinfo=sq.CLINIC_TIMEZONE)
 
-        # Counted: confirmed booking, unexpired HOLD, and HOLD with no deadline.
+        # Counted: explicit BOOKED and a NULL status (COALESCE default).
         self.db.add_assignment(
             doctor_id=1, department_id=1, slot_start_time="07:00:00", status="BOOKED"
         )
         self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="07:15:00",
-            status="HOLD",
-            hold_expires_at=future,
+            doctor_id=1, department_id=1, slot_start_time="07:15:00", status=None
+        )
+        # Not counted: terminal statuses.
+        self.db.add_assignment(
+            doctor_id=1, department_id=1, slot_start_time="07:30:00", status="CANCELLED"
         )
         self.db.add_assignment(
-            doctor_id=1, department_id=1, slot_start_time="07:30:00", status="HOLD"
-        )
-        # Not counted: expired HOLD plus CANCELLED / EXPIRED rows (even with a
-        # future hold_expires_at, because their status is terminal).
-        self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="07:45:00",
-            status="HOLD",
-            hold_expires_at=past,
-        )
-        self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="08:00:00",
-            status="CANCELLED",
-            hold_expires_at=future,
-        )
-        self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="08:15:00",
-            status="EXPIRED",
-            hold_expires_at=future,
+            doctor_id=1, department_id=1, slot_start_time="07:45:00", status="EXPIRED"
         )
 
         result = self._load_today_at(10, 0)
         doctor = result["morning"]["doctors"][0]
 
-        self.assertEqual(doctor["booked_count"], 3)
-        self.assertEqual(doctor["available_capacity"], 13)
-        self.assertEqual(result["morning"]["total_available_slots"], 13)
+        self.assertEqual(doctor["booked_count"], 2)
+        self.assertEqual(doctor["available_capacity"], 14)
+        self.assertEqual(result["morning"]["total_available_slots"], 14)
         self.assertFalse(result["morning"]["is_full"])
         self.assertEqual(result["recommended_shift"], "MORNING")
 
