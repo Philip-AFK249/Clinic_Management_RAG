@@ -11,7 +11,10 @@ Business rules implemented (per the clinic's outpatient capacity policy):
   four 60-minute slots;
 * one doctor can take ``max_patients_per_slot * 4`` patients per session;
 * a session is full when the patients booked across *all* duty doctors in that
-  session reach the combined capacity of the session.
+  session reach the combined capacity of the session;
+* temporary ``HOLD`` assignments occupy capacity until their deposit deadline,
+  so unexpired (or deadline-less) holds count as booked; expired holds and
+  ``CANCELLED`` / ``EXPIRED`` rows do not.
 
 Every value that originates outside this module (department id, date) is bound
 as a query parameter - no SQL string is ever built by concatenation.
@@ -90,7 +93,16 @@ booked AS (
     FROM slot_assignments sa
     WHERE sa.appointment_date = %(target_date)s
       AND sa.department_id = %(department_id)s
-      AND COALESCE(sa.status, 'BOOKED') = 'BOOKED'
+      AND (
+          COALESCE(sa.status, 'BOOKED') = 'BOOKED'
+          OR (
+              sa.status = 'HOLD'
+              AND (
+                  sa.hold_expires_at IS NULL
+                  OR sa.hold_expires_at > (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')
+              )
+          )
+      )
     GROUP BY sa.doctor_id, 2
 )
 SELECT
