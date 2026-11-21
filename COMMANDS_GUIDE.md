@@ -152,3 +152,28 @@ All environment variables live in `.env` at the project root:
 | `DB_NAME` | Database name | `clinic_rag` |
 | `GROQ_API_KEY` | Groq LLM API key | *(required)* |
 | `LLAMA_CLOUD_API_KEY` | LlamaParse API key | *(required for LlamaParse)* |
+
+## 7. Voice Triage / 3-Minute Booking Hold
+
+The gateway keeps the structured extraction from Whisper + RAG in an in-process,
+thread-safe cache for **180 seconds** (`TRIAGE_HOLD_SECONDS`). No Redis is needed
+because uvicorn serves this API from one process.
+
+| Call | Purpose |
+|------|---------|
+| `POST /api/v1/triage/analyze-symptom` | Multipart `file` (or JSON `transcription`) -> structured JSON with `flag_id`, `departmentId`, `priorityLevel`, `normalizedSymptoms` (plus the legacy snake_case twins). |
+| `POST /api/v1/triage/analyze-symptom` with only `flag_id` / `patient_id` / `ticket_number` | Restore the cached chief complaint **without** re-running Whisper or the LLM. JSON or multipart both work. |
+| `GET /api/v1/triage/analyze-symptom?flag_id=...` | Same restore, query-string form. |
+| `PATCH /api/v1/admin/flagged-symptoms/{flagId}` with `{"event": "HOLD_EXPIRED"}` (or `BOOKING_REJECTED` / `TICKET_CANCELLED`) | Releases the ticket hold, marks the row `CANCELLED`, and keeps the triage context addressable for another 3-minute retry window. Repeated/late events are idempotent. |
+
+Run the new migration (`patient_id` column + index) before deploying:
+
+```bash
+python -m app.database.schema
+```
+
+Offline verification of the whole chain (no DB / Groq required):
+
+```bash
+python scripts/verify_triage_pipeline.py
+```

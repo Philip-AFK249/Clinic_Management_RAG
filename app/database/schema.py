@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS unmatched_symptom_logs (
     flag_reason TEXT NOT NULL DEFAULT 'LOW_SIMILARITY_MATCH',
     similarity_score DOUBLE PRECISION,
     ticket_number TEXT,
+    patient_id INTEGER,
     patient_name TEXT,
     confirmed_icd10_code TEXT,
     confirmed_disease_name TEXT,
@@ -64,6 +65,16 @@ ON unmatched_symptom_logs (status, created_at DESC);
 CREATE_UNMATCHED_LOGS_TICKET_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_unmatched_logs_ticket
 ON unmatched_symptom_logs (ticket_number);
+"""
+
+CREATE_UNMATCHED_LOGS_PATIENT_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_unmatched_logs_patient
+ON unmatched_symptom_logs (patient_id);
+"""
+
+ADD_UNMATCHED_LOG_PATIENT_ID_SQL = """
+ALTER TABLE unmatched_symptom_logs
+ADD COLUMN IF NOT EXISTS patient_id INTEGER;
 """
 
 ADD_UNMATCHED_LOG_NORMALIZED_TRANSCRIPTION_SQL = """
@@ -112,6 +123,7 @@ UNMATCHED_LOG_COLUMNS = (
     "flag_reason",
     "similarity_score",
     "ticket_number",
+    "patient_id",
     "patient_name",
     "confirmed_icd10_code",
     "confirmed_disease_name",
@@ -136,6 +148,7 @@ UNMATCHED_LOG_WRITABLE_COLUMNS = (
     "flag_reason",
     "similarity_score",
     "ticket_number",
+    "patient_id",
     "patient_name",
     "confirmed_icd10_code",
     "confirmed_disease_name",
@@ -146,7 +159,7 @@ UNMATCHED_LOG_WRITABLE_COLUMNS = (
     "status",
 )
 
-FLAG_STATUSES = ("PENDING_DOCTOR", "DOCTOR_CONFIRMED", "TRAINED")
+FLAG_STATUSES = ("PENDING_DOCTOR", "DOCTOR_CONFIRMED", "TRAINED", "CANCELLED")
 
 _JSONL_LOCK = threading.Lock()
 _UNMATCHED_TABLE_READY = False
@@ -157,7 +170,9 @@ _STATEMENTS: list[str] = [
     CREATE_UNMATCHED_LOGS_SQL,
     CREATE_UNMATCHED_LOGS_STATUS_INDEX_SQL,
     CREATE_UNMATCHED_LOGS_TICKET_INDEX_SQL,
+    CREATE_UNMATCHED_LOGS_PATIENT_INDEX_SQL,
     ADD_UNMATCHED_LOG_NORMALIZED_TRANSCRIPTION_SQL,
+    ADD_UNMATCHED_LOG_PATIENT_ID_SQL,
     ADD_AGE_GROUP_SQL,
     CREATE_INDEX_ON_AGE_GROUP_SQL,
     CREATE_INDEX_ON_SPECIALTY_SQL,
@@ -194,7 +209,9 @@ def _ensure_unmatched_table(settings: Settings) -> None:
                 CREATE_UNMATCHED_LOGS_SQL,
                 CREATE_UNMATCHED_LOGS_STATUS_INDEX_SQL,
                 CREATE_UNMATCHED_LOGS_TICKET_INDEX_SQL,
+                CREATE_UNMATCHED_LOGS_PATIENT_INDEX_SQL,
                 ADD_UNMATCHED_LOG_NORMALIZED_TRANSCRIPTION_SQL,
+                ADD_UNMATCHED_LOG_PATIENT_ID_SQL,
             ],
         )
         _UNMATCHED_TABLE_READY = True

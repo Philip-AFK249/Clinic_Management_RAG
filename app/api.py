@@ -19,11 +19,11 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.formparsers import MultiPartParser
 
 from app.core.config import (
@@ -72,6 +72,11 @@ from app.services.ambient import (
     SoapNote,
 )
 from app.services.clinical_client import get_available_drugs
+from app.services.triage_session_cache import (
+    TRIAGE_HOLD_SECONDS,
+    TriageSessionContext,
+    triage_session_cache,
+)
 
 logger = get_logger(__name__)
 
@@ -104,6 +109,10 @@ VALID_DEPARTMENT_IDS = (1, 2, 3)
 VALID_PRIORITIES = ("P1", "P2", "P3")
 TRIAGE_AGE_GROUPS = ("tre_em", "nguoi_truong_thanh", "nguoi_cao_tuoi", "tat_ca")
 MAX_CLARIFICATION_ROUNDS = 4
+# A booking is held for three minutes. Within that window the reception/admin
+# flow can reject or time out the hold and retry with flag_id / patient_id.
+CANCELLATION_EVENTS = frozenset({"TICKET_CANCELLED", "HOLD_EXPIRED", "BOOKING_REJECTED"})
+CANCELLED_STATUS = "CANCELLED"
 OOD_SCORE_THRESHOLD = 0.52
 FLAG_REPORT_DOC_ID = "du_lieu_hoc_tang_cuong"
 FLAG_REPORT_RAW_PATH = RAW_DOCS_DIR / f"{FLAG_REPORT_DOC_ID}.md"
@@ -908,6 +917,38 @@ def _clinical_symptom_summary(raw_text: str) -> str:
         or "Chưa mô tả rõ triệu chứng"
     )
 
+
+_SYMPTOM_PHRASE_SPLIT_RE = re.compile(
+    r"[,;.!?]|\s+(?:và|cùng|kèm theo|kèm|rồi|nên|nhưng|mà|thì|sau đó|đồng thời)\s+",
+    re.IGNORECASE,
+)
+_SYMPTOM_WORD_RE = re.compile(r"[A-Za-zÀ-ỹđĐ0-9]")
+
+
+def _normalised_symptom_list(transcription: str) -> list[str]:
+    """Split the de-garbled transcript into the symptoms returned to callers.
+
+    The gateway already cleans Whisper homophones in ``_clean_clinical_transcript``;
+    this just turns that single cleaned string into a structured list so a client
+    can show "chief complaints" chips without parsing free text again.
+    """
+    cleaned = _clean_clinical_transcript(transcription)
+    if not cleaned:
+        return []
+    symptoms: list[str] = []
+    for part in _SYMPTOM_PHRASE_SPLIT_RE.split(cleaned):
+        phrase = " ".join(part.split()).strip(" ,;.!?-")[:160]
+        if len(phrase) < 3 or not _SYMPTOM_WORD_RE.search(phrase):
+            continue
+        if any(
+            _fold_vietnamese_for_match(phrase) == _fold_vietnamese_for_match(existing)
+            for existing in symptoms
+        ):
+            continue
+        symptoms.append(phrase)
+        if len(symptoms) >= 12:
+            break
+    return symptoms or [cleaned[:160]]
 
 
 def _retrieve_triage_context(
@@ -1805,6 +1846,10 @@ class RefineTriageRequest(BaseModel):
     )
     is_out_of_dataset: bool = False
     flag_reason: str = ""
+    patient_id: Optional[int] = Field(
+        default=None, description="Mã bệnh nhân để khôi phục phiên giữ chỗ nếu booking bị hủy."
+    )
+    ticket_number: Optional[str] = None
 
 
 class TextTriageRequest(BaseModel):
@@ -1814,6 +1859,9 @@ class TextTriageRequest(BaseModel):
     target_date: Optional[str] = None
     age_group: Optional[str] = None
     patient_history: Optional[str] = None
+    flag_id: Optional[str] = None
+    patient_id: Optional[int] = None
+    ticket_number: Optional[str] = None
 
 
 class VoiceScheduleTriageResponse(BaseModel):
@@ -1857,6 +1905,58 @@ class VoiceScheduleTriageResponse(BaseModel):
     flag_reason: str = ""
     flag_id: Optional[str] = None
     similarity_score: Optional[float] = None
+
+
+class AnalyzeSymptomResponse(VoiceScheduleTriageResponse):
+    """Structured contract for ``/api/v1/triage/analyze-symptom``.
+
+    The intake service speaks camelCase (``departmentId``, ``priorityLevel``)
+    while the existing kiosk reads snake_case. Both shapes are emitted from the
+    same pipeline result so one call serves both without a second LLM/STT pass.
+    """
+
+    departmentId: int = 0
+    priorityLevel: str = ""
+    normalizedSymptoms: list[str] = Field(default_factory=list)
+    normalized_symptoms: list[str] = Field(default_factory=list)
+    patient_id: Optional[int] = None
+    ticket_number: str = ""
+    restored_from_cache: bool = False
+    expires_in_seconds: int = TRIAGE_HOLD_SECONDS
+
+
+class AnalyzeSymptomRequest(BaseModel):
+    """JSON body accepted by analyze-symptom for restore / typed symptom input."""
+
+    transcription: Optional[str] = None
+    flag_id: Optional[str] = None
+    patient_id: Optional[int] = None
+    ticket_number: Optional[str] = None
+    age_group: Optional[str] = None
+    patient_history: Optional[str] = None
+    target_date: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_camel_case(cls, values: Any) -> Any:
+        """Intake services use camelCase identifiers; accept both spellings."""
+        if not isinstance(values, dict):
+            return values
+        aliases = {
+            "flagId": "flag_id",
+            "patientId": "patient_id",
+            "ticketNumber": "ticket_number",
+            "ageGroup": "age_group",
+            "patientHistory": "patient_history",
+            "targetDate": "target_date",
+        }
+        result = dict(values)
+        for alias, canonical in aliases.items():
+            if alias in result:
+                if canonical not in result:
+                    result[canonical] = result[alias]
+                result.pop(alias)
+        return result
 
 
 def _is_flag_reusable(row: dict[str, Any]) -> bool:
@@ -1988,6 +2088,217 @@ def _log_out_of_dataset_facts(
         facts["flag_id"] = stored.get("flag_id")
     except Exception as exc:
         logger.warning("Không ghi nhận ca triệu chứng ngoài tập dữ liệu: %s", exc)
+
+
+def _remember_triage(
+    triage: VoiceScheduleTriageResponse,
+    *,
+    flag_id: Optional[str] = None,
+    patient_id: Optional[int] = None,
+    ticket_number: Optional[str] = None,
+    settings=None,
+) -> tuple[str, TriageSessionContext]:
+    """Park the freshly extracted context in the three-minute session cache.
+
+    A flag id is issued even when the case is not out-of-dataset: the booking
+    flow uses it to resume after an admin rejection, which must never require
+    a second recording or another Whisper call.
+    """
+    resolved_flag = (triage.flag_id or flag_id or "").strip() or new_flag_id(settings)
+    triage.flag_id = resolved_flag
+    normalized = (
+        triage.normalized_transcription
+        or _clean_clinical_transcript(triage.transcription)
+    )
+    context = TriageSessionContext(
+        flag_id=resolved_flag,
+        transcription=triage.transcription,
+        normalized_transcription=normalized,
+        normalized_symptoms=_normalised_symptom_list(normalized or triage.transcription),
+        chief_complaint_summary=triage.chief_complaint_summary,
+        department_id=triage.department_id,
+        department_name=triage.department_name,
+        priority_level=triage.priority_level,
+        disease_guess=triage.disease_guess,
+        icd10_code=triage.icd10_code,
+        patient_id=patient_id,
+        ticket_number=(ticket_number or "").strip(),
+        age_group=triage.detected_age_group or "",
+        recommended_shift=triage.recommended_shift,
+    )
+    triage_session_cache.put(context)
+    return resolved_flag, context
+
+
+def _link_session_identifiers(
+    flag_id: str,
+    settings,
+    *,
+    patient_id: Optional[int] = None,
+    ticket_number: Optional[str] = None,
+) -> None:
+    """Persist optional identifiers on the flag row when one exists.
+
+    OOD cases already have a durable row; keeping the patient/ticket on it lets
+    a restore survive a gateway restart, after the in-memory hold has expired.
+    Non-OOD cases simply get a no-op update.
+    """
+    changes: dict[str, Any] = {}
+    if patient_id is not None:
+        changes["patient_id"] = patient_id
+    if ticket_number and ticket_number.strip():
+        changes["ticket_number"] = ticket_number.strip()
+    if not changes:
+        return
+    try:
+        update_unmatched_log(flag_id, changes, settings)
+    except Exception as exc:
+        logger.warning("Không gắn patient_id/ticket_number vào ca %s: %s", flag_id, exc)
+
+
+def _analyze_response_from_context(
+    context: TriageSessionContext,
+    *,
+    restored_from_cache: bool,
+) -> AnalyzeSymptomResponse:
+    """Build the structured JSON contract from a cached triage context."""
+    symptoms = list(context.normalized_symptoms) or _normalised_symptom_list(
+        context.normalized_transcription or context.transcription
+    )
+    department = context.department_id or 1
+    priority = context.priority_level or "P3"
+    return AnalyzeSymptomResponse(
+        success=True,
+        transcription=context.transcription,
+        normalized_transcription=context.normalized_transcription,
+        normalizedSymptoms=symptoms,
+        normalized_symptoms=symptoms,
+        chief_complaint_summary=context.chief_complaint_summary,
+        disease_guess=context.disease_guess,
+        icd10_code=context.icd10_code,
+        department_id=department,
+        department_name=context.department_name,
+        priority_level=priority,
+        departmentId=department,
+        priorityLevel=priority,
+        recommended_shift=context.recommended_shift,
+        advice="",
+        schedule={},
+        schedule_connected=True,
+        target_date="",
+        rag_sources=[],
+        warnings=[
+            "Đã khôi phục triệu chứng từ phiên giữ chỗ tạm thời."
+            if restored_from_cache
+            else "Đã khôi phục triệu chứng từ hồ sơ triage đã lưu."
+        ],
+        flag_id=context.flag_id,
+        patient_id=context.patient_id,
+        ticket_number=context.ticket_number,
+        restored_from_cache=restored_from_cache,
+        expires_in_seconds=context.remaining_seconds,
+    )
+
+
+def _analyze_response_from_triage(
+    triage: VoiceScheduleTriageResponse, context: TriageSessionContext
+) -> AnalyzeSymptomResponse:
+    """Map a fresh pipeline result to the structured payload, keeping snake_case too."""
+    payload = triage.model_dump()
+    symptoms = list(context.normalized_symptoms)
+    payload.update(
+        flag_id=context.flag_id,
+        departmentId=context.department_id,
+        priorityLevel=context.priority_level,
+        normalizedSymptoms=symptoms,
+        normalized_symptoms=symptoms,
+        patient_id=context.patient_id,
+        ticket_number=context.ticket_number,
+        restored_from_cache=False,
+        expires_in_seconds=context.remaining_seconds,
+    )
+    return AnalyzeSymptomResponse(**payload)
+
+
+def _find_flag_row(
+    *,
+    flag_id: Optional[str] = None,
+    patient_id: Optional[int] = None,
+    ticket_number: Optional[str] = None,
+    settings=None,
+) -> Optional[dict[str, Any]]:
+    """Durable fallback for a restore whose three-minute cache entry has expired."""
+    rows = list_unmatched_logs(settings)
+    wanted_flag = (flag_id or "").strip()
+    if wanted_flag:
+        match = next(
+            (row for row in rows if _flag_text(row.get("flag_id")) == wanted_flag), None
+        )
+        if match:
+            return match
+    if patient_id is not None:
+        match = next(
+            (
+                row for row in rows
+                if _flag_text(row.get("patient_id")).strip() == str(patient_id)
+            ),
+            None,
+        )
+        if match:
+            return match
+    wanted_ticket = (ticket_number or "").strip()
+    if wanted_ticket:
+        return next(
+            (
+                row for row in rows
+                if _flag_text(row.get("ticket_number")).strip() == wanted_ticket
+            ),
+            None,
+        )
+    return None
+
+
+def _restore_triage_context(
+    *,
+    flag_id: Optional[str] = None,
+    patient_id: Optional[int] = None,
+    ticket_number: Optional[str] = None,
+    settings=None,
+) -> Optional[AnalyzeSymptomResponse]:
+    """Fast path: cache, then the persisted flag row. Never re-runs Whisper."""
+    cached = triage_session_cache.get(
+        flag_id=flag_id, patient_id=patient_id, ticket_number=ticket_number
+    )
+    if cached:
+        return _analyze_response_from_context(cached, restored_from_cache=True)
+
+    row = _find_flag_row(
+        flag_id=flag_id, patient_id=patient_id, ticket_number=ticket_number, settings=settings
+    )
+    if not row:
+        return None
+    item = _flag_item(row)
+    normalized = item.normalized_transcription or _clean_clinical_transcript(
+        item.transcription
+    )
+    department = item.ai_department_id or 1
+    priority = item.ai_priority_level or "P3"
+    context = TriageSessionContext(
+        flag_id=item.flag_id,
+        transcription=item.transcription,
+        normalized_transcription=normalized,
+        normalized_symptoms=_normalised_symptom_list(normalized or item.transcription),
+        chief_complaint_summary=item.ai_disease_guess,
+        department_id=department,
+        department_name=item.ai_department_name,
+        priority_level=priority,
+        disease_guess=item.ai_disease_guess,
+        icd10_code=item.ai_icd10_code,
+        patient_id=item.patient_id,
+        ticket_number=item.ticket_number,
+        age_group=item.age_group,
+    )
+    return _analyze_response_from_context(context, restored_from_cache=False)
 
 
 def _complete_triage_with_schedule(
@@ -2719,6 +3030,52 @@ async def run_single_file(payload: PipelineRunRequest):
         ) from exc
 
 
+def _voice_upload_filename(upload: UploadFile) -> str:
+    """Normalise browser-generated blobs (no extension) into a named audio file."""
+    filename = (upload.filename or "").strip()
+    extension = Path(filename).suffix.lower()
+    if extension:
+        return filename
+    content_type = (upload.content_type or "").lower()
+    if "webm" in content_type:
+        extension = ".webm"
+    elif "wav" in content_type:
+        extension = ".wav"
+    elif "mp4" in content_type or "m4a" in content_type:
+        extension = ".m4a"
+    elif "ogg" in content_type:
+        extension = ".ogg"
+    elif "mp3" in content_type or "mpeg" in content_type:
+        extension = ".mp3"
+    else:
+        extension = ".webm"  # Mặc định của Web MediaRecorder
+    return f"voice_recording{extension}"
+
+
+def _validate_voice_upload(filename: str, audio: bytes) -> None:
+    """Shared format/size/silence guards for every audio extraction route."""
+    extension = Path(filename).suffix.lower()
+    if extension not in VOICE_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Định dạng audio không hỗ trợ: {extension or '(không có)'}. "
+            f"Chấp nhận: {', '.join(VOICE_ALLOWED_EXTENSIONS)}",
+        )
+    if not audio:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp audio rỗng.")
+    if len(audio) > VOICE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File audio vượt quá {VOICE_MAX_BYTES // (1024 * 1024)} MB.",
+        )
+    if _wav_has_no_speech(audio) is True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Không phát hiện giọng nói trong tệp WAV (âm thanh im lặng hoặc chỉ có nhiễu). "
+            "Vui lòng ghi âm lại gần micro hơn.",
+        )
+
+
 @app.post("/api/v1/triage/voice-schedule", response_model=VoiceScheduleTriageResponse)
 async def voice_schedule_triage(
     file: UploadFile = File(..., description="Ghi âm: .wav, .webm, .m4a, .mp3"),
@@ -2732,61 +3089,34 @@ async def voice_schedule_triage(
     patient_history: Optional[str] = Form(
         None, description="Tiền sử bệnh đã biết (tăng huyết áp, tim mạch, tiểu đường...)."
     ),
+    patient_id: Optional[int] = Form(
+        None, description="Mã bệnh nhân (để khôi phục phiên nếu booking bị hủy)."
+    ),
+    flag_id: Optional[str] = Form(None, description="FLG-... của phiên triage trước."),
+    ticket_number: Optional[str] = Form(None, description="Mã vé đặt chỗ tạm thời."),
 ):
     """Two-stage voice triage: Whisper + age-filtered RAG + LLM, then roster query."""
     try:
-        filename = (file.filename or "").strip()
-        extension = Path(filename).suffix.lower()
-
-        # 1. Tự động nhận diện định dạng nếu trình duyệt gửi file blob không có đuôi mở rộng
-        if not extension:
-            content_type = (file.content_type or "").lower()
-            if "webm" in content_type:
-                extension = ".webm"
-            elif "wav" in content_type:
-                extension = ".wav"
-            elif "mp4" in content_type or "m4a" in content_type:
-                extension = ".m4a"
-            elif "ogg" in content_type:
-                extension = ".ogg"
-            elif "mp3" in content_type or "mpeg" in content_type:
-                extension = ".mp3"
-            else:
-                extension = ".webm"  # Mặc định của Web MediaRecorder
-            filename = f"voice_recording{extension}"
-
-        # 2. Kiểm tra định dạng audio hợp lệ
-        if extension not in VOICE_ALLOWED_EXTENSIONS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Định dạng audio không hỗ trợ: {extension or '(không có)'}. "
-                f"Chấp nhận: {', '.join(VOICE_ALLOWED_EXTENSIONS)}",
-            )
-
-        # 3. Đọc dữ liệu audio
+        # 1-4. Normalise the blob name, then validate format/size/silence.
+        filename = _voice_upload_filename(file)
         audio = await file.read()
-        if not audio:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Tệp audio rỗng."
-            )
-        if len(audio) > VOICE_MAX_BYTES:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File audio vượt quá {VOICE_MAX_BYTES // (1024 * 1024)} MB.",
-            )
-
-        # 4. Kiểm tra khoảng lặng (áp dụng cho PCM WAV)
-        if _wav_has_no_speech(audio) is True:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Không phát hiện giọng nói trong tệp WAV (âm thanh im lặng hoặc chỉ có nhiễu). "
-                "Vui lòng ghi âm lại gần micro hơn.",
-            )
+        _validate_voice_upload(filename, audio)
 
         # 5. Thực thi luồng xử lý Voice Triage & Tra cứu lịch trực
-        return await asyncio.to_thread(
+        triage = await asyncio.to_thread(
             _run_voice_triage, audio, filename, target_date, age_group, patient_history
         )
+        flag, _context = _remember_triage(
+            triage,
+            flag_id=flag_id,
+            patient_id=patient_id,
+            ticket_number=ticket_number,
+            settings=get_settings(),
+        )
+        _link_session_identifiers(
+            flag, get_settings(), patient_id=patient_id, ticket_number=ticket_number
+        )
+        return triage
 
     except HTTPException:
         # Giữ nguyên các mã lỗi HTTP có chủ đích (400, 413, v.v.)
@@ -2811,7 +3141,21 @@ async def voice_schedule_triage(
 async def text_schedule_triage(payload: TextTriageRequest):
     """Fully typed/edited transcript -> same RAG + LLM + schedule pipeline as voice."""
     try:
-        return await asyncio.to_thread(_run_text_triage, payload)
+        triage = await asyncio.to_thread(_run_text_triage, payload)
+        flag, _context = _remember_triage(
+            triage,
+            flag_id=payload.flag_id,
+            patient_id=payload.patient_id,
+            ticket_number=payload.ticket_number,
+            settings=get_settings(),
+        )
+        _link_session_identifiers(
+            flag,
+            get_settings(),
+            patient_id=payload.patient_id,
+            ticket_number=payload.ticket_number,
+        )
+        return triage
     except HTTPException:
         raise
     except ValueError as exc:
@@ -2836,7 +3180,21 @@ async def refine_triage(payload: RefineTriageRequest):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Thiếu nội dung lời kể ban đầu cần làm rõ.",
             )
-        return await asyncio.to_thread(_run_refined_triage, payload)
+        triage = await asyncio.to_thread(_run_refined_triage, payload)
+        flag, _context = _remember_triage(
+            triage,
+            flag_id=payload.flag_id,
+            patient_id=payload.patient_id,
+            ticket_number=payload.ticket_number,
+            settings=get_settings(),
+        )
+        _link_session_identifiers(
+            flag,
+            get_settings(),
+            patient_id=payload.patient_id,
+            ticket_number=payload.ticket_number,
+        )
+        return triage
     except HTTPException:
         raise
     except ValueError as exc:
@@ -2850,6 +3208,152 @@ async def refine_triage(payload: RefineTriageRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi xử lý làm rõ triệu chứng: {str(exc)}",
         ) from exc
+
+
+@app.post("/api/v1/triage/analyze-symptom", response_model=AnalyzeSymptomResponse)
+async def analyze_symptom(request: Request):
+    """Extract symptoms once and return the structured payload used for booking.
+
+    Accepts either ``multipart/form-data`` (an optional ``file`` recording plus
+    ``patient_id`` / ``flag_id`` / ``ticket_number``) or a JSON body with the
+    same identifiers and an optional ``transcription``.
+
+    When neither a recording nor a transcription is sent, the request is a
+    *restore*: the previously extracted chief complaint is read from the
+    three-minute session cache (or the persisted flag row) with no Whisper or
+    LLM call. This is the path used after an admin rejects a held booking.
+    """
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+        upload = None
+        if (
+            "multipart/form-data" in content_type
+            or "application/x-www-form-urlencoded" in content_type
+        ):
+            form = await request.form()
+            raw: dict[str, Any] = {}
+            for key, value in form.multi_items():
+                if hasattr(value, "read") and hasattr(value, "filename"):
+                    if key == "file" and upload is None:
+                        upload = value
+                    continue
+                raw[key] = value
+        else:
+            try:
+                raw = await request.json()
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+
+        known_fields = AnalyzeSymptomRequest.model_fields
+        payload = AnalyzeSymptomRequest(
+            **{key: value for key, value in raw.items() if key in known_fields}
+        )
+        transcription = (payload.transcription or "").strip()
+        settings = get_settings()
+
+        # Restore-only path: identifiers instead of new audio. Never re-run STT.
+        if upload is None and not transcription:
+            if not (
+                payload.flag_id
+                or payload.patient_id is not None
+                or payload.ticket_number
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Cần file audio, lời kể, hoặc flag_id/patient_id/ticket_number để khôi phục.",
+                )
+            restored = await asyncio.to_thread(
+                _restore_triage_context,
+                flag_id=payload.flag_id,
+                patient_id=payload.patient_id,
+                ticket_number=payload.ticket_number,
+                settings=settings,
+            )
+            if restored is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Không tìm thấy phiên triệu chứng tạm thời (có thể đã hết hạn giữ chỗ 3 phút).",
+                )
+            return restored
+
+        if upload is not None:
+            filename = _voice_upload_filename(upload)
+            audio = await upload.read()
+            _validate_voice_upload(filename, audio)
+            triage = await asyncio.to_thread(
+                _run_voice_triage,
+                audio,
+                filename,
+                payload.target_date,
+                payload.age_group,
+                payload.patient_history,
+            )
+        else:
+            triage = await asyncio.to_thread(
+                _run_text_triage,
+                TextTriageRequest(
+                    transcription=transcription,
+                    target_date=payload.target_date,
+                    age_group=payload.age_group,
+                    patient_history=payload.patient_history,
+                ),
+            )
+
+        flag, context = _remember_triage(
+            triage,
+            flag_id=payload.flag_id,
+            patient_id=payload.patient_id,
+            ticket_number=payload.ticket_number,
+            settings=settings,
+        )
+        _link_session_identifiers(
+            flag,
+            settings,
+            patient_id=payload.patient_id,
+            ticket_number=payload.ticket_number,
+        )
+        return _analyze_response_from_triage(triage, context)
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        logger.warning("Analyze symptom validation error: %s", exc)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Lỗi hệ thống khi phân tích triệu chứng: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi xử lý Analyze Symptom: {str(exc)}",
+        ) from exc
+
+
+@app.get("/api/v1/triage/analyze-symptom", response_model=AnalyzeSymptomResponse)
+async def restore_analyzed_symptom(
+    flag_id: Optional[str] = None,
+    patient_id: Optional[int] = None,
+    ticket_number: Optional[str] = None,
+):
+    """Restore the chief complaint captured during an active (or just expired) hold."""
+    if not (flag_id or patient_id is not None or ticket_number):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cần ít nhất một trong: flag_id, patient_id, ticket_number.",
+        )
+    restored = await asyncio.to_thread(
+        _restore_triage_context,
+        flag_id=flag_id,
+        patient_id=patient_id,
+        ticket_number=ticket_number,
+        settings=get_settings(),
+    )
+    if restored is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Không tìm thấy phiên triệu chứng tạm thời (có thể đã hết hạn giữ chỗ 3 phút).",
+        )
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -3436,6 +3940,7 @@ class FlaggedSymptomItem(BaseModel):
     flag_reason: str = ""
     similarity_score: Optional[float] = None
     ticket_number: str = ""
+    patient_id: Optional[int] = None
     patient_name: str = ""
     confirmed_icd10_code: str = ""
     confirmed_disease_name: str = ""
@@ -3458,6 +3963,7 @@ class FlaggedSymptomsStats(BaseModel):
     pending_doctor: int = 0
     doctor_confirmed: int = 0
     trained: int = 0
+    cancelled: int = 0
     top_clusters: list[FlaggedSymptomCluster] = Field(default_factory=list)
 
 
@@ -3468,6 +3974,7 @@ class FlaggedSymptomsResponse(BaseModel):
 
 class FlaggedSymptomUpdate(BaseModel):
     ticket_number: Optional[str] = None
+    patient_id: Optional[int] = None
     patient_name: Optional[str] = None
     age_group: Optional[str] = None
     flag_reason: Optional[str] = None
@@ -3481,7 +3988,34 @@ class FlaggedSymptomUpdate(BaseModel):
     medical_symptom_standard: Optional[str] = None
     red_flags: Optional[str] = None
     reception_action: Optional[str] = None
-    status: Optional[Literal["PENDING_DOCTOR", "DOCTOR_CONFIRMED", "TRAINED"]] = None
+    status: Optional[str] = None
+    #: Cancellation events emitted when an admin rejects a booking or the
+    #: three-minute hold expires. Both release the ticket without deleting the
+    #: extracted clinical context, so the patient can retry from cache.
+    event: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_camel_case(cls, values: Any) -> Any:
+        """The admin UI posts camelCase DTOs; map them onto the DB column names."""
+        if not isinstance(values, dict):
+            return values
+        aliases = {
+            "departmentId": "ai_department_id",
+            "priorityLevel": "ai_priority_level",
+            "patientId": "patient_id",
+            "ticketNumber": "ticket_number",
+            "diseaseGuess": "ai_disease_guess",
+            "icd10Code": "ai_icd10_code",
+            "normalizedSymptoms": "medical_symptom_standard",
+        }
+        result = dict(values)
+        for alias, canonical in aliases.items():
+            if alias in result:
+                if canonical not in result:
+                    result[canonical] = result[alias]
+                result.pop(alias)
+        return result
 
 
 class FlaggedSymptomConfirmRequest(BaseModel):
@@ -3559,6 +4093,11 @@ def _flag_item(row: dict[str, Any]) -> FlaggedSymptomItem:
         parsed_score = float(raw_score) if raw_score not in (None, "") else None
     except (TypeError, ValueError):
         parsed_score = None
+    raw_patient_id = row.get("patient_id")
+    try:
+        parsed_patient_id = int(raw_patient_id) if raw_patient_id not in (None, "") else None
+    except (TypeError, ValueError):
+        parsed_patient_id = None
     transcription = _flag_text(row.get("transcription"))
     normalised = (
         _flag_text(row.get("normalized_transcription")).strip()
@@ -3581,6 +4120,7 @@ def _flag_item(row: dict[str, Any]) -> FlaggedSymptomItem:
         flag_reason=_flag_text(row.get("flag_reason")),
         similarity_score=parsed_score,
         ticket_number=_flag_text(row.get("ticket_number")),
+        patient_id=parsed_patient_id,
         patient_name=_flag_text(row.get("patient_name")),
         confirmed_icd10_code=_flag_text(row.get("confirmed_icd10_code")),
         confirmed_disease_name=_flag_text(row.get("confirmed_disease_name")),
@@ -3632,6 +4172,7 @@ def _flag_stats(rows: list[dict[str, Any]]) -> FlaggedSymptomsStats:
         pending_doctor=statuses.get("PENDING_DOCTOR", 0),
         doctor_confirmed=statuses.get("DOCTOR_CONFIRMED", 0),
         trained=statuses.get("TRAINED", 0),
+        cancelled=statuses.get(CANCELLED_STATUS, 0),
         top_clusters=[
             FlaggedSymptomCluster(label=label, count=count) for label, count in ranked
         ],
@@ -4213,6 +4754,17 @@ async def update_flagged_symptom(flag_id: str, payload: FlaggedSymptomUpdate):
         for key, value in payload.model_dump(exclude_unset=True).items()
         if value is not None
     }
+
+    # Cancellation may arrive as an explicit event (admin rejects the held
+    # booking, or the 3-minute hold timer fires) or simply as a CANCELLED status.
+    event = " ".join(_flag_text(changes.pop("event", "")).split()).upper().replace(" ", "_")
+    raw_status = " ".join(_flag_text(changes.get("status")).split()).upper().replace(" ", "_")
+    if raw_status in {"HOLD_EXPIRED", "BOOKING_REJECTED", "TICKET_CANCELLED"}:
+        raw_status = CANCELLED_STATUS
+    is_cancellation = event in CANCELLATION_EVENTS or raw_status == CANCELLED_STATUS
+    ticket_to_release = _flag_text(changes.get("ticket_number")).strip() or None
+    patient_to_release = changes.get("patient_id")
+
     if "age_group" in changes:
         age_group = _normalise_age_group(changes["age_group"])
         if not age_group:
@@ -4228,11 +4780,29 @@ async def update_flagged_symptom(flag_id: str, payload: FlaggedSymptomUpdate):
             if reason in {"OUT_OF_SPECIALTY", "NEW_SYMPTOM_PATTERN", "LOW_SIMILARITY_MATCH"}
             else ""
         )
-    if "status" in changes and changes["status"] not in FLAG_STATUSES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Trạng thái không hợp lệ: {changes['status']!r}.",
+    if raw_status:
+        if raw_status not in FLAG_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Trạng thái không hợp lệ: {changes['status']!r}.",
+            )
+        changes["status"] = raw_status
+
+    if is_cancellation:
+        # Release the hold without throwing away the extracted chief complaint:
+        # the patient may retry and expect an instant restore from the cache.
+        changes["status"] = CANCELLED_STATUS
+        changes["ticket_number"] = ""
+        if not _flag_text(changes.get("reception_action")).strip():
+            changes["reception_action"] = (
+                "Booking bị hủy/hết hạn giữ chỗ; triệu chứng được lưu để đặt lại."
+            )
+        triage_session_cache.cancel_hold(
+            flag_id=flag_id,
+            patient_id=patient_to_release,
+            ticket_number=ticket_to_release,
         )
+
     if not changes:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -4241,12 +4811,24 @@ async def update_flagged_symptom(flag_id: str, payload: FlaggedSymptomUpdate):
 
     updated = await asyncio.to_thread(update_unmatched_log, flag_id, changes, settings)
     if not updated:
+        if is_cancellation:
+            # A cancellation event is idempotent: a late/duplicate hold-expiry
+            # notification for an already released ticket is not an error.
+            return FlaggedSymptomMutationResponse(
+                success=True,
+                message=f"Ca {flag_id} đã được giải phóng hoặc không tồn tại.",
+                item=None,
+            )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Không tìm thấy ca {flag_id!r}.",
         )
     return FlaggedSymptomMutationResponse(
-        message=f"Đã cập nhật ca {flag_id}.",
+        message=(
+            f"Đã hủy giữ chỗ ca {flag_id}; triệu chứng vẫn sẵn sàng để đặt lại."
+            if is_cancellation
+            else f"Đã cập nhật ca {flag_id}."
+        ),
         item=_flag_item(updated),
     )
 
@@ -4258,6 +4840,8 @@ async def update_flagged_symptom(flag_id: str, payload: FlaggedSymptomUpdate):
 async def delete_flagged_symptom(flag_id: str):
     settings = get_settings()
     deleted = await asyncio.to_thread(delete_unmatched_log, flag_id, settings)
+    if deleted:
+        triage_session_cache.release(flag_id=flag_id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
