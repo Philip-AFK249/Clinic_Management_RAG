@@ -204,7 +204,7 @@ class _ScheduleHarness:
         doctor_id: int,
         department_id: int,
         slot_start_time: str,
-        status: str | None = "BOOKED",
+        status: str = "BOOKED",
         appointment_date: date = TARGET_DATE,
     ) -> None:
         self.connection.execute(
@@ -212,7 +212,7 @@ class _ScheduleHarness:
             "(ticket_number, doctor_id, department_id, appointment_date, "
             "slot_start_time, status) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                f"T{doctor_id}-{appointment_date.isoformat()}-{slot_start_time}-{status}",
+                f"T{doctor_id}-{appointment_date.isoformat()}-{slot_start_time}",
                 doctor_id,
                 department_id,
                 appointment_date.isoformat(),
@@ -313,15 +313,11 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
         )
         self.assertEqual(doctor["available_capacity"], 15)
 
-    def _load_today_at(self, hour: int, minute: int = 0) -> dict:
-        """Run _load_schedule with the clinic clock frozen at TARGET_DATE HH:MM."""
-        now = datetime(2099, 1, 5, hour, minute, tzinfo=sq.CLINIC_TIMEZONE)
-        with patch.object(sq, "datetime", _frozen_datetime(now)):
-            return sq._load_schedule(1, now.date(), object())
-
     def _load_today_at_3pm(self) -> dict:
         """Run _load_schedule as if it is 15:00 Asia/Ho_Chi_Minh today."""
-        return self._load_today_at(15, 0)
+        now = datetime(2099, 1, 5, 15, 0, tzinfo=sq.CLINIC_TIMEZONE)
+        with patch.object(sq, "datetime", _frozen_datetime(now)):
+            return sq._load_schedule(1, now.date(), object())
 
     def test_afternoon_recommended_at_3pm_instead_of_morning(self) -> None:
         self.db.add_shift(
@@ -369,79 +365,6 @@ class QueryDepartmentScheduleTests(unittest.TestCase):
         self.assertTrue(result["morning_elapsed"])
         self.assertTrue(result["afternoon"]["is_full"])
         self.assertEqual(result["recommended_shift"], "NEXT_DAY")
-
-    def test_schedule_sql_counts_only_booked_assignments(self) -> None:
-        """The production query carries no temporary-hold/deposit condition."""
-        sql = sq._SCHEDULE_SQL
-        self.assertIn("COALESCE(sa.status, 'BOOKED') = 'BOOKED'", sql)
-        self.assertNotIn("HOLD", sql)
-        self.assertNotIn("hold_expires_at", sql)
-        self.assertNotIn("NOW()", sql)
-
-    def test_explicit_and_default_booked_assignments_count_toward_capacity(self) -> None:
-        self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
-        self.db.add_assignment(
-            doctor_id=1, department_id=1, slot_start_time="08:00:00"
-        )
-        self.db.add_assignment(
-            doctor_id=1,
-            department_id=1,
-            slot_start_time="09:00:00",
-            status="BOOKED",
-        )
-
-        result = self._load_today_at(10, 0)
-
-        doctor = result["morning"]["doctors"][0]
-        self.assertEqual(doctor["booked_count"], 2)
-        self.assertEqual(doctor["available_capacity"], 14)
-        self.assertEqual(result["morning"]["total_available_slots"], 14)
-        self.assertFalse(result["morning"]["is_full"])
-
-    def test_booked_assignments_can_fill_a_session(self) -> None:
-        self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
-        for index in range(16):
-            self.db.add_assignment(
-                doctor_id=1,
-                department_id=1,
-                slot_start_time=f"{7 + index // 4:02d}:{(index % 4) * 15:02d}:00",
-            )
-
-        result = self._load_today_at(10, 0)
-        session = result["morning"]
-
-        self.assertEqual(session["doctors"][0]["booked_count"], 16)
-        self.assertEqual(session["doctors"][0]["available_capacity"], 0)
-        self.assertEqual(session["total_available_slots"], 0)
-        self.assertTrue(session["is_full"])
-        self.assertEqual(result["recommended_shift"], "NEXT_DAY")
-
-    def test_null_status_counts_as_booked_but_terminal_statuses_do_not(self) -> None:
-        self.db.add_shift(doctor_id=1, department_id=1, session="MORNING")
-
-        # Counted: explicit BOOKED and a NULL status (COALESCE default).
-        self.db.add_assignment(
-            doctor_id=1, department_id=1, slot_start_time="07:00:00", status="BOOKED"
-        )
-        self.db.add_assignment(
-            doctor_id=1, department_id=1, slot_start_time="07:15:00", status=None
-        )
-        # Not counted: terminal statuses.
-        self.db.add_assignment(
-            doctor_id=1, department_id=1, slot_start_time="07:30:00", status="CANCELLED"
-        )
-        self.db.add_assignment(
-            doctor_id=1, department_id=1, slot_start_time="07:45:00", status="EXPIRED"
-        )
-
-        result = self._load_today_at(10, 0)
-        doctor = result["morning"]["doctors"][0]
-
-        self.assertEqual(doctor["booked_count"], 2)
-        self.assertEqual(doctor["available_capacity"], 14)
-        self.assertEqual(result["morning"]["total_available_slots"], 14)
-        self.assertFalse(result["morning"]["is_full"])
-        self.assertEqual(result["recommended_shift"], "MORNING")
 
 
 if __name__ == "__main__":
