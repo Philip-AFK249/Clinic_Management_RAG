@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import base64
 import csv
 import io
@@ -74,6 +75,9 @@ from app.services.ambient import (
 from app.services.clinical_client import get_available_drugs
 
 logger = get_logger(__name__)
+
+#: Reused pool for triage RAG retrieval (avoids per-request thread creation).
+_TRIAGE_RAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 INDEX_HTML = PROJECT_ROOT / "index.html"
 PIPELINE_HTML = PROJECT_ROOT / "app" / "static" / "pipeline.html"
@@ -159,16 +163,10 @@ AMBIENT_STT_PROMPT = (
 )
 
 VOICE_STT_PROMPT = (
-    "Khám bệnh, đau thắt ngực, khó thở, huyết áp, hồi hộp, tim mạch, sốt cao, "
-    "ho khạc đờm, ho khan, đau rát họng, khò khè, hen suyễn, sổ mũi, viêm xoang, "
-    "dị ứng, nổi mẩn đỏ, ngứa ngáy, mụn nước, dát sẩn, vảy nến, zona, sốc phản vệ, "
-    "mề đay, tê bàn chân, tiêu chảy, nôn ói, "
-    "tiểu buốt, tiểu rắt, nước tiểu đục, đau hông lưng, leo cầu thang, hồi hộp, "
-    "tim đập nhanh, thở không ra hơi, khàn tiếng, mất tiếng, khô họng, rát họng, "
-    "tim đập thình thịch, ớn lạnh, chóng mặt, đau họng, nuốt đau, sâu cắn, "
-    "côn trùng đốt, nổi mẩn đỏ, ngứa liên tục, nhìn mờ, đốm đen trước mắt, mờ mắt, "
-    "đau răng, đau bụng dưới, trật khớp, cổ họng, đánh trống ngực, "
-    "ho khan, nổi mẩn đỏ, ngứa ngáy."
+    "Bệnh nhân khai triệu chứng khám bệnh tại phòng khám đa khoa: "
+    "đau tức ngực, khó thở, hồi hộp, tim đập nhanh, tăng huyết áp, chóng mặt, "
+    "ho khan, ho có đờm, đau rát họng, khàn tiếng, sổ mũi, viêm xoang, hen suyễn, "
+    "nổi mẩn đỏ, ngứa ngáy, dị ứng, mề đay, zona, tiểu buốt, đau bụng."
 )
 
 VOICE_TRIAGE_SYSTEM_PROMPT = """Bạn là trợ lý phân loại triệu chứng lâm sàng tại phòng tiếp đón.
@@ -252,7 +250,7 @@ AVAILABLE_MODELS: dict[str, list[str]] = {
 }
 
 _DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
-_DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
+_DEFAULT_STT_MODEL = "whisper-large-v3"
 _DEFAULT_VLM_MODEL = "qwen/qwen3.8-27b"
 
 _runtime_lock = threading.Lock()
@@ -435,7 +433,7 @@ class VoiceAudioDecodeError(ValueError):
 
 
 #: Peak amplitude below this (16-bit PCM ≈ -42 dBFS) counts as silence.
-_SILENCE_PEAK_THRESHOLD = 500
+_SILENCE_PEAK_THRESHOLD = 200
 
 
 def _wav_has_no_speech(audio: bytes) -> Optional[bool]:
@@ -936,9 +934,8 @@ def _retrieve_triage_context(
                     settings=settings,
                 )
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_do_retrieval)
-                results = future.result(timeout=2.5)
+            future = _TRIAGE_RAG_EXECUTOR.submit(_do_retrieval)
+            results = future.result(timeout=2.5)
             if results:
                 best_score = max((result.score for result in results), default=0.0)
                 context = "\n\n---\n\n".join(result.content for result in results)
@@ -1512,6 +1509,7 @@ def _extract_triage_facts(
             model=llm_model,
             settings=settings,
             temperature=0.1,
+            max_completion_tokens=700,
         )
     except Exception as exc:
         logger.warning("LLM returned non-JSON triage output: %s", str(exc)[:200])

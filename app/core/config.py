@@ -72,7 +72,7 @@ class Settings(BaseSettings):
 
     # LLM & VLM Models
     LLM_MODEL_ID: str = "llama-3.3-70b-versatile"
-    LLM_STT_MODEL_ID: str = "whisper-large-v3-turbo"
+    LLM_STT_MODEL_ID: str = "whisper-large-v3"
     VLM_MODEL_ID: str = "qwen/qwen3.8-27b"
 
     # Retrieval
